@@ -5,9 +5,10 @@ use chrono::TimeDelta;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use service_engine::blobs::{Sha256Digest, UploadExpectation};
+use service_engine::gate::Reason;
 use service_engine::inbound::{ReactionCoordinates, ReactionMessage};
 use service_engine::pipeline::{Mutation, MutationInput, OneShot, Reaction};
-use service_engine::{BlobReader, BlobRef, UploadUrl};
+use service_engine::{BlobReader, BlobRef, JsonScalar, UploadUrl};
 use uuid::Uuid;
 
 use crate::blob::DriveSource;
@@ -16,6 +17,7 @@ use crate::fault::{DriveFault, DriveReactionFault, codes};
 use crate::file::store;
 use crate::file::{File, FileCause, FileRow, ProcessingState};
 use crate::host::{DriveHost, DriveRequest};
+use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
 
 pub const UPLOAD_DEADLINE_AGGREGATE: &str = "drive_file";
@@ -33,10 +35,26 @@ pub struct RequestUpload {
     pub sha256_hex: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, async_graphql::SimpleObject)]
 pub struct UploadTicket {
     pub file_id: Uuid,
-    pub upload: UploadUrl,
+    pub url: String,
+    pub fields: JsonScalar,
+}
+
+impl UploadTicket {
+    fn new(file_id: Uuid, upload: UploadUrl) -> Self {
+        let (url, fields) = upload.into_parts();
+        let fields: serde_json::Map<String, serde_json::Value> = fields
+            .into_iter()
+            .map(|(name, value)| (name, serde_json::Value::String(value)))
+            .collect();
+        Self {
+            file_id,
+            url,
+            fields: async_graphql::Json(serde_json::Value::Object(fields)),
+        }
+    }
 }
 
 impl MutationInput for RequestUpload {
@@ -50,27 +68,29 @@ pub fn request_upload<'m, H: DriveHost>(
     input: RequestUpload,
 ) -> BoxFuture<'m, Result<OneShot<UploadTicket>, DriveFault>> {
     Box::pin(async move {
-        let path = DrivePath::parse(&input.path).map_err(service_engine::gate::Reason::from)?;
-        let name = FileName::parse(&input.name).map_err(service_engine::gate::Reason::from)?;
+        let path = DrivePath::parse(&input.path).map_err(Reason::from)?;
+        let name = FileName::parse(&input.name).map_err(Reason::from)?;
+        let media_type = MediaType::parse(&input.media_type)
+            .map_err(|_| DriveFault::Refused(codes::INVALID_MEDIA_TYPE))?;
         let digest = Sha256Digest::from_hex(&input.sha256_hex)
             .map_err(|_| DriveFault::Refused(codes::INVALID_SHA256))?;
-        cx.load::<DriveRow>(&input.drive_id)
-            .await?
-            .ok_or(DriveFault::Refused(codes::DRIVE_NOT_FOUND))?;
         cx.principal()
             .drive_gate(&DriveRequest::CreateFile {
                 drive: input.drive_id,
                 path: &path,
                 name: &name,
-                media_type: &input.media_type,
+                media_type: &media_type,
                 size: input.size,
             })
             .require()?;
+        cx.load::<DriveRow>(&input.drive_id)
+            .await?
+            .ok_or(DriveFault::Refused(codes::DRIVE_NOT_FOUND))?;
         let taken = store::sibling_names(cx.connection(), input.drive_id, &path).await?;
         let name = name.first_free(&taken);
         let blob = cx.blob_verified::<DriveSource>(
             name.as_str().to_string(),
-            input.media_type.clone(),
+            media_type.as_str().to_string(),
             UploadExpectation::new(input.size, digest),
         )?;
         let now = cx.now().as_datetime();
@@ -80,7 +100,7 @@ pub fn request_upload<'m, H: DriveHost>(
             path,
             name,
             protected: false,
-            media_type: input.media_type,
+            media_type,
             size_bytes: i64::try_from(input.size)
                 .map_err(|_| DriveFault::Refused(codes::FILE_TOO_LARGE))?,
             sha256: *digest.as_bytes(),
@@ -102,10 +122,7 @@ pub fn request_upload<'m, H: DriveHost>(
         })?;
         let deadline = cx.now() + window;
         cx.schedule_at(deadline, UploadDeadline::<H>::new(file.id))?;
-        Ok(OneShot(UploadTicket {
-            file_id: file.id,
-            upload: blob.upload_url(),
-        }))
+        Ok(OneShot(UploadTicket::new(file.id, blob.upload_url())))
     })
 }
 
@@ -134,12 +151,12 @@ pub fn commit_upload<'m, H: DriveHost>(
             .drive_gate(&file.as_create_request())
             .require()?;
         file.require_pending()?;
-        let head = reader
+        let landed = reader
             .head(BlobRef(file.blob_ref))
             .await?
-            .ok_or(DriveFault::Refused(codes::UPLOAD_NOT_LANDED))?;
-        if head.verified() != Some(true) {
-            return Err(DriveFault::Refused(codes::UPLOAD_MISMATCH));
+            .is_some_and(|head| head.verified() == Some(true));
+        if !landed {
+            return Err(DriveFault::Refused(codes::UPLOAD_NOT_LANDED));
         }
         file.processing_state = ProcessingState::Ready;
         file.updated_at = cx.now().as_datetime();

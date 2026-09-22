@@ -17,6 +17,12 @@ use super::aggregate::{File, FileRow, FileVisibility, ProcessingState};
 use super::store::{self, FileStore};
 use crate::host::DriveHost;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ByteCount(pub u64);
+
+async_graphql::scalar!(ByteCount);
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject)]
 pub struct DriveFile {
     pub id: Uuid,
@@ -25,7 +31,7 @@ pub struct DriveFile {
     pub name: String,
     pub protected: bool,
     pub media_type: String,
-    pub size_bytes: i64,
+    pub size_bytes: ByteCount,
     pub sha256: String,
     pub processing_state: ProcessingState,
     pub processing_error: Option<String>,
@@ -106,8 +112,8 @@ impl<H: DriveHost> Projector for DriveFiles<H> {
             path: row.path.as_str().to_string(),
             name: row.name.as_str().to_string(),
             protected: row.protected,
-            media_type: row.media_type.clone(),
-            size_bytes: row.size_bytes,
+            media_type: row.media_type.as_str().to_string(),
+            size_bytes: ByteCount(u64::try_from(row.size_bytes).unwrap_or(0)),
             sha256: hex(&row.sha256),
             processing_state: row.processing_state,
             processing_error: row.processing_error.clone(),

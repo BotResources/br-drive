@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use super::aggregate::{FileRow, ProcessingState};
 use crate::host::{DRIVE_DIM, DriveHost};
+use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
 
 const COLUMNS: &str = "id, drive_id, path, name, protected, media_type, size_bytes, sha256, \
@@ -25,13 +26,15 @@ fn row_to_file<H>(row: &sqlx::postgres::PgRow) -> Result<FileRow<H>, EngineError
         .map_err(|error| EngineError::Config(error.to_string()))?;
     let path: String = row.get("path");
     let name: String = row.get("name");
+    let media_type: String = row.get("media_type");
     Ok(FileRow {
         id: row.get("id"),
         drive_id: row.get("drive_id"),
         path: DrivePath::parse(&path).map_err(|error| EngineError::Config(error.to_string()))?,
         name: FileName::parse(&name).map_err(|error| EngineError::Config(error.to_string()))?,
         protected: row.get("protected"),
-        media_type: row.get("media_type"),
+        media_type: MediaType::parse(&media_type)
+            .map_err(|error| EngineError::Config(error.to_string()))?,
         size_bytes: row.get("size_bytes"),
         sha256,
         blob_ref: row.get("blob_ref"),
@@ -132,7 +135,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.path.as_str())
             .bind(file.name.as_str())
             .bind(file.protected)
-            .bind(&file.media_type)
+            .bind(file.media_type.as_str())
             .bind(file.size_bytes)
             .bind(file.sha256.to_vec())
             .bind(file.blob_ref)
@@ -184,6 +187,14 @@ impl<H: DriveHost> Aggregate for FileRow<H> {
     fn blob_refs(&self) -> Vec<BlobRef> {
         vec![BlobRef(self.blob_ref)]
     }
+}
+
+pub async fn delete_many(conn: &mut PgConnection, ids: &[Uuid]) -> Result<u64, EngineError> {
+    let done = sqlx::query("DELETE FROM drive.file WHERE id = ANY($1)")
+        .bind(ids)
+        .execute(conn)
+        .await?;
+    Ok(done.rows_affected())
 }
 
 pub async fn ids_in_drives(

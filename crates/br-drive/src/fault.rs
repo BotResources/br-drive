@@ -11,10 +11,11 @@ pub mod codes {
     pub const FOLDER_NOT_FOUND: Reason = Reason::new("FOLDER_NOT_FOUND");
     pub const FILE_PROTECTED: Reason = Reason::new("FILE_PROTECTED");
     pub const FILE_NOT_PENDING: Reason = Reason::new("FILE_NOT_PENDING");
+    pub const FILE_NOT_READY: Reason = Reason::new("FILE_NOT_READY");
     pub const FILE_TOO_LARGE: Reason = Reason::new("FILE_TOO_LARGE");
     pub const UPLOAD_NOT_LANDED: Reason = Reason::new("UPLOAD_NOT_LANDED");
-    pub const UPLOAD_MISMATCH: Reason = Reason::new("UPLOAD_MISMATCH");
     pub const INVALID_SHA256: Reason = Reason::new("INVALID_SHA256");
+    pub const INVALID_MEDIA_TYPE: Reason = Reason::new("INVALID_MEDIA_TYPE");
     pub const INVALID_PATH: Reason = Reason::new("INVALID_PATH");
     pub const INVALID_NAME: Reason = Reason::new("INVALID_NAME");
     pub const NAME_TAKEN: Reason = Reason::new("NAME_TAKEN");

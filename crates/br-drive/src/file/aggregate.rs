@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::fault::codes;
 use crate::host::{DRIVE_DIM, DriveHost, DriveRequest};
+use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
 
 pub struct File;
@@ -66,6 +67,7 @@ pub enum FileCause {
     Moved { from_drive: Uuid },
     FolderMoved,
     ProtectionChanged { protected: bool },
+    MetadataChanged,
     Deleted,
     FolderDeleted,
     DriveDeleted,
@@ -77,7 +79,7 @@ pub struct FileRow<H> {
     pub path: DrivePath,
     pub name: FileName,
     pub protected: bool,
-    pub media_type: String,
+    pub media_type: MediaType,
     pub size_bytes: i64,
     pub sha256: [u8; 32],
     pub blob_ref: Uuid,
@@ -163,6 +165,9 @@ service_engine::gated! {
         )
     }
     "download" => fn download_gate(this, principal) {
+        if this.processing_state != ProcessingState::Ready {
+            return Gate::blocked(codes::FILE_NOT_READY);
+        }
         principal.drive_gate(&DriveRequest::ReadFile { file: this })
     }
 }

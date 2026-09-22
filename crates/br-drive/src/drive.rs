@@ -2,12 +2,13 @@ use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use service_engine::error::EngineError;
 use service_engine::persistence::{Aggregate, Persistence, PersistenceStyle};
-use service_engine::pipeline::Ops;
+use service_engine::pipeline::{Bulk, Ops};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use crate::fault::{DriveFault, codes};
-use crate::file::{File, FileCause, FileRow, store};
+use crate::file::{FileCause, FileRow, store};
+use crate::folders::{delete_rows, impact_rows};
 use crate::host::DriveHost;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +50,31 @@ impl Persistence for DriveStore {
         key: &'a Uuid,
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Self::row_lock(conn, "drive.drive", key)
+    }
+
+    fn read_many<'a>(
+        conn: &'a mut PgConnection,
+        keys: &'a [Uuid],
+    ) -> BoxFuture<'a, Result<Vec<(Uuid, DriveRow)>, EngineError>> {
+        Box::pin(async move {
+            let rows = sqlx::query(
+                "SELECT id, created_by, created_at FROM drive.drive WHERE id = ANY($1)",
+            )
+            .bind(keys)
+            .fetch_all(conn)
+            .await?;
+            Ok(rows
+                .iter()
+                .map(|row| {
+                    let drive = DriveRow {
+                        id: row.get("id"),
+                        created_by: row.get("created_by"),
+                        created_at: row.get("created_at"),
+                    };
+                    (drive.id, drive)
+                })
+                .collect())
+        })
     }
 
     fn save<'a>(
@@ -113,42 +139,18 @@ pub struct DriveDeleted {
 }
 
 pub async fn delete_drive<H: DriveHost>(
-    ops: &mut Ops<'_>,
+    cx: &mut Bulk<'_, H>,
     id: Uuid,
 ) -> Result<DriveDeleted, DriveFault> {
-    let drive = ops
+    let drive = cx
         .load::<DriveRow>(&id)
         .await?
         .ok_or(DriveFault::Refused(codes::DRIVE_NOT_FOUND))?;
-    let ids = store::ids_in_drive(ops.connection(), id).await?;
-    let files = ops.load_many::<FileRow<H>>(&ids).await?;
-    for file in &files {
-        ops.delete(file).await?;
-        ops.impact_caused::<File, _>(&file.id, FileCause::DriveDeleted)?;
-    }
-    ops.delete(&drive).await?;
+    let ids = store::ids_in_drive(cx.connection(), id).await?;
+    let files = cx.load_many::<FileRow<H>>(&ids).await?;
+    delete_rows(cx, &files).await?;
+    cx.delete(&drive).await?;
+    let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
+    impact_rows(cx, &ids, FileCause::DriveDeleted)?;
     Ok(DriveDeleted { files: files.len() })
-}
-
-pub async fn drive_of(ops: &mut Ops<'_>, file_id: Uuid) -> Result<Option<Uuid>, DriveFault> {
-    Ok(store::drive_of(ops.connection(), file_id).await?)
-}
-
-pub async fn set_protected<H: DriveHost>(
-    ops: &mut Ops<'_>,
-    file_id: Uuid,
-    protected: bool,
-) -> Result<(), DriveFault> {
-    let mut file = ops
-        .load::<FileRow<H>>(&file_id)
-        .await?
-        .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
-    if file.protected == protected {
-        return Ok(());
-    }
-    file.protected = protected;
-    file.updated_at = ops.now().as_datetime();
-    ops.save(&file).await?;
-    ops.impact_caused::<File, _>(&file.id, FileCause::ProtectionChanged { protected })?;
-    Ok(())
 }

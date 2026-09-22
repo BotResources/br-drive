@@ -9,6 +9,7 @@ use service_engine::principal::Principal;
 use uuid::Uuid;
 
 use crate::file::FileRow;
+use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
 
 pub const DRIVE_DIM: &str = "drive";
@@ -18,7 +19,7 @@ pub enum DriveRequest<'a, H> {
         drive: Uuid,
         path: &'a DrivePath,
         name: &'a FileName,
-        media_type: &'a str,
+        media_type: &'a MediaType,
         size: u64,
     },
     ReadFile {
@@ -79,6 +80,8 @@ pub trait DriveHost: Principal {
     const SOURCE_MAX_BYTES: u64 = 1 << 30;
 
     const SOURCE_ORPHAN_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+    const BULK_RESET_THRESHOLD: usize = 256;
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;
 

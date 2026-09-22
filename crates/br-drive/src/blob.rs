@@ -35,9 +35,6 @@ pub fn source_available<'a>(
 pub fn register<P: DriveHost>(
     engine: &mut Engine<P>,
 ) -> Result<(), service_engine::error::EngineError> {
-    if !engine.blobs_configured() {
-        return Ok(());
-    }
     engine.register_blobs::<DriveSource>(service_engine::BlobPolicy {
         max_bytes: P::SOURCE_MAX_BYTES,
         orphan_after: P::SOURCE_ORPHAN_AFTER,

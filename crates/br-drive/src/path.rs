@@ -3,6 +3,7 @@ use service_engine::gate::Reason;
 use crate::fault::codes;
 
 pub const MAX_SEGMENT_BYTES: usize = 255;
+pub const MAX_PATH_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PathError {
@@ -26,6 +27,7 @@ fn segment_is_sound(segment: &str) -> bool {
         && segment != "."
         && segment != ".."
         && segment.len() <= MAX_SEGMENT_BYTES
+        && segment.trim() == segment
         && !segment.chars().any(|c| c.is_control() || c == '\\')
 }
 
@@ -42,7 +44,7 @@ impl DrivePath {
         if trimmed.is_empty() {
             return Ok(Self::root());
         }
-        if !trimmed.split('/').all(segment_is_sound) {
+        if trimmed.len() > MAX_PATH_BYTES || !trimmed.split('/').all(segment_is_sound) {
             return Err(PathError::InvalidPath);
         }
         Ok(Self(trimmed.to_string()))
@@ -78,11 +80,12 @@ impl DrivePath {
         } else {
             self.0[from.0.len()..].trim_start_matches('/')
         };
-        Some(match (to.is_root(), rest.is_empty()) {
-            (true, _) => DrivePath(rest.to_string()),
-            (false, true) => to.clone(),
-            (false, false) => DrivePath(format!("{}/{rest}", to.0)),
-        })
+        let landed = match (to.is_root(), rest.is_empty()) {
+            (true, _) => rest.to_string(),
+            (false, true) => to.0.clone(),
+            (false, false) => format!("{}/{rest}", to.0),
+        };
+        (landed.len() <= MAX_PATH_BYTES).then_some(DrivePath(landed))
     }
 }
 
@@ -91,7 +94,6 @@ pub struct FileName(String);
 
 impl FileName {
     pub fn parse(raw: &str) -> Result<Self, PathError> {
-        let raw = raw.trim();
         if raw.contains('/') || !segment_is_sound(raw) {
             return Err(PathError::InvalidName);
         }
@@ -156,26 +158,44 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_dot_or_over_long_segment_is_refused() {
+    fn an_empty_dot_padded_or_over_long_segment_is_refused() {
         for raw in [
             "a//b",
             "a/./b",
             "../a",
             "a/..",
+            "a/ b",
+            "a /b",
+            "a/ /b",
             &format!("a/{}", "x".repeat(256)),
         ] {
             assert_eq!(DrivePath::parse(raw), Err(PathError::InvalidPath), "{raw}");
         }
         assert!(DrivePath::parse(&"x".repeat(255)).is_ok());
+        assert!(DrivePath::parse("a b/c d").is_ok());
         assert_eq!(DrivePath::parse("a\u{0}b"), Err(PathError::InvalidPath));
     }
 
     #[test]
-    fn a_name_carries_no_slash_and_is_never_a_dot_segment() {
+    fn the_whole_path_is_capped_at_parse_and_at_rebase() {
+        let segment = "s".repeat(200);
+        let five = [segment.as_str(); 5].join("/");
+        assert_eq!(five.len(), 1004);
+        assert!(DrivePath::parse(&five).is_ok());
+        let six = [segment.as_str(); 6].join("/");
+        assert_eq!(DrivePath::parse(&six), Err(PathError::InvalidPath));
+        let deep = path(&[segment.as_str(); 4].join("/"));
+        assert!(path(&five).rebased(&path(&segment), &deep).is_none());
+    }
+
+    #[test]
+    fn a_name_carries_no_slash_no_padding_and_is_never_a_dot_segment() {
         assert!(FileName::parse("report.pdf").is_ok());
+        assert!(FileName::parse("my report.pdf").is_ok());
         assert_eq!(FileName::parse("a/b"), Err(PathError::InvalidName));
         assert_eq!(FileName::parse(""), Err(PathError::InvalidName));
         assert_eq!(FileName::parse(".."), Err(PathError::InvalidName));
+        assert_eq!(FileName::parse(" padded"), Err(PathError::InvalidName));
         assert_eq!(FileName::parse("a\tb"), Err(PathError::InvalidName));
     }
 

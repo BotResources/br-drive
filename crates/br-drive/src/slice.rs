@@ -82,34 +82,25 @@ macro_rules! drive_slice {
                     path: ::std::string::String,
                     name: ::std::string::String,
                     media_type: ::std::string::String,
-                    size: u64,
+                    size: $crate::ByteCount,
                     sha256: ::std::string::String,
-                ) -> ::async_graphql::Result<::service_engine::JsonScalar> {
-                    let ticket = ::service_engine::execute::<$p, $crate::RequestUpload>(
-                        ctx,
-                        $crate::RequestUpload {
-                            file_id,
-                            drive_id,
-                            path,
-                            name,
-                            media_type,
-                            size,
-                            sha256_hex: sha256,
-                        },
+                ) -> ::async_graphql::Result<$crate::UploadTicket> {
+                    ::core::result::Result::Ok(
+                        ::service_engine::execute::<$p, $crate::RequestUpload>(
+                            ctx,
+                            $crate::RequestUpload {
+                                file_id,
+                                drive_id,
+                                path,
+                                name,
+                                media_type,
+                                size: size.0,
+                                sha256_hex: sha256,
+                            },
+                        )
+                        .await?
+                        .into_inner(),
                     )
-                    .await?
-                    .into_inner();
-                    let (url, fields) = ticket.upload.into_parts();
-                    let fields: ::serde_json::Map<::std::string::String, ::serde_json::Value> =
-                        fields
-                            .into_iter()
-                            .map(|(k, v)| (k, ::serde_json::Value::String(v)))
-                            .collect();
-                    ::core::result::Result::Ok(::async_graphql::Json(::serde_json::json!({
-                        "fileId": ticket.file_id,
-                        "url": url,
-                        "fields": fields,
-                    })))
                 }
 
                 async fn [<$prefix _commit_upload>](
@@ -163,7 +154,7 @@ macro_rules! drive_slice {
                     old_prefix: ::std::string::String,
                     new_prefix: ::std::string::String,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
-                    ::service_engine::ack::<$p, $crate::MoveFolder>(
+                    ::service_engine::ack_bulk::<$p, $crate::MoveFolder>(
                         ctx,
                         $crate::MoveFolder {
                             drive_id,
@@ -180,7 +171,7 @@ macro_rules! drive_slice {
                     drive_id: ::uuid::Uuid,
                     prefix: ::std::string::String,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
-                    ::service_engine::ack::<$p, $crate::DeleteFolder>(
+                    ::service_engine::ack_bulk::<$p, $crate::DeleteFolder>(
                         ctx,
                         $crate::DeleteFolder { drive_id, prefix },
                     )
