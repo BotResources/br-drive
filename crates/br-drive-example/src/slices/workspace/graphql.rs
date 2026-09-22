@@ -64,6 +64,18 @@ impl WorkspaceMutation {
         service_engine::ack::<AppPrincipal, TransferWorkspace>(ctx, TransferWorkspace { id, to })
             .await
     }
+
+    #[cfg(feature = "drive")]
+    async fn workspace_protect_file(
+        &self,
+        ctx: &Context<'_>,
+        file_id: Uuid,
+        protected: bool,
+    ) -> Result<MutationAck> {
+        use super::mutations::ProtectFile;
+        service_engine::ack::<AppPrincipal, ProtectFile>(ctx, ProtectFile { file_id, protected })
+            .await
+    }
 }
 
 #[derive(Default)]

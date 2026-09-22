@@ -47,6 +47,7 @@ type WorkspaceMutation {
 	workspaceCreate(id: UUID!, name: String!): MutationAck!
 	workspaceDelete(id: UUID!): MutationAck!
 	workspaceTransfer(id: UUID!, to: UUID!): MutationAck!
+	workspaceProtectFile(fileId: UUID!, protected: Boolean!): MutationAck!
 }
 
 type WorkspaceQuery {

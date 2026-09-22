@@ -1,3 +1,7 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use br_drive_example::kernel::HostSettings;
 use br_drive_example::slices::{MutationRoot, QueryRoot, SubscriptionRoot};
 use service_engine::config::EngineConfig;
 use service_engine::{BlobConfig, BootPlan, run_service};
@@ -20,6 +24,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config = config.with_blob_storage(blob);
     }
 
+    let mut settings = HostSettings::default();
+    if let Ok(raw) = std::env::var("DRIVE_UPLOAD_WINDOW_MS") {
+        settings.upload_window = Duration::from_millis(raw.parse()?);
+    }
+
     run_service(BootPlan {
         component: "br-drive-example",
         libraries: br_drive_example::db::libraries(),
@@ -29,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mutation: MutationRoot::default(),
         subscription: SubscriptionRoot::default(),
         declare_scopes: false,
-        register: br_drive_example::register::all,
+        register: br_drive_example::register::all_with(Arc::new(settings)),
     })
     .await?;
     Ok(())

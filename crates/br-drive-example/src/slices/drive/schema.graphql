@@ -1,6 +1,111 @@
-type DriveQuery {
-	workspaceDriveVersion: String!
+scalar Affordances
+
+"""
+Implement the DateTime<Utc> scalar
+
+The input/output is a string in RFC3339 format.
+"""
+scalar DateTime
+
+union DriveDelta = DriveReset | DriveUpsert | DriveRemove | LanesPaused | LanesResumed
+
+type DriveFile {
+	id: UUID!
+	driveId: UUID!
+	path: String!
+	name: String!
+	protected: Boolean!
+	mediaType: String!
+	sizeBytes: Int!
+	sha256: String!
+	processingState: ProcessingState!
+	processingError: String
+	metadata: JSON!
+	createdBy: UUID!
+	createdAt: DateTime!
+	updatedAt: DateTime!
+	affordances: Affordances!
 }
+
+union DriveFileUnion = DriveFile
+
+type DriveMutation {
+	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: Int!, sha256: String!): JSON!
+	workspaceCommitUpload(fileId: UUID!): MutationAck!
+	workspaceUpdateFile(fileId: UUID!, name: String, path: String, driveId: UUID): MutationAck!
+	workspaceDeleteFile(fileId: UUID!): MutationAck!
+	workspaceMoveFolder(driveId: UUID!, oldPrefix: String!, newPrefix: String!): MutationAck!
+	workspaceDeleteFolder(driveId: UUID!, prefix: String!): MutationAck!
+}
+
+type DriveQuery {
+	workspaceFile(fileId: UUID!): DriveFile
+	workspaceDriveFiles(driveId: UUID!): [DriveFile!]!
+	workspaceFileAccess(fileId: UUID!, name: String): String
+}
+
+type DriveRemove {
+	revision: Int!
+	projector: String!
+	key: JSON!
+	cause: JSON
+}
+
+type DriveReset {
+	revision: Int!
+	views: [DriveFileUnion!]!
+}
+
+type DriveSubscription {
+	workspaceDriveChanged(driveId: UUID!): DriveDelta!
+}
+
+type DriveUpsert {
+	revision: Int!
+	view: DriveFileUnion!
+	cause: JSON
+}
+
+"""
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
+enum Lane {
+	ACCUMULATED
+	PRESENCE
+}
+
+type LanesPaused {
+	lanes: [Lane!]!
+}
+
+type LanesResumed {
+	lanes: [Lane!]!
+}
+
+type MutationAck {
+	success: Boolean!
+}
+
+enum ProcessingState {
+	PENDING
+	PROCESSING
+	READY
+	FAILED
+}
+
+"""
+A UUID is a unique 128-bit number, stored as 16 octets. UUIDs are parsed as
+Strings within GraphQL. UUIDs are used to assign unique identifiers to
+entities without requiring a central allocating authority.
+
+# References
+
+* [Wikipedia: Universally Unique Identifier](http://en.wikipedia.org/wiki/Universally_unique_identifier)
+* [RFC4122: A Universally Unique Identifier (UUID) URN Namespace](http://tools.ietf.org/html/rfc4122)
+"""
+scalar UUID
 
 """
 Directs the executor to include this field or fragment only when the `if` argument is true.
@@ -10,6 +115,12 @@ directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
 Directs the executor to skip this field or fragment when the `if` argument is true.
 """
 directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Provides a scalar specification URL for specifying the behavior of custom scalar types.
+"""
+directive @specifiedBy(url: String!) on SCALAR
 schema {
 	query: DriveQuery
+	mutation: DriveMutation
+	subscription: DriveSubscription
 }

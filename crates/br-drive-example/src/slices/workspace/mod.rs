@@ -19,6 +19,8 @@ pub fn register(engine: &mut Engine<AppPrincipal>) -> Result<(), EngineError> {
     engine.register_mutation::<mutations::CreateWorkspace, _>(mutations::create_workspace)?;
     engine.register_mutation::<mutations::DeleteWorkspace, _>(mutations::delete_workspace)?;
     engine.register_mutation::<mutations::TransferWorkspace, _>(mutations::transfer_workspace)?;
+    #[cfg(feature = "drive")]
+    engine.register_mutation::<mutations::ProtectFile, _>(mutations::protect_file)?;
     engine.register_schema_slice(
         service_engine::graphql::SliceFragment::derive::<
             graphql::WorkspaceQuery,

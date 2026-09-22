@@ -28,6 +28,16 @@ impl From<Reason> for AppFault {
     }
 }
 
+#[cfg(feature = "drive")]
+impl From<br_drive::DriveFault> for AppFault {
+    fn from(fault: br_drive::DriveFault) -> Self {
+        match fault {
+            br_drive::DriveFault::Refused(reason) => Self::Refused(reason),
+            br_drive::DriveFault::Engine(error) => Self::Engine(error),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReactionFault {
     #[error("terminal: {0}")]
