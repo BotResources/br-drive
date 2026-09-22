@@ -25,9 +25,13 @@ impl DriveHost for AppPrincipal {
 
     const VISIBILITY_DEPS: Deps = Deps::from_bits(1 << OWNERSHIP_DEP);
 
+    const SOURCE_ORPHAN_AFTER: Duration = Duration::from_secs(8);
+
+    const BULK_RESET_THRESHOLD: usize = 3;
+
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate {
         if let DriveRequest::CreateFile { media_type, .. } = request
-            && *media_type == UNRENDERABLE
+            && media_type.as_str() == UNRENDERABLE
         {
             return Gate::blocked(UNRENDERABLE_MEDIA_TYPE);
         }

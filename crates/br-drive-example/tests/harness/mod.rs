@@ -23,22 +23,20 @@ pub struct World {
     pub db: TestDb,
     pub service: Service,
     pub http: reqwest::Client,
-    pub minio: Option<TestMinio>,
-    pub blob_bucket: Option<String>,
-    _nats_server: TestNats,
+    pub minio: TestMinio,
+    pub blob_bucket: String,
+    pub nats_server: TestNats,
 }
 
 pub struct WorldOptions {
-    pub blobs: bool,
-    pub reaper_interval: Option<Duration>,
+    pub reaper_interval: Duration,
     pub upload_window: Duration,
 }
 
 impl Default for WorldOptions {
     fn default() -> Self {
         Self {
-            blobs: false,
-            reaper_interval: None,
+            reaper_interval: Duration::from_millis(150),
             upload_window: HostSettings::DEFAULT_UPLOAD_WINDOW,
         }
     }
@@ -49,42 +47,21 @@ impl World {
         World::start_with(pod, WorldOptions::default()).await
     }
 
-    pub async fn start_blobs(pod: &str) -> World {
-        World::start_with(
-            pod,
-            WorldOptions {
-                blobs: true,
-                reaper_interval: Some(Duration::from_millis(150)),
-                ..WorldOptions::default()
-            },
-        )
-        .await
-    }
-
     pub async fn start_with(pod: &str, options: WorldOptions) -> World {
         install_log_capture();
         let db = TestDb::fresh().await;
         let nats_server = TestNats::spawn().await;
         nats_server.provision(br_drive_example::SERVICE).await;
 
-        let (minio, blob_bucket, blob_config) = if options.blobs {
-            let minio = TestMinio::spawn().await;
-            let bucket = format!("drive-{}", Uuid::now_v7().simple());
-            minio.create_bucket(&bucket).await;
-            let config = minio.config(&bucket);
-            (Some(minio), Some(bucket), Some(config))
-        } else {
-            (None, None, None)
-        };
+        let minio = TestMinio::spawn().await;
+        let blob_bucket = format!("drive-{}", Uuid::now_v7().simple());
+        minio.create_bucket(&blob_bucket).await;
+        let blob_config = minio.config(&blob_bucket);
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut config = base_config(pod, addr);
-        if let Some(blob_config) = blob_config {
-            config = config.with_blob_storage(blob_config);
-        }
-        if let Some(interval) = options.reaper_interval {
-            config = config.with_blob_reaper_interval(interval);
-        }
+        let config = base_config(pod, addr)
+            .with_blob_storage(blob_config)
+            .with_blob_reaper_interval(options.reaper_interval);
 
         let service = boot(
             config,
@@ -106,7 +83,7 @@ impl World {
             http: reqwest::Client::new(),
             minio,
             blob_bucket,
-            _nats_server: nats_server,
+            nats_server,
         }
     }
 
@@ -203,6 +180,51 @@ impl World {
         .fetch_all(&self.db.app)
         .await
         .expect("read the host's folder gesture log")
+    }
+
+    pub async fn object_exists(&self, object_key: &str) -> bool {
+        self.minio
+            .object_exists(&self.blob_bucket, object_key)
+            .await
+    }
+
+    pub async fn object_key_of(&self, reference: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT object_key FROM service_engine.blob WHERE id = $1")
+            .bind(reference)
+            .fetch_optional(&self.db.app)
+            .await
+            .expect("read the blob row")
+    }
+
+    pub async fn send_upload_deadline(&self, file_id: Uuid) {
+        use br_core_integration::{Actor, EventMetadata, IntegrationCommand, ServiceAccountId};
+        let command = IntegrationCommand::new(
+            Uuid::now_v7(),
+            "drive_file.upload-deadline",
+            1,
+            chrono::Utc::now(),
+            EventMetadata::new(
+                Actor::Service(ServiceAccountId::from(Uuid::now_v7())),
+                Uuid::now_v7(),
+            ),
+            serde_json::json!({ "file_id": file_id }),
+        );
+        let bytes = serde_json::to_vec(&command).expect("the command encodes");
+        let client = async_nats::connect(self.nats_server.url())
+            .await
+            .expect("dial the ephemeral broker");
+        let js = async_nats::jetstream::new(client);
+        js.publish(
+            format!(
+                "integration.cmd.{}.drive_file.upload-deadline.v1",
+                br_drive_example::SERVICE
+            ),
+            bytes.into(),
+        )
+        .await
+        .expect("publish the redelivered deadline")
+        .await
+        .expect("the stream acks the redelivered deadline");
     }
 
     pub async fn cleanup(self) {

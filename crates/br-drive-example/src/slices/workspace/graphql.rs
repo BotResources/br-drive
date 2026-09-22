@@ -52,7 +52,8 @@ impl WorkspaceMutation {
     }
 
     async fn workspace_delete(&self, ctx: &Context<'_>, id: Uuid) -> Result<MutationAck> {
-        service_engine::ack::<AppPrincipal, DeleteWorkspace>(ctx, DeleteWorkspace { id }).await
+        service_engine::ack_bulk::<AppPrincipal, DeleteWorkspace>(ctx, DeleteWorkspace { id })
+            .await
     }
 
     async fn workspace_transfer(
@@ -75,6 +76,24 @@ impl WorkspaceMutation {
         use super::mutations::ProtectFile;
         service_engine::ack::<AppPrincipal, ProtectFile>(ctx, ProtectFile { file_id, protected })
             .await
+    }
+
+    #[cfg(feature = "drive")]
+    async fn workspace_annotate_file(
+        &self,
+        ctx: &Context<'_>,
+        file_id: Uuid,
+        metadata: service_engine::JsonScalar,
+    ) -> Result<MutationAck> {
+        use super::mutations::AnnotateFile;
+        service_engine::ack::<AppPrincipal, AnnotateFile>(
+            ctx,
+            AnnotateFile {
+                file_id,
+                metadata: metadata.0,
+            },
+        )
+        .await
     }
 }
 

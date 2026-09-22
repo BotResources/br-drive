@@ -1,5 +1,7 @@
 scalar Affordances
 
+scalar ByteCount
+
 """
 Implement the DateTime<Utc> scalar
 
@@ -16,7 +18,7 @@ type DriveFile {
 	name: String!
 	protected: Boolean!
 	mediaType: String!
-	sizeBytes: Int!
+	sizeBytes: ByteCount!
 	sha256: String!
 	processingState: ProcessingState!
 	processingError: String
@@ -30,7 +32,7 @@ type DriveFile {
 union DriveFileUnion = DriveFile
 
 type DriveMutation {
-	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: Int!, sha256: String!): JSON!
+	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
 	workspaceCommitUpload(fileId: UUID!): MutationAck!
 	workspaceUpdateFile(fileId: UUID!, name: String, path: String, driveId: UUID): MutationAck!
 	workspaceDeleteFile(fileId: UUID!): MutationAck!
@@ -106,6 +108,12 @@ entities without requiring a central allocating authority.
 * [RFC4122: A Universally Unique Identifier (UUID) URN Namespace](http://tools.ietf.org/html/rfc4122)
 """
 scalar UUID
+
+type UploadTicket {
+	fileId: UUID!
+	url: String!
+	fields: JSON!
+}
 
 """
 Directs the executor to include this field or fragment only when the `if` argument is true.

@@ -74,7 +74,7 @@ async fn update_file(
 #[tokio::test]
 async fn moving_a_folder_rewrites_every_path_underneath_and_runs_the_host_hook_in_the_transaction()
 {
-    let world = World::start_blobs("pod-folder-move").await;
+    let world = World::start("pod-folder-move").await;
     let owner = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "library").await;
     let ids = seed_tree(&world, &owner, drive).await;
@@ -143,7 +143,7 @@ async fn moving_a_folder_rewrites_every_path_underneath_and_runs_the_host_hook_i
 
 #[tokio::test]
 async fn deleting_a_folder_removes_its_files_releases_their_blobs_and_runs_the_host_hook() {
-    let world = World::start_blobs("pod-folder-delete").await;
+    let world = World::start("pod-folder-delete").await;
     let owner = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "library").await;
     let ids = seed_tree(&world, &owner, drive).await;
@@ -214,7 +214,7 @@ async fn deleting_a_folder_removes_its_files_releases_their_blobs_and_runs_the_h
 
 #[tokio::test]
 async fn renaming_and_moving_a_file_updates_its_path_and_a_taken_name_is_refused() {
-    let world = World::start_blobs("pod-file-update").await;
+    let world = World::start("pod-file-update").await;
     let owner = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "library").await;
     let ids = seed_tree(&world, &owner, drive).await;
@@ -273,12 +273,33 @@ async fn renaming_and_moving_a_file_updates_its_path_and_a_taken_name_is_refused
     .await;
     assert_eq!(error_code(&missing), "FILE_NOT_FOUND");
 
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$m:JSON!){workspaceAnnotateFile(fileId:$f,metadata:$m){success}}",
+            serde_json::json!({ "f": ids["c.txt"], "m": { "origin": "import", "page": 3 } }),
+        )
+        .await);
+    let annotated = next_drive_delta(&mut sub, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "MetadataChanged"
+    })
+    .await;
+    assert_eq!(annotated["view"]["id"], ids["c.txt"].to_string());
+    let again = world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$m:JSON!){workspaceAnnotateFile(fileId:$f,metadata:$m){success}}",
+            serde_json::json!({ "f": ids["c.txt"], "m": { "origin": "import", "page": 3 } }),
+        )
+        .await;
+    assert_eq!(error_code(&again), "NOTHING_TO_CHANGE");
+
     world.cleanup().await;
 }
 
 #[tokio::test]
 async fn a_protected_file_refuses_user_rename_move_and_delete_and_says_so_in_its_affordances() {
-    let world = World::start_blobs("pod-protected").await;
+    let world = World::start("pod-protected").await;
     let owner = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "library").await;
     let ids = seed_tree(&world, &owner, drive).await;

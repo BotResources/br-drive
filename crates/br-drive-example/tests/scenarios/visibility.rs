@@ -12,7 +12,7 @@ const BYTES: &[u8] = b"visibility bytes";
 
 #[tokio::test]
 async fn losing_the_workspace_removes_its_files_from_the_old_owners_live_session() {
-    let world = World::start_blobs("pod-visibility-transfer").await;
+    let world = World::start("pod-visibility-transfer").await;
     let old_owner_id = Uuid::now_v7();
     let new_owner_id = Uuid::now_v7();
     let old_owner = passport(old_owner_id);
@@ -76,12 +76,26 @@ async fn losing_the_workspace_removes_its_files_from_the_old_owners_live_session
         true
     );
 
+    ok(&world
+        .gql(
+            &new_owner,
+            "mutation($f:UUID!,$n:String){workspaceUpdateFile(fileId:$f,name:$n){success}}",
+            serde_json::json!({ "f": file_id, "n": "renamed-by-the-new-owner.txt" }),
+        )
+        .await);
+    let renamed = next_drive_delta(&mut stranger_session, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "Renamed"
+    })
+    .await;
+    assert_eq!(renamed["view"]["name"], "renamed-by-the-new-owner.txt");
+    old_session.expect_silence(Duration::from_secs(2)).await;
+
     world.cleanup().await;
 }
 
 #[tokio::test]
 async fn an_outsider_sees_nothing_and_every_gesture_is_refused_by_the_host_gate() {
-    let world = World::start_blobs("pod-visibility-outsider").await;
+    let world = World::start("pod-visibility-outsider").await;
     let owner = passport(Uuid::now_v7());
     let outsider = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "private").await;
@@ -128,6 +142,22 @@ async fn an_outsider_sees_nothing_and_every_gesture_is_refused_by_the_host_gate(
         )
         .await;
     assert_eq!(error_code(&moving), "NOT_THE_WORKSPACE_OWNER");
+    let committing = world
+        .gql(
+            &outsider,
+            "mutation($f:UUID!){workspaceCommitUpload(fileId:$f){success}}",
+            serde_json::json!({ "f": file_id }),
+        )
+        .await;
+    assert_eq!(error_code(&committing), "NOT_THE_WORKSPACE_OWNER");
+    let deleting_folder = world
+        .gql(
+            &outsider,
+            "mutation($d:UUID!,$p:String!){workspaceDeleteFolder(driveId:$d,prefix:$p){success}}",
+            serde_json::json!({ "d": drive, "p": "a" }),
+        )
+        .await;
+    assert_eq!(error_code(&deleting_folder), "NOT_THE_WORKSPACE_OWNER");
     let unknown_drive = request(
         &world,
         &owner,
@@ -135,7 +165,11 @@ async fn an_outsider_sees_nothing_and_every_gesture_is_refused_by_the_host_gate(
         &UploadRequest::text(Uuid::now_v7(), "", "nowhere.txt", BYTES),
     )
     .await;
-    assert_eq!(error_code(&unknown_drive), "DRIVE_NOT_FOUND");
+    assert_eq!(
+        error_code(&unknown_drive),
+        "NOT_THE_WORKSPACE_OWNER",
+        "the gate answers first, so an unknown drive id is indistinguishable from a foreign one"
+    );
 
     assert!(
         !world.file(&owner, file_id).await.is_null(),
@@ -147,7 +181,7 @@ async fn an_outsider_sees_nothing_and_every_gesture_is_refused_by_the_host_gate(
 
 #[tokio::test]
 async fn a_file_moves_between_two_drives_of_one_owner_and_never_toward_a_foreign_one() {
-    let world = World::start_blobs("pod-visibility-cross-drive").await;
+    let world = World::start("pod-visibility-cross-drive").await;
     let owner = passport(Uuid::now_v7());
     let stranger = passport(Uuid::now_v7());
     let source_drive = world.create_workspace(&owner, "from").await;

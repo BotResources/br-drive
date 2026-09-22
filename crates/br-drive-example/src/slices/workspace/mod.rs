@@ -17,10 +17,12 @@ pub fn register(engine: &mut Engine<AppPrincipal>) -> Result<(), EngineError> {
     engine.register_principal_fact(principal::load_owned_workspaces)?;
     engine.register_view(view::WorkspacesView)?;
     engine.register_mutation::<mutations::CreateWorkspace, _>(mutations::create_workspace)?;
-    engine.register_mutation::<mutations::DeleteWorkspace, _>(mutations::delete_workspace)?;
+    engine.register_bulk::<mutations::DeleteWorkspace, _>(mutations::delete_workspace)?;
     engine.register_mutation::<mutations::TransferWorkspace, _>(mutations::transfer_workspace)?;
     #[cfg(feature = "drive")]
     engine.register_mutation::<mutations::ProtectFile, _>(mutations::protect_file)?;
+    #[cfg(feature = "drive")]
+    engine.register_mutation::<mutations::AnnotateFile, _>(mutations::annotate_file)?;
     engine.register_schema_slice(
         service_engine::graphql::SliceFragment::derive::<
             graphql::WorkspaceQuery,

@@ -34,8 +34,8 @@ impl<'a> UploadRequest<'a> {
     }
 }
 
-const REQUEST: &str = "mutation($f:UUID!,$d:UUID!,$p:String!,$n:String!,$m:String!,$s:Int!,$h:String!){\
-    workspaceRequestUpload(fileId:$f,driveId:$d,path:$p,name:$n,mediaType:$m,size:$s,sha256:$h)}";
+const REQUEST: &str = "mutation($f:UUID!,$d:UUID!,$p:String!,$n:String!,$m:String!,$s:ByteCount!,$h:String!){\
+    workspaceRequestUpload(fileId:$f,driveId:$d,path:$p,name:$n,mediaType:$m,size:$s,sha256:$h){fileId url fields}}";
 
 pub async fn request(
     world: &World,

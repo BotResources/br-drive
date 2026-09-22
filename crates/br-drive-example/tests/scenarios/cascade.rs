@@ -7,7 +7,7 @@ const BYTES: &[u8] = b"cascade bytes";
 
 #[tokio::test]
 async fn deleting_a_file_releases_its_blob_in_the_same_transaction() {
-    let world = World::start_blobs("pod-cascade-file").await;
+    let world = World::start("pod-cascade-file").await;
     let owner = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "library").await;
     let file_id = upload(
@@ -51,7 +51,7 @@ async fn deleting_a_file_releases_its_blob_in_the_same_transaction() {
 
 #[tokio::test]
 async fn deleting_the_workspace_cascades_to_its_files_and_releases_their_blobs() {
-    let world = World::start_blobs("pod-cascade-drive").await;
+    let world = World::start("pod-cascade-drive").await;
     let owner = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "library").await;
     let mut sources = Vec::new();

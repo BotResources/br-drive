@@ -17,7 +17,7 @@ const WRONG_SHA256: &str = "0000000000000000000000000000000000000000000000000000
 
 #[tokio::test]
 async fn a_verified_upload_round_trips_and_the_file_becomes_ready() {
-    let world = World::start_blobs("pod-upload-roundtrip").await;
+    let world = World::start("pod-upload-roundtrip").await;
     let owner = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "library").await;
     let mut sub = drive_subscription(&world, &owner, drive).await;
@@ -42,6 +42,14 @@ async fn a_verified_upload_round_trips_and_the_file_becomes_ready() {
     assert_eq!(
         requested["view"]["path"], "docs/2026",
         "the path is normalized: no leading or trailing slash"
+    );
+    assert_eq!(
+        requested["view"]["affordances"]["download"]["allowed"], false,
+        "nothing to download before the upload is committed"
+    );
+    assert_eq!(
+        requested["view"]["affordances"]["download"]["reason"],
+        "FILE_NOT_READY"
     );
 
     let status = post_bytes(&world, &ticket, PAYLOAD, "fox.txt").await;
@@ -101,7 +109,7 @@ async fn a_verified_upload_round_trips_and_the_file_becomes_ready() {
 
 #[tokio::test]
 async fn bytes_whose_checksum_does_not_match_are_refused_by_storage_and_the_commit_is_refused() {
-    let world = World::start_blobs("pod-upload-wrong-sha").await;
+    let world = World::start("pod-upload-wrong-sha").await;
     let owner = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "library").await;
 
@@ -123,12 +131,7 @@ async fn bytes_whose_checksum_does_not_match_are_refused_by_storage_and_the_comm
     );
     let object_key = ticket.fields["key"].as_str().expect("the object key");
     assert!(
-        !world
-            .minio
-            .as_ref()
-            .unwrap()
-            .object_exists(world.blob_bucket.as_deref().unwrap(), object_key)
-            .await,
+        !world.object_exists(object_key).await,
         "no object landed under the presigned key"
     );
 
@@ -138,9 +141,10 @@ async fn bytes_whose_checksum_does_not_match_are_refused_by_storage_and_the_comm
         world.file(&owner, file_id).await["processingState"],
         "PENDING"
     );
-    assert!(
-        ok(&world.file_access(&owner, file_id).await)["workspaceFileAccess"].is_null(),
-        "a pending file with no object mints no download URL"
+    assert_eq!(
+        error_code(&world.file_access(&owner, file_id).await),
+        "FILE_NOT_READY",
+        "a pending file affords no download, and the query says why"
     );
 
     world.cleanup().await;
@@ -151,8 +155,7 @@ async fn a_commit_in_the_pending_window_reads_the_storage_head_before_the_reaper
     let world = World::start_with(
         "pod-upload-pending-window",
         WorldOptions {
-            blobs: true,
-            reaper_interval: Some(Duration::from_secs(3600)),
+            reaper_interval: Duration::from_secs(3600),
             ..WorldOptions::default()
         },
     )
@@ -196,9 +199,8 @@ async fn an_abandoned_upload_is_reaped_and_the_file_removed() {
     let world = World::start_with(
         "pod-upload-abandoned",
         WorldOptions {
-            blobs: true,
-            reaper_interval: Some(Duration::from_millis(150)),
             upload_window: Duration::from_secs(1),
+            ..WorldOptions::default()
         },
     )
     .await;
@@ -224,18 +226,70 @@ async fn an_abandoned_upload_is_reaped_and_the_file_removed() {
     })
     .await;
     assert!(world.file(&owner, file_id).await.is_null());
-    let state = world.blob_state(source).await;
-    assert!(
-        state.is_none() || state.as_deref() == Some("orphaned"),
-        "the abandoned file released its blob: {state:?}"
+    assert_eq!(
+        world.blob_state(source).await.as_deref(),
+        Some("orphaned"),
+        "the deadline released the blob in the same transaction"
     );
+    poll_until!(Duration::from_secs(30), {
+        world.blob_state(source).await.is_none().then_some(())
+    });
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_upload_that_landed_but_was_never_committed_is_reaped_with_its_object() {
+    let world = World::start_with(
+        "pod-upload-landed-abandoned",
+        WorldOptions {
+            upload_window: Duration::from_secs(1),
+            ..WorldOptions::default()
+        },
+    )
+    .await;
+    let owner = passport(Uuid::now_v7());
+    let drive = world.create_workspace(&owner, "library").await;
+    let mut sub = drive_subscription(&world, &owner, drive).await;
+
+    let file_id = Uuid::now_v7();
+    let ticket = ticket(
+        &request(
+            &world,
+            &owner,
+            file_id,
+            &UploadRequest::text(drive, "", "landed.txt", PAYLOAD),
+        )
+        .await,
+    );
+    let status = post_bytes(&world, &ticket, PAYLOAD, "landed.txt").await;
+    assert!((200..300).contains(&status), "the bytes land: {status}");
+    let source = world.source_of(file_id).await;
+    let object_key = world
+        .object_key_of(source)
+        .await
+        .expect("the blob row names its object");
+    assert!(world.object_exists(&object_key).await);
+
+    next_drive_delta(&mut sub, |node| {
+        node["__typename"] == "DriveRemove" && node["key"] == file_id.to_string()
+    })
+    .await;
+    assert!(world.file(&owner, file_id).await.is_null());
+    assert_eq!(world.blob_state(source).await.as_deref(), Some("orphaned"));
+    let refused = commit(&world, &owner, file_id).await;
+    assert_eq!(error_code(&refused), "FILE_NOT_FOUND");
+    poll_until!(Duration::from_secs(30), {
+        (!world.object_exists(&object_key).await).then_some(())
+    });
+    assert!(world.blob_state(source).await.is_none());
 
     world.cleanup().await;
 }
 
 #[tokio::test]
 async fn a_sibling_collision_derives_a_counter_before_the_extension() {
-    let world = World::start_blobs("pod-upload-collision").await;
+    let world = World::start("pod-upload-collision").await;
     let owner = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "library").await;
 
@@ -273,7 +327,7 @@ async fn a_sibling_collision_derives_a_counter_before_the_extension() {
 
 #[tokio::test]
 async fn a_path_or_name_that_does_not_normalize_is_refused() {
-    let world = World::start_blobs("pod-upload-normalization").await;
+    let world = World::start("pod-upload-normalization").await;
     let owner = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "library").await;
 
@@ -303,6 +357,40 @@ async fn a_path_or_name_that_does_not_normalize_is_refused() {
     )
     .await;
     assert_eq!(error_code(&refused), "INVALID_SHA256");
+    for media_type in ["text", "text/plain; charset=utf-8", "text plain"] {
+        let refused = request(
+            &world,
+            &owner,
+            Uuid::now_v7(),
+            &UploadRequest {
+                drive,
+                path: "",
+                name: "a.txt",
+                media_type,
+                bytes: PAYLOAD,
+            },
+        )
+        .await;
+        assert_eq!(error_code(&refused), "INVALID_MEDIA_TYPE", "{media_type:?}");
+    }
+    let padded = request(
+        &world,
+        &owner,
+        Uuid::now_v7(),
+        &UploadRequest::text(drive, "docs /x", " a.txt", PAYLOAD),
+    )
+    .await;
+    assert_eq!(error_code(&padded), "INVALID_PATH");
+    let deep = "s".repeat(200);
+    let too_long = [deep.as_str(); 6].join("/");
+    let over = request(
+        &world,
+        &owner,
+        Uuid::now_v7(),
+        &UploadRequest::text(drive, &too_long, "a.txt", PAYLOAD),
+    )
+    .await;
+    assert_eq!(error_code(&over), "INVALID_PATH");
 
     let unrenderable = request(
         &world,

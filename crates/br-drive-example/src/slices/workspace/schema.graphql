@@ -48,6 +48,7 @@ type WorkspaceMutation {
 	workspaceDelete(id: UUID!): MutationAck!
 	workspaceTransfer(id: UUID!, to: UUID!): MutationAck!
 	workspaceProtectFile(fileId: UUID!, protected: Boolean!): MutationAck!
+	workspaceAnnotateFile(fileId: UUID!, metadata: JSON!): MutationAck!
 }
 
 type WorkspaceQuery {

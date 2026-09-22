@@ -1,7 +1,7 @@
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use service_engine::impact::Deps;
-use service_engine::pipeline::{Mutation, MutationInput};
+use service_engine::pipeline::{Bulk, Mutation, MutationInput};
 use service_engine::principal::PrincipalId;
 use uuid::Uuid;
 
@@ -58,7 +58,7 @@ impl MutationInput for DeleteWorkspace {
 }
 
 pub fn delete_workspace<'m>(
-    cx: &'m mut Mutation<'m, AppPrincipal>,
+    cx: &'m mut Bulk<'m, AppPrincipal>,
     input: DeleteWorkspace,
 ) -> BoxFuture<'m, Result<(), AppFault>> {
     Box::pin(async move {
@@ -136,6 +136,39 @@ pub fn protect_file<'m>(
             .ok_or(AppFault::Refused(WORKSPACE_NOT_FOUND))?;
         workspace.transfer_gate(cx.principal()).require()?;
         br_drive::set_protected::<AppPrincipal>(cx, input.file_id, input.protected).await?;
+        Ok(())
+    })
+}
+
+#[cfg(feature = "drive")]
+#[derive(Debug, Deserialize)]
+pub struct AnnotateFile {
+    pub file_id: Uuid,
+    pub metadata: serde_json::Value,
+}
+
+#[cfg(feature = "drive")]
+impl MutationInput for AnnotateFile {
+    type Output = ();
+    type Error = AppFault;
+    const NAME: &'static str = "annotate_file";
+}
+
+#[cfg(feature = "drive")]
+pub fn annotate_file<'m>(
+    cx: &'m mut Mutation<'m, AppPrincipal>,
+    input: AnnotateFile,
+) -> BoxFuture<'m, Result<(), AppFault>> {
+    Box::pin(async move {
+        let drive = br_drive::drive_of(cx, input.file_id)
+            .await?
+            .ok_or(AppFault::Refused(br_drive::codes::FILE_NOT_FOUND))?;
+        let workspace = cx
+            .load::<WorkspaceRow>(&drive)
+            .await?
+            .ok_or(AppFault::Refused(WORKSPACE_NOT_FOUND))?;
+        workspace.transfer_gate(cx.principal()).require()?;
+        br_drive::set_metadata::<AppPrincipal>(cx, input.file_id, input.metadata).await?;
         Ok(())
     })
 }

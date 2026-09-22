@@ -65,7 +65,7 @@ impl TestMinio {
 
     pub fn config(&self, bucket: &str) -> BlobConfig {
         BlobConfig::new(self.endpoint(), REGION, bucket, ACCESS_KEY, SECRET_KEY)
-            .with_upload_ttl(Duration::from_secs(600))
+            .with_upload_ttl(Duration::from_secs(6))
             .with_download_ttl(Duration::from_secs(600))
     }
 
