@@ -1,0 +1,13 @@
+[package]
+name = "br-drive"
+version.workspace = true
+description = "File collections for services built on br-service-engine: drives, files by path, verified uploads, renditions"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-graphql = { workspace = true }
+service-engine = { workspace = true }
+sqlx = { workspace = true, features = ["chrono", "json", "macros", "migrate", "uuid"] }

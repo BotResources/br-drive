@@ -1,0 +1,250 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt-clippy-test:
+    name: cargo fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: cargo test (no infra)
+        run: cargo test --workspace --all-targets --locked --exclude br-drive-example
+      - name: cargo test (example host, infra-free targets)
+        run: |
+          cargo test -p br-drive-example --locked --lib --bins \
+            --test schema_fragments --test schema_gate --test binary_schema
+
+  msrv:
+    name: MSRV 1.89 build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: msrv
+      - run: cargo build --workspace --locked
+
+  deny:
+    name: cargo-deny check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check advisories bans licenses sources
+
+  unused-deps:
+    name: cargo-machete (unused deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-machete
+      - run: cargo machete
+
+  removability:
+    name: example host slices are removable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: removability
+      - name: build the kernel with every slice removed, then each slice removed in turn
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          set -euo pipefail
+          all="workspace drive"
+          cargo build -p br-drive-example --no-default-features --lib --locked
+          for removed in $all; do
+            feats=$(echo "$all" | tr ' ' '\n' | grep -v "^${removed}$" | paste -sd, -)
+            echo "::group::without ${removed} (features: ${feats})"
+            cargo build -p br-drive-example --no-default-features --features "${feats}" --lib --locked
+            echo "::endgroup::"
+          done
+
+  semver:
+    name: cargo semver-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: semver
+      - uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-semver-checks
+      - name: cargo semver-checks (unified baseline)
+        run: |
+          set -euo pipefail
+          baseline=$(git tag --list 'v*' | sort -V | tail -n1)
+          if [ -z "$baseline" ]; then
+            echo "::notice::no prior unified v* tag, skipping semver-checks (first lockstep release)"
+            exit 0
+          fi
+          shopt -s nullglob
+          base_wt="$(mktemp -d)/baseline"
+          git worktree add --detach "$base_wt" "$baseline"
+          trap 'git worktree remove --force "$base_wt" 2>/dev/null || true; git worktree prune' EXIT
+          rustdoc_json() {
+            local dir="$1" crate="$2" out="$3"
+            ( cd "$dir" && RUSTC_BOOTSTRAP=1 \
+              RUSTDOCFLAGS="-Z unstable-options --output-format json --cap-lints allow" \
+              cargo doc -p "$crate" --lib --no-deps --all-features --locked \
+              --target-dir "$out" )
+          }
+          fail=0
+          for toml in crates/*/Cargo.toml; do
+            crate=$(basename "$(dirname "$toml")")
+            case "${crate}" in
+              *-example)
+                echo "::notice::${crate} is the example host (the library's oracle), exempt from semver-checks — br-drive stays gated"
+                continue
+                ;;
+            esac
+            if [ ! -f "crates/${crate}/src/lib.rs" ]; then
+              echo "::notice::${crate} has no library target, skipping semver-checks"
+              continue
+            fi
+            if ! git cat-file -e "${baseline}:crates/${crate}/Cargo.toml" 2>/dev/null; then
+              echo "::notice::${crate} is new since ${baseline}, no baseline to compare, skipping semver-checks"
+              continue
+            fi
+            echo "::group::${crate} vs ${baseline}"
+            lib="${crate//-/_}"
+            rustdoc_json "." "${crate}" "$PWD/target/semver-current"
+            rustdoc_json "$base_wt" "${crate}" "$base_wt/target/semver-baseline"
+            if ! cargo semver-checks -p "${crate}" \
+              --baseline-rustdoc "$base_wt/target/semver-baseline/doc/${lib}.json" \
+              --current-rustdoc "$PWD/target/semver-current/doc/${lib}.json"; then
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+  changelog:
+    name: changelog entry per Cargo.toml version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: check changelog entry
+        run: bash .github/scripts/check-changelog.sh
+      - name: check README tag pins are fresh
+        run: bash .github/scripts/check-readme-pins.sh
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: shellcheck .github/scripts
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          shellcheck --severity=warning .github/scripts/*.sh
+
+  trufflehog:
+    name: trufflehog (secret scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+      - uses: trufflesecurity/trufflehog@d411fff7b8879a62509f3fa98c07f247ac089a51 # v3.95.5
+        with:
+          extra_args: --results=verified,unknown
+
+  e2e:
+    name: example host e2e (real infra)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      E2E_PG_ADMIN_URL: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: e2e
+      - name: tune the ephemeral CI Postgres for the 2-core runner
+        run: bash .github/scripts/tune-ci-postgres.sh
+      - name: install nats-server
+        env:
+          NATS_SERVER_VERSION: v2.14.1
+        run: |
+          set -euo pipefail
+          url="https://github.com/nats-io/nats-server/releases/download/${NATS_SERVER_VERSION}/nats-server-${NATS_SERVER_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL "$url" -o /tmp/nats-server.tar.gz
+          tar -xzf /tmp/nats-server.tar.gz -C /tmp
+          sudo install "/tmp/nats-server-${NATS_SERVER_VERSION}-linux-amd64/nats-server" /usr/local/bin/nats-server
+          nats-server --version
+      - name: cache the MinIO fixture build (keyed on MINIO_COMMIT, valid until the pin moves)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: minio-${{ runner.os }}-01ce918d8279a20e4706b96a64396146894adee4
+      - name: build pinned MinIO fixture from source (upstream publishes no binary archive)
+        env:
+          MINIO_COMMIT: 01ce918d8279a20e4706b96a64396146894adee4
+        run: |
+          set -euo pipefail
+          GOBIN=/tmp/minio-bin go install "github.com/minio/minio@${MINIO_COMMIT}"
+          sudo install /tmp/minio-bin/minio /usr/local/bin/minio
+          minio --version
+      - name: example host e2e
+        run: cargo test -p br-drive-example --all-targets --locked -- --test-threads=3

@@ -1,0 +1,91 @@
+name: release-tags
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-tags
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Auto-tag the unified workspace version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Is the workspace version released in the changelog?
+        id: released
+        run: |
+          set +e
+          bash .github/scripts/check-changelog.sh release
+          status=$?
+          set -e
+          if [ "$status" -eq 2 ]; then
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          echo "released=true" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and release the unified version
+        if: steps.released.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "::error file=Cargo.toml::could not extract the workspace version"
+            exit 1
+          fi
+          tag="v${version}"
+
+          if git rev-parse --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "✓ tag ${tag} already exists"
+          else
+            echo "→ creating tag ${tag}"
+            git tag -a "${tag}" \
+              -m "br-drive ${version}" \
+              -m "Auto-tagged from main. See CHANGELOG.md for the entry."
+            git push origin "${tag}"
+          fi
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "✓ release ${tag} already exists"
+          else
+            echo "→ creating release ${tag}"
+            notes_file=$(mktemp)
+            awk -v target="## ${version}" '
+              !in_section && substr($0, 1, length(target)) == target &&
+              (length($0) == length(target) || substr($0, length(target) + 1, 1) == " ") {
+                in_section = 1; print; next
+              }
+              in_section && /^## / { exit }
+              in_section { print }
+            ' CHANGELOG.md > "$notes_file"
+            if [ ! -s "$notes_file" ]; then
+              echo "::warning file=CHANGELOG.md::could not extract notes for ${tag}; using placeholder"
+              printf 'See [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md) for changes.\n' \
+                "$GITHUB_REPOSITORY" "$tag" > "$notes_file"
+            fi
+            gh release create "${tag}" \
+              --title "br-drive ${version}" \
+              --notes-file "$notes_file" \
+              --verify-tag
+            rm -f "$notes_file"
+          fi

@@ -1,0 +1,42 @@
+[package]
+name = "br-drive-example"
+version.workspace = true
+description = "The example host that embeds br-drive: a fictional workspace service, and the library's e2e oracle"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = ["workspace", "drive"]
+workspace = []
+drive = ["dep:br-drive"]
+
+[dependencies]
+thiserror = { workspace = true }
+async-graphql = { workspace = true }
+axum = { workspace = true }
+br-core-auth = { workspace = true }
+br-core-integration = { workspace = true }
+br-drive = { workspace = true, optional = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+service-engine = { workspace = true }
+sqlx = { workspace = true, features = ["chrono", "json", "macros", "migrate", "uuid"] }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+async-nats = { workspace = true }
+reqwest = { workspace = true, features = ["json", "multipart"] }
+rusty-s3 = { workspace = true }
+sha2 = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "br-drive-example"
+path = "src/bin/service.rs"
