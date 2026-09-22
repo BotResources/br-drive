@@ -59,8 +59,10 @@ The engine's "library slice" path, exactly as `example-lib-roster` does it:
    releases their blobs). A drive has no name and no row of its own on the wire:
    its id is the host object's id, it is the unit of visibility and the root of
    the cascade, nothing else. `br_drive::set_protected` marks a file the users
-   may neither rename, move nor delete; `br_drive::drive_of` answers which drive
-   a file belongs to.
+   may neither rename, move nor delete, `br_drive::set_metadata` writes the
+   host's free JSON on a file (both refuse an unchanged value with
+   `NOTHING_TO_CHANGE`), and `br_drive::drive_of` answers which drive a file
+   belongs to.
 
 Every root field the library contributes is prefixed by the host; the value
 types (`DriveFile`, `DriveDelta`, …) keep their names in every embed, so a
@@ -83,6 +85,11 @@ impl DriveHost for AppPrincipal {
 }
 ```
 
+`br_drive::register` (called by the slice's generated `register`) refuses to
+boot a host that configured no object storage: the upload **is** the library,
+so a storage-less embed fails loud instead of answering an internal error on
+every `RequestUpload`.
+
 - `drive_gate` receives the **request itself**, never only an action name:
   `CreateFile { drive, path, name, media_type, size }`, `ReadFile { file }`,
   `UpdateFile { file, target_drive }` (a cross-drive move names both drives),
@@ -103,6 +110,17 @@ impl DriveHost for AppPrincipal {
   drive arrives as `Remove` deltas, a gained one as `Upsert`s.
 - `SOURCE_MAX_BYTES` (default 1 GiB) and `SOURCE_ORPHAN_AFTER` (default 24 h,
   must cover the engine's `upload_ttl`) are the `BlobPolicy` of the source kind.
+  `upload_window` (default 15 min) should not be shorter than `upload_ttl`: a
+  POST that lands after the deadline already released the row leaves an object
+  on an orphaned blob, which the engine reaper deletes after `orphan_after`.
+- `BULK_RESET_THRESHOLD` (default 256): `MoveFolder`, `DeleteFolder` and
+  `delete_drive` run on the engine's **bulk** pipeline — one set-based
+  statement for the rows, one blob release per file — and stage one caused
+  impact per file up to the threshold, beyond it a projector reset (every open
+  `DriveChanged` session receives a fresh `DriveReset`). So a folder or a drive
+  of any size can be moved or deleted, whatever the engine's
+  `impacts_per_commit`. The host registers the mutation that calls
+  `delete_drive` with `register_bulk` (and answers it with `ack_bulk`).
 - The two hooks run **inside** the `MoveFolder` / `DeleteFolder` transaction,
   after the bulk change, on the same `Ops`; a host that stores path prefixes
   elsewhere rewrites them there, and an `Err` rolls the whole gesture back (an
@@ -116,21 +134,24 @@ client-generated UUIDv7.
 
 | Root | Shape |
 |---|---|
-| `<p>RequestUpload(fileId, driveId, path, name, mediaType, size, sha256): JSON!` | gate `CreateFile` → uniqueness (` (1)`, ` (2)` before the extension) → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. Returns `{ fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. |
-| `<p>CommitUpload(fileId): MutationAck!` | a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` if the object is absent, `UPLOAD_MISMATCH` if it is not the pinned bytes; else `READY` (no ruleset yet). A second commit is `FILE_NOT_PENDING`. |
-| `<p>UpdateFile(fileId, name?, path?, driveId?): MutationAck!` | rename, move, or move to another drive of the same host; `NAME_TAKEN` on collision, `NOTHING_TO_CHANGE` when nothing differs, `FILE_PROTECTED` on a protected file. |
+| `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256): UploadTicket!` | gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). |
+| `<p>CommitUpload(fileId): MutationAck!` | a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); else `READY` (no ruleset yet). A second commit is `FILE_NOT_PENDING`. |
+| `<p>UpdateFile(fileId, name?, path?, driveId?): MutationAck!` | rename, move, or move to another drive of the same host; both drives are locked before the sibling check, so a concurrent collision answers `NAME_TAKEN`, never a database error; `NOTHING_TO_CHANGE` when nothing differs, `FILE_PROTECTED` on a protected file. |
 | `<p>DeleteFile(fileId): MutationAck!` | cascade; the source blob is released in the same transaction. |
-| `<p>MoveFolder(driveId, oldPrefix, newPrefix): MutationAck!` | one bulk `UPDATE` on the prefix (the rows are locked first), then `folder_moved`; `FOLDER_NOT_FOUND`, `FOLDER_INTO_ITSELF`, `NAME_TAKEN` (refused as a whole), `FILE_PROTECTED` if any file under the prefix is protected, `INVALID_PATH` for the root. |
-| `<p>DeleteFolder(driveId, prefix): MutationAck!` | deletes every file under the prefix (each releases its blob), then `folder_deleted`. |
+| `<p>MoveFolder(driveId, oldPrefix, newPrefix): MutationAck!` | bulk pipeline: one `UPDATE` on the prefix (the rows are locked first), then `folder_moved`; `FOLDER_NOT_FOUND`, `FOLDER_INTO_ITSELF`, `NAME_TAKEN` (refused as a whole), `FILE_PROTECTED` if any file under the prefix is protected, `INVALID_PATH` for the root or a rebased path over 1024 bytes. |
+| `<p>DeleteFolder(driveId, prefix): MutationAck!` | bulk pipeline: one `DELETE` for every file under the prefix, one blob release per file, then `folder_deleted`. |
 | `<p>File(fileId): DriveFile` | the file as the caller sees it, or `null`. |
 | `<p>DriveFiles(driveId): [DriveFile!]!` | the drive's files as the caller sees them (the tree is a path prefix; empty folders do not exist). |
-| `<p>FileAccess(fileId, name: String): String` | a short-lived presigned GET on the source (attachment); `null` until the object is landed **and** promoted by the engine reaper (a verified blob is never downloadable in the pending window), or when the caller cannot see the file; a coded error when the `download` affordance is denied. `name` is reserved for the extracted images (milestone 3) and answers `null` today. |
+| `<p>FileAccess(fileId, name: String): String` | a short-lived presigned GET on the source (attachment); `null` when the caller cannot see the file, a coded refusal when the `download` affordance is denied (`FILE_NOT_READY` before the commit, then the host's code), and `null` between the commit and the engine reaper's promotion (a verified blob is never downloadable in the pending window; the `SourceAvailable` cause says when to retry). `name` is reserved for the extracted images (milestone 3) and answers `null` today. |
 | `<p>DriveChanged(driveId): DriveDelta!` | the engine snapshot on connect (`DriveReset`), then `DriveUpsert` / `DriveRemove` on the contiguous revision. |
 
 `DriveFile`: `id`, `driveId`, `path` (normalized, `""` = root), `name`,
-`protected`, `mediaType`, `sizeBytes`, `sha256` (hex), `processingState`
+`protected`, `mediaType`, `sizeBytes` (`ByteCount`, a 64-bit JSON number —
+GraphQL `Int` is 32-bit), `sha256` (hex), `processingState`
 (`PENDING | PROCESSING | READY | FAILED`), `processingError`, `metadata`
-(JSON), `createdBy`, `createdAt`, `updatedAt`, `affordances`.
+(JSON), `createdBy`, `createdAt`, `updatedAt`, `affordances` (`delete`,
+`rename`, `move`, `download` — `download` is denied with `FILE_NOT_READY`
+until the file is `READY`).
 
 `DriveDelta` is the engine's delta union: `DriveReset { revision, views }`,
 `DriveUpsert { revision, view, cause }`, `DriveRemove { revision, projector,
@@ -149,9 +170,11 @@ released and the engine reaper removes the object). A file whose object landed
 but was never committed is deleted the same way.
 
 Paths: `/`-separated segments, no leading or trailing slash (both are
-normalized away), no empty, `.` or `..` segment, no control character or
-backslash, segment ≤ 255 bytes, `""` is the root. Names obey the segment rules
-and carry no `/`. Anything else is `INVALID_PATH` / `INVALID_NAME`.
+normalized away), no empty, `.` or `..` segment, no segment with leading or
+trailing whitespace, no control character or backslash, segment ≤ 255 bytes,
+whole path ≤ 1024 bytes, `""` is the root. Names obey the segment rules and
+carry no `/`. Comparison is byte-wise: case-sensitive, no Unicode
+normalization. Anything else is `INVALID_PATH` / `INVALID_NAME`.
 
 ## The example host
 

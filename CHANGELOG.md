@@ -35,32 +35,49 @@ single git tag `v{version}` releases the set. Format follows
   `folder_moved` and `folder_deleted` (default no-op; a refusal rolls the bulk
   gesture back).
 - GraphQL roots at the host prefix: `<p>RequestUpload(fileId, driveId, path,
-  name, mediaType, size, sha256)` → `{ fileId, url, fields }` (a verified
-  presigned POST pinning the exact size and SHA-256), `<p>CommitUpload(fileId)`
-  (a live storage HEAD in the pending window; `READY` on commit),
+  name, mediaType, size: ByteCount, sha256)` → `UploadTicket { fileId, url,
+  fields }` (a verified presigned POST pinning the exact size and SHA-256),
+  `<p>CommitUpload(fileId)` (a live storage HEAD in the pending window; `READY`
+  on commit),
   `<p>UpdateFile(fileId, name?, path?, driveId?)`, `<p>DeleteFile(fileId)`,
   `<p>MoveFolder(driveId, oldPrefix, newPrefix)`, `<p>DeleteFolder(driveId,
   prefix)`, `<p>File(fileId)`, `<p>DriveFiles(driveId)`, `<p>FileAccess(fileId,
   name?)` (a presigned GET, attachment disposition) and the
   `<p>DriveChanged(driveId)` subscription delivering `DriveDelta` over the common
   `DriveFile` value type with its `affordances` (`delete`, `rename`, `move`,
-  `download`) computed from the host gate and `protected`.
+  `download` — denied `FILE_NOT_READY` until the file is `READY`) computed from
+  the host gate and `protected`. `MoveFolder`, `DeleteFolder` and
+  `delete_drive` run on the engine's bulk pipeline (set-based statements, one
+  blob release per file, a projector reset past `DriveHost::BULK_RESET_THRESHOLD`)
+  so a folder or a drive of any size can be moved or deleted.
 - Abandoned uploads: a scheduled `upload-deadline` reaction deletes a file
   still `PENDING` past the host's `upload_window` (releasing its blob for the
   engine reaper); a post-upload policy on the `drive_source` kind impacts the
   file (`SourceAvailable`) when the reaper promotes its object.
+- Value objects and bounds: `MediaType` (`type/subtype` token pair, ≤ 255
+  bytes, `INVALID_MEDIA_TYPE`), whole path ≤ 1024 bytes and no padded segment
+  (`INVALID_PATH`), `ByteCount` (64-bit sizes on the wire), matching `CHECK`
+  constraints in the migration. `set_metadata` gives the host a write path for
+  the file's free JSON. The library refuses to register on a host that
+  configured no object storage.
 - Reason codes: `DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`,
-  `FILE_PROTECTED`, `FILE_NOT_PENDING`, `FILE_TOO_LARGE`, `UPLOAD_NOT_LANDED`,
-  `UPLOAD_MISMATCH`, `INVALID_SHA256`, `INVALID_PATH`, `INVALID_NAME`,
-  `NAME_TAKEN`, `FOLDER_INTO_ITSELF`, `NOTHING_TO_CHANGE`, plus the engine's
-  `KEY_REUSED` and the host's own codes through the gate and the hooks.
+  `FILE_PROTECTED`, `FILE_NOT_PENDING`, `FILE_NOT_READY`, `FILE_TOO_LARGE`,
+  `UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,
+  `INVALID_NAME`, `NAME_TAKEN`, `FOLDER_INTO_ITSELF`, `NOTHING_TO_CHANGE`, plus
+  the engine's `KEY_REUSED` and the host's own codes through the gate and the
+  hooks.
 - Example host: `workspaceCreate` / `workspaceDelete` wrap `create_drive` /
   `delete_drive`, `workspaceTransfer` moves the drive's visibility,
   `workspaceProtectFile` wraps `set_protected`; the host gate refuses one media
   type it cannot render and the hooks log every folder gesture (and refuse the
-  `forbidden` prefix). Sixteen e2e scenarios over real PostgreSQL, NATS and
+  `forbidden` prefix). Twenty-four e2e scenarios over real PostgreSQL, NATS and
   MinIO: verified round trip, wrong checksum refused by storage, commit in the
-  pending window, abandoned upload reaped, sibling collision, normalization
-  refusals, folder move and delete with the hooks in the transaction, rename and
-  move, `protected`, cascade releases blobs, visibility loss delivers `Remove`,
-  the outsider is refused every gesture, cross-drive move.
+  pending window, abandoned upload reaped (never posted, and landed but never
+  committed — with the object's deletion), sibling collision, normalization
+  refusals, folder move and delete with the hooks in the transaction, the bulk
+  path past the reset threshold (move, folder delete, drive delete), rename and
+  move, `protected`, metadata, cascade releases blobs, visibility loss delivers
+  `Remove` and the old session then stays silent, the outsider is refused every
+  gesture, cross-drive move, two concurrent uploads of one name and two
+  concurrent renames onto one name, a redelivered upload deadline, a fresh
+  subscription after mutations.
