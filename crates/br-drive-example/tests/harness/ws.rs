@@ -12,6 +12,15 @@ pub struct Subscription {
 
 impl Subscription {
     pub async fn open(ws_url: &str, passport: &str, query: &str) -> Subscription {
+        Self::open_with(ws_url, passport, query, serde_json::json!({})).await
+    }
+
+    pub async fn open_with(
+        ws_url: &str,
+        passport: &str,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Subscription {
         let mut request = ws_url
             .into_client_request()
             .expect("a valid websocket request");
@@ -39,7 +48,7 @@ impl Subscription {
         let subscribe = serde_json::json!({
             "id": "1",
             "type": "subscribe",
-            "payload": { "query": query },
+            "payload": { "query": query, "variables": variables },
         });
         socket
             .send(Message::text(subscribe.to_string()))

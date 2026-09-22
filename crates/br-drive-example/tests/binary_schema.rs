@@ -14,7 +14,7 @@ fn the_binary_prints_the_composed_sdl_without_touching_infra() {
     );
     let sdl = String::from_utf8(output.stdout).expect("utf-8 sdl");
     assert!(
-        sdl.contains("workspaceDriveVersion"),
+        sdl.contains("workspaceRequestUpload"),
         "the SDL carries the library slice under the host prefix: {sdl}"
     );
     assert!(

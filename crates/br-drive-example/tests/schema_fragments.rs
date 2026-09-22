@@ -1,4 +1,4 @@
-use async_graphql::{EmptyMutation, EmptySubscription, Schema};
+use async_graphql::Schema;
 
 fn check(slice: &str, sdl: String) {
     let path = format!(
@@ -36,10 +36,10 @@ fn workspace_slice_sdl_matches_its_committed_fragment() {
 #[cfg(feature = "drive")]
 #[test]
 fn drive_slice_sdl_matches_its_committed_fragment() {
-    use br_drive_example::slices::drive::DriveQuery;
+    use br_drive_example::slices::drive::{DriveMutation, DriveQuery, DriveSubscription};
     check(
         "drive",
-        Schema::build(DriveQuery, EmptyMutation, EmptySubscription)
+        Schema::build(DriveQuery, DriveMutation, DriveSubscription)
             .finish()
             .sdl(),
     );

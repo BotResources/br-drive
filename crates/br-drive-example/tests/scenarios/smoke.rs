@@ -12,16 +12,16 @@ async fn the_host_boots_with_the_drive_slice_and_serves_both_slices_under_its_pr
     let owner_id = Uuid::now_v7();
     let owner = passport(owner_id);
 
-    let version = world
+    let empty = world
         .gql(
             &owner,
-            "query{workspaceDriveVersion}",
-            serde_json::json!({}),
+            "query($d:UUID!){workspaceDriveFiles(driveId:$d){id}}",
+            serde_json::json!({ "d": Uuid::now_v7() }),
         )
         .await;
     assert_eq!(
-        ok(&version)["workspaceDriveVersion"],
-        br_drive::VERSION,
+        ok(&empty)["workspaceDriveFiles"].as_array().unwrap().len(),
+        0,
         "the library slice answers under the host prefix"
     );
 
