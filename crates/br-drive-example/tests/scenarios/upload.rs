@@ -59,16 +59,24 @@ async fn a_verified_upload_round_trips_and_the_file_becomes_ready() {
     );
 
     ok(&commit(&world, &owner, file_id).await);
-    let committed = next_drive_delta(&mut sub, |node| {
-        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "UploadCommitted"
-    })
-    .await;
-    assert_eq!(committed["view"]["processingState"], "READY");
-    assert_eq!(committed["view"]["affordances"]["delete"]["allowed"], true);
-    assert_eq!(
-        committed["view"]["affordances"]["download"]["allowed"],
-        true
-    );
+    let mut causes = std::collections::BTreeSet::new();
+    while causes.len() < 2 {
+        let delta = next_drive_delta(&mut sub, |node| {
+            node["__typename"] == "DriveUpsert"
+                && matches!(
+                    node["cause"]["kind"].as_str(),
+                    Some("UploadCommitted" | "SourceAvailable")
+                )
+        })
+        .await;
+        let kind = delta["cause"]["kind"].as_str().unwrap().to_string();
+        if kind == "UploadCommitted" {
+            assert_eq!(delta["view"]["processingState"], "READY");
+            assert_eq!(delta["view"]["affordances"]["delete"]["allowed"], true);
+            assert_eq!(delta["view"]["affordances"]["download"]["allowed"], true);
+        }
+        causes.insert(kind);
+    }
 
     let file = world.file(&owner, file_id).await;
     assert_eq!(file["sizeBytes"], PAYLOAD.len());
@@ -98,11 +106,6 @@ async fn a_verified_upload_round_trips_and_the_file_becomes_ready() {
         PAYLOAD,
         "the presigned GET round-trips the bytes"
     );
-
-    next_drive_delta(&mut sub, |node| {
-        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "SourceAvailable"
-    })
-    .await;
 
     world.cleanup().await;
 }
