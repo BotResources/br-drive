@@ -49,7 +49,6 @@ type DriveLabel {
 	name: String!
 	color: String!
 	description: String!
-	createdBy: UUID!
 	createdAt: DateTime!
 	updatedAt: DateTime!
 }

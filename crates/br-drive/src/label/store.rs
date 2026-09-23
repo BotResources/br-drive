@@ -139,10 +139,19 @@ impl Aggregate for LabelRow {
 }
 
 pub async fn all_ids(conn: &mut PgConnection) -> Result<Vec<Uuid>, EngineError> {
-    let rows = sqlx::query("SELECT id FROM drive.label ORDER BY lower(name)")
+    let rows = sqlx::query("SELECT id FROM drive.label")
         .fetch_all(conn)
         .await?;
     Ok(rows.iter().map(|row| row.get::<Uuid, _>("id")).collect())
+}
+
+/// Serializes the name checks of two concurrent saves, so a collision is
+/// answered `LABEL_NAME_TAKEN` and never the unique index's error.
+pub async fn serialize_labels(conn: &mut PgConnection) -> Result<(), EngineError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('drive.label'))")
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 pub async fn name_taken(

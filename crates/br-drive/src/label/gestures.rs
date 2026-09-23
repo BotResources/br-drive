@@ -5,12 +5,15 @@ use serde::Deserialize;
 use service_engine::pipeline::{Mutation, MutationInput};
 use uuid::Uuid;
 
+use service_engine::pipeline::Bulk;
+
 use super::store::{
     existing_ids, files_with_label, labels_of_file, name_taken, replace_file_labels,
+    serialize_labels,
 };
-use super::{Label, LabelCause, LabelRow, validate_color, validate_name};
+use super::{Label, LabelCause, LabelRow, validate_color, validate_description, validate_name};
 use crate::fault::{DriveFault, codes};
-use crate::file::{File, FileCause, FileRow};
+use crate::file::{DriveFiles, File, FileCause, FileRow};
 use crate::host::{DriveHost, DriveRequest};
 
 fn manage_gate<H: DriveHost>(principal: &H) -> Result<(), DriveFault> {
@@ -42,6 +45,8 @@ pub fn create_label<'m, H: DriveHost>(
         manage_gate(cx.principal())?;
         let name = validate_name(&input.name)?;
         let color = validate_color(&input.color)?;
+        let description = validate_description(input.description.as_deref().unwrap_or(""))?;
+        serialize_labels(cx.connection()).await?;
         if name_taken(cx.connection(), &name, None).await? {
             return Err(DriveFault::Refused(codes::LABEL_NAME_TAKEN));
         }
@@ -50,7 +55,7 @@ pub fn create_label<'m, H: DriveHost>(
             id: input.id,
             name,
             color,
-            description: input.description.unwrap_or_default(),
+            description,
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,
@@ -81,6 +86,7 @@ pub fn update_label<'m, H: DriveHost>(
 ) -> BoxFuture<'m, Result<(), DriveFault>> {
     Box::pin(async move {
         manage_gate(cx.principal())?;
+        serialize_labels(cx.connection()).await?;
         let mut label = cx
             .load::<LabelRow>(&input.id)
             .await?
@@ -123,8 +129,11 @@ impl MutationInput for DeleteLabel {
     const NAME: &'static str = "drive_delete_label";
 }
 
+/// Deleting a label detaches every file it was on: the bulk pipeline, so a
+/// label on any number of files can go — one `LabelsChanged` per file up to
+/// the host's threshold, a `DriveFiles` reset beyond it.
 pub fn delete_label<'m, H: DriveHost>(
-    cx: &'m mut Mutation<'m, H>,
+    cx: &'m mut Bulk<'m, H>,
     input: DeleteLabel,
 ) -> BoxFuture<'m, Result<(), DriveFault>> {
     Box::pin(async move {
@@ -136,6 +145,10 @@ pub fn delete_label<'m, H: DriveHost>(
         let detached = files_with_label(cx.connection(), label.id).await?;
         cx.delete(&label).await?;
         cx.impact_caused::<Label, _>(&label.id, LabelCause::Deleted)?;
+        if detached.len() > H::BULK_RESET_THRESHOLD {
+            cx.impact_all_view::<DriveFiles<H>>();
+            return Ok(());
+        }
         for file in detached {
             cx.impact_caused::<File, _>(
                 &file,

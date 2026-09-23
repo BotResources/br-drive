@@ -60,12 +60,12 @@ pub fn register<H: DriveHost>(
     engine.register_mutation::<DeleteRuleset, _>(delete_ruleset::<H>)?;
     engine.register_mutation::<CreateLabel, _>(create_label::<H>)?;
     engine.register_mutation::<UpdateLabel, _>(update_label::<H>)?;
-    engine.register_mutation::<DeleteLabel, _>(delete_label::<H>)?;
     engine.register_mutation::<SetFileLabels, _>(set_file_labels::<H>)?;
     engine.register_mutation::<RunnerRequestImageUpload, _>(runner_request_image_upload::<H>)?;
     engine.register_mutation::<RunnerReport, _>(runner_report::<H>)?;
     engine.register_bulk::<MoveFolder, _>(folders::move_folder::<H>)?;
     engine.register_bulk::<DeleteFolder, _>(folders::delete_folder::<H>)?;
+    engine.register_bulk::<DeleteLabel, _>(delete_label::<H>)?;
     let durable = |suffix: &str| processing::durable(H::SERVICE, suffix);
     engine.register_reaction::<UploadDeadline<H>, _, _>(
         &durable(UPLOAD_DEADLINE_DURABLE),

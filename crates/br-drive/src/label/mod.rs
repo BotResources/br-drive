@@ -20,6 +20,7 @@ pub use store::label_ids_of_files;
 pub use view::{DriveLabel, DriveLabels, LabelWindow};
 
 pub const MAX_LABEL_NAME_CHARS: usize = 100;
+pub const MAX_LABEL_DESCRIPTION_BYTES: usize = 1024;
 
 pub struct Label;
 
@@ -56,6 +57,14 @@ pub fn validate_name(raw: &str) -> Result<String, DriveFault> {
     Ok(name.to_string())
 }
 
+/// A label description: free text, at most 1 KiB.
+pub fn validate_description(raw: &str) -> Result<String, DriveFault> {
+    if raw.len() > MAX_LABEL_DESCRIPTION_BYTES {
+        return Err(DriveFault::Refused(codes::INVALID_LABEL));
+    }
+    Ok(raw.to_string())
+}
+
 /// A label colour: `#rrggbb`, lowercase hexadecimal (an uppercase input is
 /// accepted and lowercased).
 pub fn validate_color(raw: &str) -> Result<String, DriveFault> {
@@ -76,11 +85,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_name_is_trimmed_and_bounded() {
+    fn a_name_is_trimmed_and_bounded_in_characters_like_the_database_check() {
         assert_eq!(validate_name("  Urgent ").unwrap(), "Urgent");
         assert!(validate_name("   ").is_err());
         assert!(validate_name(&"x".repeat(101)).is_err());
-        assert!(validate_name(&"é".repeat(100)).is_ok());
+        let accented = "é".repeat(100);
+        assert!(
+            accented.len() > MAX_LABEL_NAME_CHARS,
+            "two bytes per character"
+        );
+        assert!(validate_name(&accented).is_ok());
+        assert!(validate_name(&"é".repeat(101)).is_err());
+    }
+
+    #[test]
+    fn a_description_is_bounded_in_bytes() {
+        assert!(validate_description(&"x".repeat(1024)).is_ok());
+        assert!(validate_description(&"é".repeat(600)).is_err());
     }
 
     #[test]

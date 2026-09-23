@@ -329,7 +329,7 @@ macro_rules! drive_slice {
                     ctx: &::async_graphql::Context<'_>,
                     id: ::uuid::Uuid,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
-                    ::service_engine::ack::<$p, $crate::DeleteLabel>(
+                    ::service_engine::ack_bulk::<$p, $crate::DeleteLabel>(
                         ctx,
                         $crate::DeleteLabel { id },
                     )

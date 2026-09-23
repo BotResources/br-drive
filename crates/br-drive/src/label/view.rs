@@ -22,7 +22,6 @@ pub struct DriveLabel {
     pub name: String,
     pub color: String,
     pub description: String,
-    pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -71,7 +70,6 @@ impl<H: DriveHost> Projector for DriveLabels<H> {
             name: row.name.clone(),
             color: row.color.clone(),
             description: row.description.clone(),
-            created_by: row.created_by,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })

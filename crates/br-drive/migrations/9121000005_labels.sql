@@ -1,8 +1,8 @@
 CREATE TABLE drive.label (
     id          uuid        PRIMARY KEY,
-    name        text        NOT NULL CHECK (octet_length(name) BETWEEN 1 AND 100),
+    name        text        NOT NULL CHECK (char_length(name) BETWEEN 1 AND 100),
     color       text        NOT NULL CHECK (color ~ '^#[0-9a-f]{6}$'),
-    description text        NOT NULL DEFAULT '',
+    description text        NOT NULL DEFAULT '' CHECK (octet_length(description) <= 1024),
     created_by  uuid        NOT NULL,
     created_at  timestamptz NOT NULL,
     updated_at  timestamptz NOT NULL

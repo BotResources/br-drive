@@ -40,7 +40,7 @@ pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
 pub use image::{ImageName, InvalidImageName, MAX_IMAGE_NAME_BYTES};
 pub use label::{
     CreateLabel, DeleteLabel, DriveLabel, DriveLabels, Label, LabelCause, LabelRow, LabelWindow,
-    MAX_LABEL_NAME_CHARS, SetFileLabels, UpdateLabel,
+    MAX_LABEL_DESCRIPTION_BYTES, MAX_LABEL_NAME_CHARS, SetFileLabels, UpdateLabel,
 };
 pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
