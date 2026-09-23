@@ -3,19 +3,23 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::harness::runner::{
-    RUNNER_SCOPE, Report, assign_job, context, image_ticket, report, request_image, upload_image,
+    RUNNER_SCOPE, Report, context, image_ticket, install_render_rule, report, request_image,
+    upload_image,
 };
 use crate::harness::upload::{UploadRequest, post_bytes, upload};
 use crate::harness::{
-    World, WorldOptions, drain_with_a_rename, drive_subscription, error_code, next_drive_delta,
-    next_page_delta, ok, pages_subscription, passport, service_passport,
+    JobsStandIn, World, WorldOptions, drain_with_a_rename, drive_subscription, error_code,
+    manager_passport, next_drive_delta, next_page_delta, ok, pages_subscription, passport,
+    service_passport,
 };
 use crate::poll_until;
 
 const SOURCE: &[u8] = b"the source document";
 const IMAGE: &[u8] = b"\x89PNG fake image bytes";
 
-async fn file_with_job(world: &World, owner: &str) -> (Uuid, Uuid, Uuid) {
+async fn file_with_job(world: &World, jobs: &JobsStandIn, owner: &str) -> (Uuid, Uuid, Uuid) {
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    install_render_rule(world, jobs, &manager).await;
     let drive = world.create_workspace(owner, "library").await;
     let file_id = upload(
         world,
@@ -23,7 +27,7 @@ async fn file_with_job(world: &World, owner: &str) -> (Uuid, Uuid, Uuid) {
         &UploadRequest::text(drive, "docs", "source.txt", SOURCE),
     )
     .await;
-    let job_id = assign_job(world, owner, file_id).await;
+    let job_id = world.await_job(file_id).await;
     (drive, file_id, job_id)
 }
 
@@ -32,7 +36,8 @@ async fn the_runner_context_carries_a_fresh_presigned_get_on_the_source_and_the_
     let world = World::start("pod-runner-context").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    let (_, file_id, job_id) = file_with_job(&world, &owner).await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let (_, file_id, job_id) = file_with_job(&world, &jobs, &owner).await;
 
     let context_json = poll_until!(Duration::from_secs(15), {
         let response = context(&world, &runner, file_id, job_id).await;
@@ -115,7 +120,8 @@ async fn the_runner_context_says_source_not_available_until_the_reaper_promoted_
     .await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    let (_, file_id, job_id) = file_with_job(&world, &owner).await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let (_, file_id, job_id) = file_with_job(&world, &jobs, &owner).await;
 
     let pending = context(&world, &runner, file_id, job_id).await;
     assert_eq!(
@@ -125,8 +131,8 @@ async fn the_runner_context_says_source_not_available_until_the_reaper_promoted_
     );
     assert_eq!(
         world.file(&owner, file_id).await["processingState"],
-        "READY",
-        "the commit itself went through"
+        "PROCESSING",
+        "the commit itself went through and the chain started"
     );
 
     world.cleanup().await;
@@ -136,7 +142,8 @@ async fn the_runner_context_says_source_not_available_until_the_reaper_promoted_
 async fn the_runner_roots_refuse_a_human_and_a_service_without_the_runner_scope() {
     let world = World::start("pod-runner-scope").await;
     let owner = passport(Uuid::now_v7());
-    let (drive, file_id, job_id) = file_with_job(&world, &owner).await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let (drive, file_id, job_id) = file_with_job(&world, &jobs, &owner).await;
     let unscoped = service_passport(&["workspace:other"]);
 
     for principal in [&owner, &unscoped] {
@@ -190,7 +197,8 @@ async fn a_runner_holding_the_scope_but_not_the_files_job_is_refused_every_root(
     let world = World::start("pod-runner-wrong-job").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    let (_, file_id, _) = file_with_job(&world, &owner).await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let (_, file_id, _) = file_with_job(&world, &jobs, &owner).await;
     let stale = Uuid::now_v7();
 
     let refused = context(&world, &runner, file_id, stale).await;
@@ -233,7 +241,8 @@ async fn an_image_round_trips_through_a_verified_upload_and_a_wrong_checksum_is_
     let world = World::start("pod-runner-image").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    let (drive, file_id, job_id) = file_with_job(&world, &owner).await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let (drive, file_id, job_id) = file_with_job(&world, &jobs, &owner).await;
     let mut sub = drive_subscription(&world, &owner, drive).await;
 
     let ticket = image_ticket(
@@ -348,7 +357,8 @@ async fn replacing_an_image_keeps_the_old_object_readable_until_the_new_one_land
     let world = World::start("pod-runner-image-replace").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    let (_, file_id, job_id) = file_with_job(&world, &owner).await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let (_, file_id, job_id) = file_with_job(&world, &jobs, &owner).await;
     let name = "p001-img01.png";
 
     upload_image(&world, &runner, file_id, job_id, name, IMAGE).await;
@@ -447,7 +457,8 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
     let world = World::start("pod-runner-report").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    let (drive, file_id, job_id) = file_with_job(&world, &owner).await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let (drive, file_id, job_id) = file_with_job(&world, &jobs, &owner).await;
     world.await_source_promoted(file_id).await;
     let mut files = drive_subscription(&world, &owner, drive).await;
     let mut pages = pages_subscription(&world, &owner, file_id).await;
@@ -466,7 +477,10 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
     })
     .await;
     assert_eq!(entered["view"]["markdown"], "two");
-    assert_eq!(entered["view"]["affordances"]["editPage"]["allowed"], true);
+    assert_eq!(
+        entered["view"]["affordances"]["editPage"]["reason"], "FILE_PROCESSING",
+        "no page edit while the chain runs"
+    );
     assert!(
         entered["cause"].is_null(),
         "a page entering the window is delivered by repopulation, without a cause"
@@ -639,7 +653,8 @@ async fn two_concurrent_report_batches_on_one_file_both_land() {
     let world = World::start("pod-runner-concurrent-report").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    let (_, file_id, job_id) = file_with_job(&world, &owner).await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let (_, file_id, job_id) = file_with_job(&world, &jobs, &owner).await;
 
     let batch = |pages: Vec<(i32, &'static str)>| {
         report(

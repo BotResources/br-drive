@@ -2,12 +2,15 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use crate::harness::runner::{RUNNER_SCOPE, Report, assign_job, report, upload_image};
+use crate::harness::runner::{
+    RUNNER_SCOPE, Report, finish_job, install_regenerate_rule, install_render_rule, report,
+    upload_image,
+};
 use crate::harness::upload::{UploadRequest, upload};
 use crate::harness::{
-    PAGE_DELTAS, Subscription, World, drain_with_a_rename, drive_subscription, error_code,
-    next_drive_delta, next_page_delta, ok, pages_reset, pages_subscription, passport,
-    service_passport,
+    JobsStandIn, PAGE_DELTAS, Subscription, World, drain_with_a_rename, drive_subscription,
+    error_code, manager_passport, next_drive_delta, next_page_delta, ok, pages_reset,
+    pages_subscription, passport, service_passport,
 };
 use crate::poll_until;
 
@@ -24,10 +27,24 @@ async fn image_source(world: &World, file_id: Uuid, name: &str) -> Uuid {
         .0
 }
 
-async fn rendered_file(world: &World, owner: &str, runner: &str, drive: Uuid, name: &str) -> Uuid {
+async fn rules(world: &World) -> (JobsStandIn, String) {
+    let jobs = JobsStandIn::attach(world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    install_render_rule(world, &jobs, &manager).await;
+    (jobs, manager)
+}
+
+async fn rendered_file(
+    world: &World,
+    jobs: &JobsStandIn,
+    owner: &str,
+    runner: &str,
+    drive: Uuid,
+    name: &str,
+) -> Uuid {
     let file_id = upload(world, owner, &UploadRequest::text(drive, "", name, SOURCE)).await;
     world.await_source_promoted(file_id).await;
-    let job_id = assign_job(world, owner, file_id).await;
+    let job_id = world.await_job(file_id).await;
     ok(&report(
         world,
         runner,
@@ -41,6 +58,8 @@ async fn rendered_file(world: &World, owner: &str, runner: &str, drive: Uuid, na
         },
     )
     .await);
+    finish_job(world, jobs, job_id).await;
+    world.await_state(owner, file_id, "READY").await;
     file_id
 }
 
@@ -49,8 +68,9 @@ async fn a_user_edits_a_page_of_a_ready_file_and_only_that_page_travels() {
     let world = World::start("pod-page-edit").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
+    let (jobs, _) = rules(&world).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = rendered_file(&world, &owner, &runner, drive, "doc.txt").await;
+    let file_id = rendered_file(&world, &jobs, &owner, &runner, drive, "doc.txt").await;
     let mut files = drive_subscription(&world, &owner, drive).await;
     let mut pages = pages_subscription(&world, &owner, file_id).await;
     drain_with_a_rename(&world, &owner, &mut files, file_id, "doc-settled.txt").await;
@@ -133,6 +153,7 @@ async fn a_long_report_reaches_the_page_window_page_by_page_and_never_rewrites_t
     let world = World::start("pod-page-long-report").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
+    let _rules = rules(&world).await;
     let drive = world.create_workspace(&owner, "library").await;
     let file_id = upload(
         &world,
@@ -141,7 +162,7 @@ async fn a_long_report_reaches_the_page_window_page_by_page_and_never_rewrites_t
     )
     .await;
     world.await_source_promoted(file_id).await;
-    let job_id = assign_job(&world, &owner, file_id).await;
+    let job_id = world.await_job(file_id).await;
     let mut files = drive_subscription(&world, &owner, drive).await;
     let mut pages = pages_subscription(&world, &owner, file_id).await;
     drain_with_a_rename(&world, &owner, &mut files, file_id, "long-settled.txt").await;
@@ -223,15 +244,17 @@ async fn a_page_window_follows_one_file_and_closes_when_the_file_leaves_the_owne
     let owner_id = Uuid::now_v7();
     let owner = passport(owner_id);
     let runner = service_passport(&[RUNNER_SCOPE]);
+    let (jobs, manager) = rules(&world).await;
+    install_regenerate_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_a = rendered_file(&world, &owner, &runner, drive, "a.txt").await;
+    let file_a = rendered_file(&world, &jobs, &owner, &runner, drive, "a.txt").await;
     let file_b = upload(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "b.txt", SOURCE),
     )
     .await;
-    let job_b = assign_job(&world, &owner, file_b).await;
+    let job_b = world.await_job(file_b).await;
 
     let mut window_a = Subscription::open_with(
         &world.subscription_url(),
@@ -270,7 +293,14 @@ async fn a_page_window_follows_one_file_and_closes_when_the_file_leaves_the_owne
     )
     .await);
     window_a.expect_silence(Duration::from_secs(1)).await;
-    let job_a = assign_job(&world, &owner, file_a).await;
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$n:Int!){workspaceRegeneratePage(fileId:$f,number:$n){success}}",
+            serde_json::json!({ "f": file_a, "n": 1 }),
+        )
+        .await);
+    let job_a = world.await_job(file_a).await;
     ok(&report(
         &world,
         &runner,
@@ -322,6 +352,8 @@ async fn regenerating_a_page_replaces_that_pages_images_by_name_and_releases_the
     let world = World::start("pod-page-regenerate").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
+    let (jobs, manager) = rules(&world).await;
+    install_regenerate_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
     let file_id = upload(
         &world,
@@ -329,7 +361,7 @@ async fn regenerating_a_page_replaces_that_pages_images_by_name_and_releases_the
         &UploadRequest::text(drive, "", "doc.txt", SOURCE),
     )
     .await;
-    let job_id = assign_job(&world, &owner, file_id).await;
+    let job_id = world.await_job(file_id).await;
 
     upload_image(&world, &runner, file_id, job_id, "p001-img01.png", IMAGE_A).await;
     upload_image(&world, &runner, file_id, job_id, "p001-img02.png", IMAGE_B).await;
@@ -356,14 +388,31 @@ async fn regenerating_a_page_replaces_that_pages_images_by_name_and_releases_the
     poll_until!(Duration::from_secs(15), {
         (world.blob_state(old_a).await.as_deref() == Some("uploaded")).then_some(())
     });
+    finish_job(&world, &jobs, job_id).await;
+    world.await_state(&owner, file_id, "READY").await;
     let mut files = drive_subscription(&world, &owner, drive).await;
     let mut pages = pages_subscription(&world, &owner, file_id).await;
 
-    let regeneration = assign_job(&world, &owner, file_id).await;
-    next_drive_delta(&mut files, |node| {
-        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "MetadataChanged"
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$n:Int!,$c:String){workspaceRegeneratePage(fileId:$f,number:$n,comment:$c){success}}",
+            serde_json::json!({ "f": file_id, "n": 1, "c": "the figure is cut" }),
+        )
+        .await);
+    let regeneration = world.await_job(file_id).await;
+    let started = next_drive_delta(&mut files, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingStarted"
     })
     .await;
+    assert_eq!(started["view"]["progress"]["stepIndex"], 0);
+    let create = jobs.await_create(file_id).await;
+    assert_eq!(create.job_id, regeneration);
+    assert_eq!(
+        create.config.as_ref().unwrap()["options"],
+        serde_json::json!({ "page": 1, "comment": "the figure is cut" }),
+        "the page and the comment travel in the first step's options"
+    );
     upload_image(
         &world,
         &runner,
@@ -437,6 +486,7 @@ async fn deleting_a_folder_releases_its_image_blobs_and_drops_its_pages() {
     let world = World::start("pod-page-cascade").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
+    let (jobs, _) = rules(&world).await;
     let drive = world.create_workspace(&owner, "library").await;
     let file_id = upload(
         &world,
@@ -444,7 +494,7 @@ async fn deleting_a_folder_releases_its_image_blobs_and_drops_its_pages() {
         &UploadRequest::text(drive, "sub", "doc.txt", SOURCE),
     )
     .await;
-    let job_id = assign_job(&world, &owner, file_id).await;
+    let job_id = world.await_job(file_id).await;
     upload_image(&world, &runner, file_id, job_id, "p001-img01.png", IMAGE_A).await;
     ok(&report(
         &world,
@@ -472,6 +522,7 @@ async fn deleting_a_folder_releases_its_image_blobs_and_drops_its_pages() {
 
     assert_eq!(world.blob_state(image).await.as_deref(), Some("orphaned"));
     assert_eq!(world.blob_state(source).await.as_deref(), Some("orphaned"));
+    jobs.await_cancel(job_id).await;
     let pages: i64 = sqlx::query_scalar("SELECT count(*) FROM drive.file_page WHERE file_id = $1")
         .bind(file_id)
         .fetch_one(&world.db.app)

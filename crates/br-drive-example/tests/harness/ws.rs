@@ -79,6 +79,27 @@ impl Subscription {
         }
     }
 
+    pub async fn try_next_payload(&mut self, within: Duration) -> Option<serde_json::Value> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(remaining, self.socket.next()).await {
+                Err(_) | Ok(None) => return None,
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&text).expect("a json websocket frame");
+                    if frame["type"] == "next" {
+                        return Some(frame["payload"]["data"].clone());
+                    }
+                }
+                Ok(Some(_)) => continue,
+            }
+        }
+    }
+
     pub async fn next_payload(&mut self, within: Duration) -> serde_json::Value {
         loop {
             let frame = read_json(&mut self.socket, within).await;
