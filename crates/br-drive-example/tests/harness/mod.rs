@@ -1,6 +1,7 @@
 pub mod minio;
 pub mod nats;
 pub mod pg;
+pub mod runner;
 pub mod upload;
 pub mod ws;
 
@@ -125,7 +126,9 @@ impl World {
             .gql(
                 passport,
                 "query($id:UUID!){workspaceFile(fileId:$id){id driveId path name protected \
-                 mediaType sizeBytes sha256 processingState affordances}}",
+                 mediaType sizeBytes sha256 processingState summary pageCount estimatedTokens \
+                 pages{number markdown origin updatedBy} images{name mediaType sizeBytes page} \
+                 affordances}}",
                 serde_json::json!({ "id": file_id }),
             )
             .await;
@@ -144,6 +147,20 @@ impl World {
             .as_array()
             .expect("a list of files")
             .clone()
+    }
+
+    pub async fn image_access(
+        &self,
+        passport: &str,
+        file_id: Uuid,
+        name: &str,
+    ) -> serde_json::Value {
+        self.gql(
+            passport,
+            "query($id:UUID!,$n:String){workspaceFileAccess(fileId:$id,name:$n)}",
+            serde_json::json!({ "id": file_id, "n": name }),
+        )
+        .await
     }
 
     pub async fn file_access(&self, passport: &str, file_id: Uuid) -> serde_json::Value {
@@ -259,6 +276,20 @@ fn base_config(pod: &str, addr: SocketAddr) -> EngineConfig {
     .with_http_addr(addr)
 }
 
+pub fn service_passport(scopes: &[&str]) -> String {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "scopes".to_string(),
+        serde_json::Value::Array(
+            scopes
+                .iter()
+                .map(|scope| serde_json::Value::String((*scope).to_string()))
+                .collect(),
+        ),
+    );
+    Passport::service(Uuid::now_v7(), PassportClaims::from_map(map)).to_header()
+}
+
 pub fn passport(user: Uuid) -> String {
     Passport::human(
         user,
@@ -307,7 +338,7 @@ pub fn error_code(response: &serde_json::Value) -> String {
 pub const DRIVE_DELTAS: &str = "subscription($d:UUID!){workspaceDriveChanged(driveId:$d){\
     __typename \
     ... on DriveReset{revision views{... on DriveFile{id path name processingState}}} \
-    ... on DriveUpsert{revision cause view{... on DriveFile{id path name processingState affordances}}} \
+    ... on DriveUpsert{revision cause view{... on DriveFile{id path name processingState affordances summary pageCount estimatedTokens pages{number markdown origin} images{name page}}}} \
     ... on DriveRemove{revision projector key cause}}}";
 
 pub async fn drive_subscription(world: &World, passport: &str, drive: Uuid) -> Subscription {

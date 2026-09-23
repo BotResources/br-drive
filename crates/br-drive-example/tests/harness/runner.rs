@@ -1,0 +1,113 @@
+use uuid::Uuid;
+
+use super::upload::{Ticket, sha256_hex};
+use super::{World, ok};
+
+pub const RUNNER_SCOPE: &str = "workspace:runner";
+
+pub async fn assign_job(world: &World, owner: &str, file_id: Uuid) -> Uuid {
+    let job_id = Uuid::now_v7();
+    ok(&world
+        .gql(
+            owner,
+            "mutation($f:UUID!,$m:JSON!){workspaceAnnotateFile(fileId:$f,metadata:$m){success}}",
+            serde_json::json!({ "f": file_id, "m": { "job_id": job_id } }),
+        )
+        .await);
+    job_id
+}
+
+pub async fn context(world: &World, runner: &str, file_id: Uuid) -> serde_json::Value {
+    world
+        .gql(
+            runner,
+            "query($f:UUID!){workspaceRunnerContext(fileId:$f){fileId mediaType name pageCount \
+             sourceUrl images pages{number markdown origin}}}",
+            serde_json::json!({ "f": file_id }),
+        )
+        .await
+}
+
+pub async fn request_image(
+    world: &World,
+    runner: &str,
+    file_id: Uuid,
+    job_id: Uuid,
+    name: &str,
+    bytes: &[u8],
+) -> serde_json::Value {
+    world
+        .gql(
+            runner,
+            "mutation($f:UUID!,$j:UUID!,$n:String!,$m:String!,$s:ByteCount!,$h:String!){\
+             workspaceRunnerRequestImageUpload(fileId:$f,jobId:$j,name:$n,mediaType:$m,size:$s,sha256:$h)\
+             {fileId url fields}}",
+            serde_json::json!({
+                "f": file_id,
+                "j": job_id,
+                "n": name,
+                "m": "image/png",
+                "s": bytes.len(),
+                "h": sha256_hex(bytes),
+            }),
+        )
+        .await
+}
+
+pub fn image_ticket(response: &serde_json::Value) -> Ticket {
+    let post = &ok(response)["workspaceRunnerRequestImageUpload"];
+    Ticket {
+        file_id: Uuid::parse_str(post["fileId"].as_str().expect("the file id")).expect("a uuid"),
+        url: post["url"]
+            .as_str()
+            .expect("a presigned endpoint")
+            .to_string(),
+        fields: post["fields"]
+            .as_object()
+            .expect("presigned post fields")
+            .clone(),
+    }
+}
+
+pub struct Report<'a> {
+    pub job_id: Uuid,
+    pub pages: Vec<(i32, &'a str)>,
+    pub origin: Option<&'a str>,
+    pub indexer: Option<(&'a str, i32, i64)>,
+    pub done: bool,
+}
+
+pub async fn report(
+    world: &World,
+    runner: &str,
+    file_id: Uuid,
+    report: Report<'_>,
+) -> serde_json::Value {
+    let pages: Vec<serde_json::Value> = report
+        .pages
+        .iter()
+        .map(|(number, markdown)| serde_json::json!({ "number": number, "markdown": markdown }))
+        .collect();
+    let mut variables = serde_json::json!({
+        "f": file_id,
+        "j": report.job_id,
+        "p": pages,
+        "d": report.done,
+    });
+    if let Some(origin) = report.origin {
+        variables["o"] = serde_json::json!(origin);
+    }
+    if let Some((summary, page_count, estimated_tokens)) = report.indexer {
+        variables["s"] = serde_json::json!(summary);
+        variables["c"] = serde_json::json!(page_count);
+        variables["t"] = serde_json::json!(estimated_tokens);
+    }
+    world
+        .gql(
+            runner,
+            "mutation($f:UUID!,$j:UUID!,$p:[ReportedPageInput!]!,$o:PageOrigin,$s:String,$c:Int,$t:Int,$d:Boolean!){\
+             workspaceRunnerReport(fileId:$f,jobId:$j,pages:$p,origin:$o,summary:$s,pageCount:$c,estimatedTokens:$t,done:$d){success}}",
+            variables,
+        )
+        .await
+}

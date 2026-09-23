@@ -23,6 +23,11 @@ type DriveFile {
 	processingState: ProcessingState!
 	processingError: String
 	metadata: JSON!
+	summary: String
+	pageCount: Int
+	estimatedTokens: Int
+	pages: [DrivePage!]!
+	images: [DriveImage!]!
 	createdBy: UUID!
 	createdAt: DateTime!
 	updatedAt: DateTime!
@@ -31,19 +36,38 @@ type DriveFile {
 
 union DriveFileUnion = DriveFile
 
+type DriveImage {
+	name: String!
+	mediaType: String!
+	sizeBytes: ByteCount!
+	page: Int
+}
+
 type DriveMutation {
 	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
 	workspaceCommitUpload(fileId: UUID!): MutationAck!
 	workspaceUpdateFile(fileId: UUID!, name: String, path: String, driveId: UUID): MutationAck!
 	workspaceDeleteFile(fileId: UUID!): MutationAck!
+	workspaceEditPage(fileId: UUID!, number: Int!, markdown: String!): MutationAck!
+	workspaceRunnerRequestImageUpload(fileId: UUID!, jobId: UUID!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
+	workspaceRunnerReport(fileId: UUID!, jobId: UUID!, pages: [ReportedPageInput!]! = [], origin: PageOrigin, summary: String, pageCount: Int, estimatedTokens: Int, done: Boolean! = false): MutationAck!
 	workspaceMoveFolder(driveId: UUID!, oldPrefix: String!, newPrefix: String!): MutationAck!
 	workspaceDeleteFolder(driveId: UUID!, prefix: String!): MutationAck!
+}
+
+type DrivePage {
+	number: Int!
+	markdown: String!
+	origin: PageOrigin!
+	updatedBy: UUID!
+	updatedAt: DateTime!
 }
 
 type DriveQuery {
 	workspaceFile(fileId: UUID!): DriveFile
 	workspaceDriveFiles(driveId: UUID!): [DriveFile!]!
 	workspaceFileAccess(fileId: UUID!, name: String): String
+	workspaceRunnerContext(fileId: UUID!): RunnerContext!
 }
 
 type DriveRemove {
@@ -90,11 +114,32 @@ type MutationAck {
 	success: Boolean!
 }
 
+enum PageOrigin {
+	RUNNER
+	REGENERATED
+	EDITED
+}
+
 enum ProcessingState {
 	PENDING
 	PROCESSING
 	READY
 	FAILED
+}
+
+input ReportedPageInput {
+	number: Int!
+	markdown: String!
+}
+
+type RunnerContext {
+	fileId: UUID!
+	mediaType: String!
+	name: String!
+	pageCount: Int
+	pages: [DrivePage!]!
+	images: [String!]!
+	sourceUrl: String
 }
 
 """
