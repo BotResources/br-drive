@@ -155,6 +155,7 @@ single git tag `v{version}` releases the set. Format follows
   type; failure and rejection with reason codes, reprocess wiping the
   rendition; foreign cancel vs own cancel; a rule edited or deleted mid-chain,
   non-retroactivity; every fact replayed idempotent; the processing guards.
+  The workspace MSRV follows `contract-jobs` 0.5.0: Rust 1.94.
 - Reason codes: `DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`,
   `FILE_PROTECTED`, `FILE_NOT_PENDING`, `FILE_NOT_READY`, `FILE_TOO_LARGE`,
   `UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,

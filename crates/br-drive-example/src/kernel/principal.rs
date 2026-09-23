@@ -11,6 +11,10 @@ use uuid::Uuid;
 
 use crate::kernel::facts::{OwnedWorkspaces, PrincipalFacts};
 
+/// The passport claim that lists a principal's scopes (the same claim the
+/// drive slice reads for its runner scope).
+pub const SCOPES_CLAIM: &str = "scopes";
+
 #[derive(Debug, Clone)]
 pub struct AppPrincipal {
     id: PrincipalId,
@@ -68,7 +72,7 @@ impl AppPrincipal {
 
     pub fn holds_scope(&self, scope: &str) -> bool {
         self.passport
-            .claim::<Vec<String>>(br_drive::SCOPES_CLAIM)
+            .claim::<Vec<String>>(SCOPES_CLAIM)
             .is_some_and(|scopes| scopes.iter().any(|held| held == scope))
     }
 

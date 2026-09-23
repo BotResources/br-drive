@@ -38,13 +38,13 @@ jobs:
             --test schema_fragments --test schema_gate --test binary_schema
 
   msrv:
-    name: MSRV 1.89 build
+    name: MSRV 1.94 build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: "1.89"
+          toolchain: "1.94"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: msrv
