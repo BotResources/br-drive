@@ -60,10 +60,42 @@ single git tag `v{version}` releases the set. Format follows
   constraints in the migration. `set_metadata` gives the host a write path for
   the file's free JSON. The library refuses to register on a host that
   configured no object storage.
+- Pages, images and the runner surface. `drive.file_page` (pk `(file_id,
+  number)`, origin `runner | regenerated | edited`, `updated_by/at`) and
+  `drive.file_image` (pk `(file_id, name)`, its own verified blob of kind
+  `drive_image` with policy + post-upload policy, `page` derived from the
+  page-scoped name `p{page:03}-img{n:02}.{ext}`); `drive.file` gains
+  `summary`, `page_count`, `estimated_tokens` (written together by the
+  indexer's report). Roots under the host prefix, gated on a
+  `Passport::Service` carrying `DriveHost::RUNNER_SCOPE`
+  (`RUNNER_SCOPE_REQUIRED` otherwise, and a runner sees nothing through the
+  drive views): `<p>RunnerContext(fileId)` (fresh presigned GET on the source,
+  media type, name, page count, pages, image names),
+  `<p>RunnerRequestImageUpload(fileId, jobId, name, mediaType, size, sha256)`
+  (an existing name is replaced and its old object released),
+  `<p>RunnerReport(fileId, jobId, pages, origin, summary, pageCount,
+  estimatedTokens, done)` (page batches upsert by number; a `REGENERATED` page
+  drops the images it no longer references; the indexer triple moves together;
+  `done` calls the `report_done` seam that milestone 4 turns into
+  `job.finish`). `jobId` is validated against the host seam
+  `DriveHost::active_job(&FileRow)` (`JOB_NOT_ACTIVE`) until the File carries
+  its own `job_id`. User gesture `<p>EditPage(fileId, number, markdown)`
+  (origin `EDITED`, `READY` only, affordance `editPage`); `<p>FileAccess(fileId,
+  name)` answers the image GET (inline). `DriveFile` carries `pages`, `images`,
+  `summary`, `pageCount`, `estimatedTokens`; deleting a file drops its pages and
+  images and releases every image blob. Eight more e2e scenarios: runner
+  context with a fresh GET, scope refusals (human, unscoped service), wrong
+  job refused, image round trip (verified, wrong checksum refused, unknown
+  name) and naming refusals, report batches with an idempotent replay and the
+  indexer triple, page edit (and its refusals), page regeneration replacing
+  images by name, cascade releasing image blobs.
 - Reason codes: `DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`,
   `FILE_PROTECTED`, `FILE_NOT_PENDING`, `FILE_NOT_READY`, `FILE_TOO_LARGE`,
   `UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,
-  `INVALID_NAME`, `NAME_TAKEN`, `FOLDER_INTO_ITSELF`, `NOTHING_TO_CHANGE`, plus
+  `INVALID_NAME`, `NAME_TAKEN`, `FOLDER_INTO_ITSELF`, `NOTHING_TO_CHANGE`,
+  `RUNNER_SCOPE_REQUIRED`, `JOB_NOT_ACTIVE`, `SOURCE_NOT_AVAILABLE`,
+  `INVALID_IMAGE_NAME`, `INVALID_PAGE`, `INVALID_PAGE_ORIGIN`, `PAGE_NOT_FOUND`,
+  `INDEXER_FIELDS_TOGETHER`, plus
   the engine's `KEY_REUSED` and the host's own codes through the gate and the
   hooks.
 - Example host: `workspaceCreate` / `workspaceDelete` wrap `create_drive` /

@@ -149,9 +149,10 @@ client-generated UUIDv7.
 `protected`, `mediaType`, `sizeBytes` (`ByteCount`, a 64-bit JSON number —
 GraphQL `Int` is 32-bit), `sha256` (hex), `processingState`
 (`PENDING | PROCESSING | READY | FAILED`), `processingError`, `metadata`
-(JSON), `createdBy`, `createdAt`, `updatedAt`, `affordances` (`delete`,
-`rename`, `move`, `download` — `download` is denied with `FILE_NOT_READY`
-until the file is `READY`).
+(JSON), `summary`, `pageCount`, `estimatedTokens`, `pages[]`, `images[]`,
+`createdBy`, `createdAt`, `updatedAt`, `affordances` (`delete`, `rename`,
+`move`, `download`, `editPage` — the last two are denied with
+`FILE_NOT_READY` until the file is `READY`).
 
 `DriveDelta` is the engine's delta union: `DriveReset { revision, views }`,
 `DriveUpsert { revision, view, cause }`, `DriveRemove { revision, projector,
@@ -175,6 +176,59 @@ trailing whitespace, no control character or backslash, segment ≤ 255 bytes,
 whole path ≤ 1024 bytes, `""` is the root. Names obey the segment rules and
 carry no `/`. Comparison is byte-wise: case-sensitive, no Unicode
 normalization. Anything else is `INVALID_PATH` / `INVALID_NAME`.
+
+## The runner contract (milestone 3)
+
+A runner is a `Passport::Service` whose `scopes` claim carries the host's
+`DriveHost::RUNNER_SCOPE` (e.g. `workspace:runner`); a human, or a service
+without that scope, is refused every runner root with `RUNNER_SCOPE_REQUIRED`.
+A runner sees nothing through the drive views and subscriptions — it reads and
+writes one file at a time through three roots at the host prefix, reaching the
+host over the gateway URL it already knows. The library is content-blind: it
+stores what the runner reports and never interprets a media type.
+
+| Root | Shape |
+|---|---|
+| `<p>RunnerContext(fileId): RunnerContext!` | `{ fileId, mediaType, name, pageCount, pages[], images[], sourceUrl }` — a **fresh** presigned GET on the source (inline) at every call, plus the current rendition so an indexer or a page-regeneration runner reads the pages, not the source. `FILE_NOT_FOUND` for an unknown file, `SOURCE_NOT_AVAILABLE` while the engine reaper has not promoted the source yet (retry). |
+| `<p>RunnerRequestImageUpload(fileId, jobId, name, mediaType, size: ByteCount, sha256): UploadTicket!` | a verified presigned POST for a `drive_image` blob (the runner hashes first) and the `file_image` row, unique per file by name; an existing name is **replaced** (its old object is released). `JOB_NOT_ACTIVE` unless `jobId` is the file's active job. |
+| `<p>RunnerReport(fileId, jobId, pages: [ReportedPageInput!], origin: PageOrigin, summary, pageCount, estimatedTokens, done): MutationAck!` | pages in one or several batches, **upserted by number** (a replayed batch changes nothing); `origin` `RUNNER` (default) or `REGENERATED` — on a regenerated page the images of that page that its new markdown no longer references are dropped and released; `summary`, `pageCount` and `estimatedTokens` are the indexer's triple and move together (`INDEXER_FIELDS_TOGETHER`); `done: true` marks the report complete (`ReportStored { jobId, pages, done }` on `DriveChanged`). `JOB_NOT_ACTIVE` on any other job. |
+
+The job seam. Until milestone 4 the library has no `job_id` column: each
+runner write validates `jobId` against `DriveHost::active_job(&FileRow) ->
+Option<Uuid>`, a host-provided seam the example host stubs from the file's
+`metadata.job_id` (set through `workspaceAnnotateFile`). Milestone 4 replaces
+it with the File's own `job_id` and turns `br_drive::report_done` — the named
+no-op called on `done: true` — into the `integration.cmd.jobs.job.finish.v2`
+command.
+
+Job config keys (what the host will put in `job.create`'s `config`, milestone
+4, so a runner can already be written against them): `host` (the host service
+name), `file_id`, `context_root` (`<p>RunnerContext`), `image_upload_root`
+(`<p>RunnerRequestImageUpload`), `report_root` (`<p>RunnerReport`), `step`,
+`options` (the ruleset step's options; `options.page` on a page regeneration).
+The config never carries a presigned URL — the runner mints one through
+`RunnerContext` when it needs it.
+
+Image naming: `p{page:03}-img{n:02}.{ext}` — page-scoped, unique per file,
+`ext` 1–8 lowercase alphanumerics, `n` starting at `01` (e.g. `p003-img01.png`);
+anything else is `INVALID_IMAGE_NAME`. The markdown references images by that
+name, never by URL; the front resolves a name to a presigned GET with
+`<p>FileAccess(fileId, name)` (inline disposition). The image's page is derived
+from its name.
+
+Everything else a runner has to say — start, plan, steps, logs, completion,
+failure, presence, cancel — goes to the Jobs service over its NATS runner
+transport, never to the host.
+
+Pages and images on the read side: `DriveFile.pages[] { number, markdown,
+origin (RUNNER | REGENERATED | EDITED), updatedBy, updatedAt }`,
+`DriveFile.images[] { name, mediaType, sizeBytes, page }`, `summary`,
+`pageCount`, `estimatedTokens`; every rendition change reaches open
+`DriveChanged` sessions as a `DriveUpsert` of the whole file. A user edits a
+page of a `READY` file with `<p>EditPage(fileId, number, markdown)` (origin
+`EDITED`, `PAGE_NOT_FOUND` for a page the runner never reported; affordance
+`editPage`). Deleting a file drops its pages and images and releases every
+image object with the source.
 
 ## The example host
 
