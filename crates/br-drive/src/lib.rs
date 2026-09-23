@@ -4,9 +4,11 @@ mod fault;
 mod file;
 mod folders;
 mod host;
+mod image;
 mod media;
 mod path;
 mod register;
+mod runner;
 mod slice;
 mod upload;
 
@@ -14,19 +16,25 @@ use std::ops::RangeInclusive;
 
 use service_engine::LibraryMigrations;
 
-pub use blob::DriveSource;
+pub use blob::{DriveImage as DriveImageBlob, DriveSource};
 pub use drive::{DriveDeleted, create_drive, delete_drive};
 pub use fault::{DriveFault, DriveReactionFault, codes};
 pub use file::{
-    ByteCount, DeleteFile, DriveDelta, DriveFile, DriveFileUnion, DriveFiles, DriveRemove,
-    DriveReset, DriveUpsert, DriveWindow, File, FileCause, FileRow, FileVisibility,
-    ProcessingState, UpdateFile, drive_of, set_metadata, set_protected,
+    ByteCount, DeleteFile, DriveDelta, DriveFile, DriveFileUnion, DriveFiles, DriveImage,
+    DrivePage, DriveRemove, DriveReset, DriveUpsert, DriveWindow, EditPage, File, FileCause,
+    FileRow, FileVisibility, ImageRow, PageOrigin, PageRow, ProcessingState, UpdateFile, drive_of,
+    set_metadata, set_protected,
 };
 pub use folders::{DeleteFolder, MoveFolder};
-pub use host::{DRIVE_DIM, DriveHost, DriveRequest};
+pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
+pub use image::{ImageName, InvalidImageName, MAX_IMAGE_NAME_BYTES};
 pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
 pub use register::register;
+pub use runner::{
+    ReportedPage, ReportedPageInput, RunnerContext, RunnerFiles, RunnerReport,
+    RunnerRequestImageUpload, RunnerWindow, report_done,
+};
 pub use upload::{CommitUpload, RequestUpload, UploadTicket};
 
 pub const NAME: &str = "drive";

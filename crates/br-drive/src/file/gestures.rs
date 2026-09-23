@@ -12,6 +12,53 @@ use crate::host::DriveHost;
 use crate::path::{DrivePath, FileName};
 
 #[derive(Debug, Deserialize)]
+pub struct EditPage {
+    pub file_id: Uuid,
+    pub number: i32,
+    pub markdown: String,
+}
+
+impl MutationInput for EditPage {
+    type Output = ();
+    type Error = DriveFault;
+    const NAME: &'static str = "drive_edit_page";
+}
+
+pub fn edit_page<'m, H: DriveHost>(
+    cx: &'m mut Mutation<'m, H>,
+    input: EditPage,
+) -> BoxFuture<'m, Result<(), DriveFault>> {
+    Box::pin(async move {
+        let mut file = cx
+            .load::<FileRow<H>>(&input.file_id)
+            .await?
+            .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
+        file.edit_page_gate(cx.principal()).require()?;
+        if file.page(input.number).is_none() {
+            return Err(DriveFault::Refused(codes::PAGE_NOT_FOUND));
+        }
+        let by = cx.principal().id().as_uuid();
+        let now = cx.now().as_datetime();
+        file.upsert_page(
+            input.number,
+            input.markdown,
+            super::aggregate::PageOrigin::Edited,
+            by,
+            now,
+        );
+        file.updated_at = now;
+        cx.save(&file).await?;
+        cx.impact_caused::<File, _>(
+            &file.id,
+            FileCause::PageEdited {
+                number: input.number,
+            },
+        )?;
+        Ok(())
+    })
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdateFile {
     pub file_id: Uuid,
     pub name: Option<String>,

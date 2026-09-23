@@ -13,6 +13,7 @@ use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
 
 pub const DRIVE_DIM: &str = "drive";
+pub const SCOPES_CLAIM: &str = "scopes";
 
 pub enum DriveRequest<'a, H> {
     CreateFile {
@@ -83,9 +84,23 @@ pub trait DriveHost: Principal {
 
     const BULK_RESET_THRESHOLD: usize = 256;
 
+    const IMAGE_MAX_BYTES: u64 = 64 << 20;
+
+    const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;
 
     fn visible_drives(&self) -> Vec<Uuid>;
+
+    fn is_runner(&self) -> bool {
+        let passport = self.passport();
+        passport.service_account_id().is_some()
+            && passport
+                .claim::<Vec<String>>(SCOPES_CLAIM)
+                .is_some_and(|scopes| scopes.iter().any(|scope| scope == Self::RUNNER_SCOPE))
+    }
+
+    fn active_job(file: &FileRow<Self>) -> Option<Uuid>;
 
     fn upload_window(&self) -> Duration {
         Duration::from_secs(15 * 60)

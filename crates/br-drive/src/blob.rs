@@ -15,6 +15,27 @@ impl Blobs for DriveSource {
     const KIND: &'static str = "drive_source";
 }
 
+pub struct DriveImage;
+
+impl Blobs for DriveImage {
+    const KIND: &'static str = "drive_image";
+}
+
+pub fn image_available<'a>(
+    uploaded: Uploaded<'a>,
+    ps: &'a mut PostSave<'_, '_>,
+) -> BoxFuture<'a, Result<(), PostUpload>> {
+    Box::pin(async move {
+        let found =
+            crate::file::store::file_of_image(ps.connection(), uploaded.reference.as_uuid())
+                .await?;
+        if let Some((file_id, name)) = found {
+            ps.impact_caused::<File, _>(&file_id, FileCause::ImageAvailable { name })?;
+        }
+        Ok(())
+    })
+}
+
 pub fn source_available<'a>(
     uploaded: Uploaded<'a>,
     ps: &'a mut PostSave<'_, '_>,
@@ -41,5 +62,11 @@ pub fn register<P: DriveHost>(
     })?;
     engine.register_post_upload_policy::<DriveSource, _>(source_available)?;
     engine.require_post_upload_policy::<DriveSource>()?;
+    engine.register_blobs::<DriveImage>(service_engine::BlobPolicy {
+        max_bytes: P::IMAGE_MAX_BYTES,
+        orphan_after: P::IMAGE_ORPHAN_AFTER,
+    })?;
+    engine.register_post_upload_policy::<DriveImage, _>(image_available)?;
+    engine.require_post_upload_policy::<DriveImage>()?;
     Ok(())
 }

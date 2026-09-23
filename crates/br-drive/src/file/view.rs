@@ -13,7 +13,9 @@ use service_engine::projector::Emission;
 use service_engine::view::{Populate, Projector, windowed};
 use uuid::Uuid;
 
-use super::aggregate::{File, FileRow, FileVisibility, ProcessingState};
+use super::aggregate::{
+    File, FileRow, FileVisibility, ImageRow, PageOrigin, PageRow, ProcessingState,
+};
 use super::store::{self, FileStore};
 use crate::host::DriveHost;
 
@@ -22,6 +24,49 @@ use crate::host::DriveHost;
 pub struct ByteCount(pub u64);
 
 async_graphql::scalar!(ByteCount);
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject)]
+pub struct DrivePage {
+    pub number: i32,
+    pub markdown: String,
+    pub origin: PageOrigin,
+    pub updated_by: Uuid,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<&PageRow> for DrivePage {
+    fn from(page: &PageRow) -> Self {
+        Self {
+            number: page.number,
+            markdown: page.markdown.clone(),
+            origin: page.origin,
+            updated_by: page.updated_by,
+            updated_at: page.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject)]
+pub struct DriveImage {
+    pub name: String,
+    pub media_type: String,
+    pub size_bytes: ByteCount,
+    pub page: Option<i32>,
+    #[graphql(skip)]
+    pub source: Uuid,
+}
+
+impl From<&ImageRow> for DriveImage {
+    fn from(image: &ImageRow) -> Self {
+        Self {
+            name: image.name.as_str().to_string(),
+            media_type: image.media_type.as_str().to_string(),
+            size_bytes: ByteCount(u64::try_from(image.size_bytes).unwrap_or(0)),
+            page: image.page,
+            source: image.blob_ref,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject)]
 pub struct DriveFile {
@@ -36,12 +81,27 @@ pub struct DriveFile {
     pub processing_state: ProcessingState,
     pub processing_error: Option<String>,
     pub metadata: JsonScalar,
+    pub summary: Option<String>,
+    pub page_count: Option<i32>,
+    pub estimated_tokens: Option<i64>,
+    pub pages: Vec<DrivePage>,
+    pub images: Vec<DriveImage>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub affordances: Affordances,
     #[graphql(skip)]
     pub source: Uuid,
+}
+
+impl DriveFile {
+    pub fn is_ready(&self) -> bool {
+        self.processing_state == ProcessingState::Ready
+    }
+
+    pub fn image(&self, name: &str) -> Option<&DriveImage> {
+        self.images.iter().find(|image| image.name == name)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -69,7 +129,7 @@ impl<H> DriveFiles<H> {
     pub const NAME: ProjectorName = ProjectorName::from_static("drive_files");
 }
 
-fn hex(bytes: &[u8; 32]) -> String {
+pub(crate) fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -118,6 +178,11 @@ impl<H: DriveHost> Projector for DriveFiles<H> {
             processing_state: row.processing_state,
             processing_error: row.processing_error.clone(),
             metadata: async_graphql::Json(row.metadata.clone()),
+            summary: row.summary.clone(),
+            page_count: row.page_count,
+            estimated_tokens: row.estimated_tokens,
+            pages: row.pages.iter().map(DrivePage::from).collect(),
+            images: row.images.iter().map(DriveImage::from).collect(),
             created_by: row.created_by,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -128,11 +193,5 @@ impl<H: DriveHost> Projector for DriveFiles<H> {
 
     fn emission(_impact: &Impact) -> Emission {
         Emission::PerImpact
-    }
-}
-
-impl DriveFile {
-    pub fn is_ready(&self) -> bool {
-        self.processing_state == ProcessingState::Ready
     }
 }

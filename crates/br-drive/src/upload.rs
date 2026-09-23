@@ -43,7 +43,7 @@ pub struct UploadTicket {
 }
 
 impl UploadTicket {
-    fn new(file_id: Uuid, upload: UploadUrl) -> Self {
+    pub(crate) fn new(file_id: Uuid, upload: UploadUrl) -> Self {
         let (url, fields) = upload.into_parts();
         let fields: serde_json::Map<String, serde_json::Value> = fields
             .into_iter()
@@ -108,9 +108,15 @@ pub fn request_upload<'m, H: DriveHost>(
             processing_state: ProcessingState::Pending,
             processing_error: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
+            summary: None,
+            page_count: None,
+            estimated_tokens: None,
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,
+            pages: Vec::new(),
+            images: Vec::new(),
+            changes: Default::default(),
             host: PhantomData,
         };
         cx.create(&file).await?;

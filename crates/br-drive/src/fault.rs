@@ -21,6 +21,14 @@ pub mod codes {
     pub const NAME_TAKEN: Reason = Reason::new("NAME_TAKEN");
     pub const FOLDER_INTO_ITSELF: Reason = Reason::new("FOLDER_INTO_ITSELF");
     pub const NOTHING_TO_CHANGE: Reason = Reason::new("NOTHING_TO_CHANGE");
+    pub const RUNNER_SCOPE_REQUIRED: Reason = Reason::new("RUNNER_SCOPE_REQUIRED");
+    pub const JOB_NOT_ACTIVE: Reason = Reason::new("JOB_NOT_ACTIVE");
+    pub const SOURCE_NOT_AVAILABLE: Reason = Reason::new("SOURCE_NOT_AVAILABLE");
+    pub const INVALID_IMAGE_NAME: Reason = Reason::new("INVALID_IMAGE_NAME");
+    pub const INVALID_PAGE: Reason = Reason::new("INVALID_PAGE");
+    pub const INVALID_PAGE_ORIGIN: Reason = Reason::new("INVALID_PAGE_ORIGIN");
+    pub const PAGE_NOT_FOUND: Reason = Reason::new("PAGE_NOT_FOUND");
+    pub const INDEXER_FIELDS_TOGETHER: Reason = Reason::new("INDEXER_FIELDS_TOGETHER");
     pub const KEY_REUSED: Reason = Reason::new("KEY_REUSED");
 }
 

@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
-use service_engine::BlobRef;
 use service_engine::gate::Reason;
+use service_engine::persistence::Aggregate;
 use service_engine::pipeline::{Bulk, MutationInput};
 use uuid::Uuid;
 
@@ -37,7 +37,9 @@ pub(crate) async fn delete_rows<H: DriveHost>(
     let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
     store::delete_many(cx.connection(), &ids).await?;
     for file in files {
-        cx.release_blob(BlobRef(file.blob_ref))?;
+        for reference in file.blob_refs() {
+            cx.release_blob(reference)?;
+        }
     }
     Ok(())
 }

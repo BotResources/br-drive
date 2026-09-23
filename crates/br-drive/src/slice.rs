@@ -52,19 +52,72 @@ macro_rules! drive_slice {
                             "file access refused",
                         ));
                     }
-                    if name.is_some() {
-                        return ::core::result::Result::Ok(::core::option::Option::None);
-                    }
+                    let (reference, disposition) = match name {
+                        ::core::option::Option::Some(name) => match file.image(&name) {
+                            ::core::option::Option::Some(image) => (
+                                image.source,
+                                ::service_engine::blobs::Disposition::Inline,
+                            ),
+                            ::core::option::Option::None => {
+                                return ::core::result::Result::Ok(::core::option::Option::None);
+                            }
+                        },
+                        ::core::option::Option::None => (
+                            file.source,
+                            ::service_engine::blobs::Disposition::Attachment,
+                        ),
+                    };
                     ::core::result::Result::Ok(
                         query
                             .download::<$crate::DriveFiles<$p>>(
                                 &file_id,
-                                ::service_engine::BlobRef(file.source),
-                                ::service_engine::blobs::Disposition::Attachment,
+                                ::service_engine::BlobRef(reference),
+                                disposition,
                             )
                             .await?
                             .map(|url| url.into_string()),
                     )
+                }
+
+                async fn [<$prefix _runner_context>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                ) -> ::async_graphql::Result<$crate::RunnerContext> {
+                    let principal = ctx.data::<$p>()?;
+                    if !$crate::DriveHost::is_runner(principal) {
+                        return ::core::result::Result::Err(::service_engine::coded_error(
+                            $crate::codes::RUNNER_SCOPE_REQUIRED.code(),
+                            "the runner roots need the host's runner scope",
+                        ));
+                    }
+                    let query = ::service_engine::Query::<$p>::new(ctx)?;
+                    let mut contexts = query
+                        .fetch_view_window::<$crate::RunnerFiles<$p>>(&$crate::RunnerWindow {
+                            file_id: ::core::option::Option::Some(file_id),
+                        })
+                        .await?;
+                    let ::core::option::Option::Some(mut context) = contexts.pop() else {
+                        return ::core::result::Result::Err(::service_engine::coded_error(
+                            $crate::codes::FILE_NOT_FOUND.code(),
+                            "no such file",
+                        ));
+                    };
+                    let url = query
+                        .download::<$crate::RunnerFiles<$p>>(
+                            &file_id,
+                            ::service_engine::BlobRef(context.source),
+                            ::service_engine::blobs::Disposition::Inline,
+                        )
+                        .await?;
+                    let ::core::option::Option::Some(url) = url else {
+                        return ::core::result::Result::Err(::service_engine::coded_error(
+                            $crate::codes::SOURCE_NOT_AVAILABLE.code(),
+                            "the source is not yet available for download",
+                        ));
+                    };
+                    context.source_url = ::core::option::Option::Some(url.into_string());
+                    ::core::result::Result::Ok(context)
                 }
             }
 
@@ -143,6 +196,81 @@ macro_rules! drive_slice {
                     ::service_engine::ack::<$p, $crate::DeleteFile>(
                         ctx,
                         $crate::DeleteFile { file_id },
+                    )
+                    .await
+                }
+
+                async fn [<$prefix _edit_page>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    number: i32,
+                    markdown: ::std::string::String,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::EditPage>(
+                        ctx,
+                        $crate::EditPage {
+                            file_id,
+                            number,
+                            markdown,
+                        },
+                    )
+                    .await
+                }
+
+                #[allow(clippy::too_many_arguments)]
+                async fn [<$prefix _runner_request_image_upload>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    job_id: ::uuid::Uuid,
+                    name: ::std::string::String,
+                    media_type: ::std::string::String,
+                    size: $crate::ByteCount,
+                    sha256: ::std::string::String,
+                ) -> ::async_graphql::Result<$crate::UploadTicket> {
+                    ::core::result::Result::Ok(
+                        ::service_engine::execute::<$p, $crate::RunnerRequestImageUpload>(
+                            ctx,
+                            $crate::RunnerRequestImageUpload {
+                                file_id,
+                                job_id,
+                                name,
+                                media_type,
+                                size: size.0,
+                                sha256_hex: sha256,
+                            },
+                        )
+                        .await?
+                        .into_inner(),
+                    )
+                }
+
+                #[allow(clippy::too_many_arguments)]
+                async fn [<$prefix _runner_report>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    job_id: ::uuid::Uuid,
+                    #[graphql(default)] pages: ::std::vec::Vec<$crate::ReportedPageInput>,
+                    origin: ::core::option::Option<$crate::PageOrigin>,
+                    summary: ::core::option::Option<::std::string::String>,
+                    page_count: ::core::option::Option<i32>,
+                    estimated_tokens: ::core::option::Option<i64>,
+                    #[graphql(default = false)] done: bool,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::RunnerReport>(
+                        ctx,
+                        $crate::RunnerReport {
+                            file_id,
+                            job_id,
+                            pages: pages.into_iter().map(::core::convert::Into::into).collect(),
+                            origin: origin.unwrap_or_default(),
+                            summary,
+                            page_count,
+                            estimated_tokens,
+                            done,
+                        },
                     )
                     .await
                 }
