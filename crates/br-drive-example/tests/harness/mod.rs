@@ -131,9 +131,9 @@ impl World {
                 passport,
                 "query($id:UUID!){workspaceFile(fileId:$id){id driveId path name protected \
                  mediaType sizeBytes sha256 processingState processingError summary pageCount \
-                 estimatedTokens images{name mediaType sizeBytes page} rulesetId \
+                 estimatedTokens images{name mediaType sizeBytes page} labelIds rulesetId \
                  steps{runnerType options} progress{stepIndex stepCount runnerType plan \
-                 currentIndex currentLabel at} affordances updatedAt}}",
+                 currentIndex currentLabel at} affordances createdBy updatedAt}}",
                 serde_json::json!({ "id": file_id }),
             )
             .await;
@@ -272,6 +272,27 @@ impl World {
             );
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
+    }
+
+    pub async fn labels(&self, passport: &str) -> Vec<serde_json::Value> {
+        let response = self
+            .gql(
+                passport,
+                "query{workspaceLabels{id name color description createdAt}}",
+                serde_json::json!({}),
+            )
+            .await;
+        ok(&response)["workspaceLabels"]
+            .as_array()
+            .expect("a list of labels")
+            .clone()
+    }
+
+    pub async fn erase(&self, person: Uuid) -> service_engine::EraseOutcome {
+        self.service
+            .erase(person)
+            .await
+            .expect("the example host erases the person")
     }
 
     pub async fn rulesets(&self, passport: &str) -> Vec<serde_json::Value> {
@@ -475,9 +496,42 @@ pub fn error_code(response: &serde_json::Value) -> String {
 
 pub const DRIVE_DELTAS: &str = "subscription($d:UUID!){workspaceDriveChanged(driveId:$d){\
     __typename \
-    ... on DriveReset{revision views{... on DriveFile{id path name processingState}}} \
-    ... on DriveUpsert{revision cause view{... on DriveFile{id path name processingState processingError affordances summary pageCount estimatedTokens images{name page} rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
+    ... on DriveReset{revision views{... on DriveFile{id path name processingState labelIds}}} \
+    ... on DriveUpsert{revision cause view{... on DriveFile{id path name processingState processingError affordances summary pageCount estimatedTokens images{name page} labelIds rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
     ... on DriveRemove{revision projector key cause}}}";
+
+pub const LABEL_DELTAS: &str = "subscription{workspaceLabelsChanged{\
+    __typename \
+    ... on DriveReset{revision views{... on DriveLabel{id name color}}} \
+    ... on DriveUpsert{revision cause view{... on DriveLabel{id name color description}}} \
+    ... on DriveRemove{revision projector key cause}}}";
+
+pub const RULESET_DELTAS: &str = "subscription{workspaceRulesetsChanged{\
+    __typename \
+    ... on DriveReset{revision views{... on DriveRuleset{id name}}} \
+    ... on DriveUpsert{revision cause view{... on DriveRuleset{id name steps{runnerType}}}} \
+    ... on DriveRemove{revision projector key cause}}}";
+
+pub async fn catalogue_subscription(
+    world: &World,
+    passport: &str,
+    query: &str,
+    root: &str,
+) -> Subscription {
+    let mut sub = Subscription::open_with(
+        &world.subscription_url(),
+        passport,
+        query,
+        serde_json::json!({}),
+    )
+    .await;
+    let reset = sub.next_payload(Duration::from_secs(10)).await;
+    assert_eq!(
+        reset[root]["__typename"], "DriveReset",
+        "the first delta on attach is a Reset: {reset}"
+    );
+    sub
+}
 
 pub const PAGE_DELTAS: &str = "subscription($f:UUID!){workspaceFilePages(fileId:$f){\
     __typename \

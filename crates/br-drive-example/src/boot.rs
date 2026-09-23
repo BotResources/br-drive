@@ -22,6 +22,7 @@ pub struct Service {
     handle: JoinHandle<Result<(), EngineError>>,
     #[cfg(feature = "drive")]
     catalogue: br_drive::CatalogueWatch,
+    eraser: service_engine::Eraser<AppPrincipal>,
 }
 
 impl Service {
@@ -39,6 +40,15 @@ impl Service {
 
     pub fn readiness(&self) -> &ReadinessHandle {
         &self.readiness
+    }
+
+    /// Erases a person through the engine's erase pipeline — the host's
+    /// gesture, never a GraphQL root of the library.
+    pub async fn erase(
+        &self,
+        person: uuid::Uuid,
+    ) -> Result<service_engine::EraseOutcome, EngineError> {
+        self.eraser.erase(service_engine::PersonId(person)).await
     }
 
     pub async fn settle(&self) {
@@ -101,6 +111,7 @@ pub async fn boot(
     let stop = engine.shutdown_handle();
     let settle = engine.settle_handle();
     let blob_reader = engine.blob_reader();
+    let eraser = engine.eraser();
     #[cfg(feature = "drive")]
     let catalogue = br_drive::watch_runner_types(engine.nats().clone(), pool);
 
@@ -145,5 +156,6 @@ pub async fn boot(
         handle,
         #[cfg(feature = "drive")]
         catalogue,
+        eraser,
     })
 }

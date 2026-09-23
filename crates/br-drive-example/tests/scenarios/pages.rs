@@ -362,6 +362,7 @@ async fn regenerating_a_page_replaces_that_pages_images_by_name_and_releases_the
     )
     .await;
     let job_id = world.await_job(file_id).await;
+    assert_eq!(jobs.await_create(file_id).await.job_id, job_id);
 
     upload_image(&world, &runner, file_id, job_id, "p001-img01.png", IMAGE_A).await;
     upload_image(&world, &runner, file_id, job_id, "p001-img02.png", IMAGE_B).await;

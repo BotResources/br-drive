@@ -33,7 +33,7 @@ The `version` beside the `tag` is required: a tag-only git dependency carries a
 
 | br-drive | `br-service-engine` |
 |---|---|
-| 0.1 (unreleased) | `v0.3.0` |
+| 0.1 | `v0.3.0` |
 
 ## What a host writes
 
@@ -76,6 +76,19 @@ types (`DriveFile`, `DriveDelta`, …) keep their names in every embed, so a
 downstream project pins one `br-drive` version across all its services and
 rolls them together. The host never writes to the `drive` schema directly.
 
+
+### Embedding checklist
+
+1. **Compose**: `slice drive ["drive"] from br_drive::drive_slice { query = drive::DriveQuery, mutation = drive::DriveMutation, subscription = drive::DriveSubscription }` under the host's `prefix`; every root below appears at that prefix.
+2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and both of the library's self-commands arrive as a service actor, and a resolver that rejects services parks all ten reactions.
+3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `visible_drives` (never a service principal), `display_name`, `upload_window`, `erase_mode`, the two folder hooks.
+4. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
+5. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
+6. **Catalogue watch**: `br_drive::watch_runner_types(engine.nats().clone(), pool.clone())` after boot, `CatalogueWatch::stop` at shutdown; the `PUBLISHED_LANGUAGE` bucket must exist on the broker.
+7. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
+8. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
+9. **Drives**: created and deleted from the host's own mutations (`create_drive`, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_protected`, `set_metadata`, `drive_of` for curation.
+
 ### The `DriveHost` seam
 
 ```rust
@@ -87,6 +100,7 @@ impl DriveHost for AppPrincipal {
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate { … }
     fn visible_drives(&self) -> Vec<Uuid> { … }
     fn display_name(&self) -> Option<String> { … }      // default None; feeds job.create's triggered_by
+    fn erase_mode() -> EraseMode { … }                  // default Anonymise; Delete removes the person's files
     fn upload_window(&self) -> Duration { … }           // default 15 min
     fn folder_moved(ops, drive, old_prefix, new_prefix) -> BoxFuture<…> { … }   // default no-op
     fn folder_deleted(ops, drive, prefix) -> BoxFuture<…> { … }                  // default no-op
@@ -110,8 +124,8 @@ every `RequestUpload`.
   the host marked `protected` is refused with `FILE_PROTECTED` before the gate
   is asked. The same decision feeds the mutation guard and the `affordances`
   on `DriveFile` (`delete`, `rename`, `move`, `download`, `editPage`,
-  `process`) and on `DrivePage` (`editPage`, `regeneratePage`), so the front
-  renders and never decides.
+  `process`, `setLabels`) and on `DrivePage` (`editPage`, `regeneratePage`),
+  so the front renders and never decides.
 - `visible_drives` is the cohort membership of the reactive views (dimension
   `drive`, `Cohort::uuid("drive", drive_id)`): a principal sees the files of the
   drives it lists. When that answer changes, the host stages
@@ -140,7 +154,9 @@ every `RequestUpload`.
 
 Root fields at the host prefix `<p>`; every mutation answers the engine's
 `{ success }` ack or a coded refusal (`errors[].extensions.code`). Ids are
-client-generated UUIDv7.
+client-generated UUIDv7. The complete SDL of the slice, as the example host
+renders it, is committed at
+`crates/br-drive-example/src/slices/drive/schema.graphql`.
 
 | Root | Shape |
 |---|---|
@@ -156,8 +172,13 @@ client-generated UUIDv7.
 | `<p>DriveFiles(driveId): [DriveFile!]!` | the drive's files as the caller sees them (the tree is a path prefix; empty folders do not exist). |
 | `<p>Pages(fileId): [DrivePage!]!` | the file's rendition, page by page (milestone 3); empty when the caller cannot read the file. |
 | `<p>Rulesets: [DriveRuleset!]!`, `<p>CreateRuleset(…)`, `<p>UpdateRuleset(…)`, `<p>DeleteRuleset(id)` | the host's processing rules (milestone 4, "Processing rules" below). |
-| `<p>FileAccess(fileId, name: String): String` | a short-lived presigned GET on the source (attachment); `null` when the caller cannot see the file, a coded refusal when the `download` affordance is denied (`FILE_NOT_READY` before the commit, then the host's code), and `null` between the commit and the engine reaper's promotion (a verified blob is never downloadable in the pending window; the `SourceAvailable` cause says when to retry). `name` is reserved for the extracted images (milestone 3) and answers `null` today. |
+| `<p>Labels: [DriveLabel!]!` | the host's label catalogue: `DriveLabel { id, name, color, description, createdAt, updatedAt }` in id order (UUIDv7: creation order); every principal of the host reads it (the creator's id stays on the row, off the wire). |
+| `<p>CreateLabel(id, name, color, description?)`, `<p>UpdateLabel(id, name?, color?, description?)`, `<p>DeleteLabel(id): MutationAck!` | gate `ManageLabels`; `name` trimmed, 1–100 characters, unique per host case-insensitive (`LABEL_NAME_TAKEN`); `color` `#rrggbb` lowercase hex (an uppercase input is lowercased; anything else `INVALID_LABEL`); `description` defaults to `""`, at most 1 KiB; the name check and the write are serialized, so two concurrent saves of one name answer exactly one `LABEL_NAME_TAKEN`; `NOTHING_TO_CHANGE` on an unchanged update. `DeleteLabel` runs on the bulk pipeline: it detaches the label from every file it was on — `LabelsChanged { detached }` per file up to `BULK_RESET_THRESHOLD`, a `DriveFiles` reset beyond — so a label on any number of files can go. |
+| `<p>SetFileLabels(fileId, labelIds): MutationAck!` | gate `SetFileLabels { file }`; the target set, idempotent — the same set is `NOTHING_TO_CHANGE`, an unknown id `LABEL_NOT_FOUND`; `labelIds` on `DriveFile` follows (`LabelsChanged`), and a file keeps its labels across the host's drives. |
+| `<p>FileAccess(fileId, name: String): String` | a short-lived presigned GET on the source (attachment); `null` when the caller cannot see the file, a coded refusal when the `download` affordance is denied (`FILE_NOT_READY` before the commit, then the host's code), and `null` between the commit and the engine reaper's promotion (a verified blob is never downloadable in the pending window; the `SourceAvailable` cause says when to retry). With `name`, a presigned GET on that extracted image (inline; `null` for an unknown name and until the object landed). |
 | `<p>DriveChanged(driveId): DriveDelta!` | the file list: the engine snapshot on connect (`DriveReset` of `DriveFile`s), then `DriveUpsert` / `DriveRemove` on the contiguous revision. |
+| `<p>LabelsChanged: DriveDelta!` | the label catalogue live: a `DriveReset` of `DriveLabel`s, then an upsert (`Created`, `Updated`) or a remove per label. |
+| `<p>RulesetsChanged: DriveDelta!` | the rule table live, for the manager's screen: an upsert per save with `Saved { unknown_runner_types }` as its cause (the same warning the save answers), a remove per delete. |
 | `<p>FilePages(fileId): DriveDelta!` | one file's rendition (milestone 3): a `DriveReset` with every `DrivePage` of the file, then a `DriveUpsert` / `DriveRemove` per page; gated on `ReadFile` for the file's drive, so a caller who cannot read the file gets an empty window and a caller who loses the drive gets one `DriveRemove` per page. |
 
 `DriveFile`: `id`, `driveId`, `path` (normalized, `""` = root), `name`,
@@ -165,7 +186,7 @@ client-generated UUIDv7.
 GraphQL `Int` is 32-bit), `sha256` (hex), `processingState`
 (`PENDING | PROCESSING | READY | FAILED`), `processingError`, `metadata`
 (JSON), `summary`, `pageCount`, `estimatedTokens`, `images[] { name,
-mediaType, sizeBytes, page }`, `rulesetId`, `steps[] { runnerType, options }`
+mediaType, sizeBytes, page }`, `labelIds` (computed, by label name), `rulesetId`, `steps[] { runnerType, options }`
 (the snapshot the last chain ran), `progress { stepIndex, stepCount,
 runnerType, plan, currentIndex, currentLabel, at }` (non-null only while
 `PROCESSING`), `createdBy`, `createdAt`, `updatedAt`, `affordances` (`delete`,
@@ -179,7 +200,7 @@ updatedAt, affordances { editPage } }` has its own projector, keyed by
 edit or a 300-page report never rewrites or re-emits the file row.
 
 `DriveDelta` is the engine's delta union over `DriveView = DriveFile |
-DrivePage`: `DriveReset { revision, views }`, `DriveUpsert { revision, view,
+DrivePage | DriveLabel | DriveRuleset`: `DriveReset { revision, views }`, `DriveUpsert { revision, view,
 cause }`, `DriveRemove { revision, projector, key, cause }` (`projector` is
 `drive_files` or `drive_pages`; a page key is `{ fileId, number }`), plus the
 lane notices. `cause` is one of the library's file causes (`UploadRequested`,
@@ -188,9 +209,12 @@ from_drive }`, `FolderMoved`, `ProtectionChanged { protected }`,
 `MetadataChanged`, `ImageRequested { name }`, `ImageAvailable { name }`,
 `ImagesDropped { names }`, `ReportStored { job_id, done }`,
 `ProcessingStarted { job_id, step }`, `ProgressChanged`,
-`ProcessingFinished`, `ProcessingFailed { reason }`, `Deleted`,
-`FolderDeleted`, `DriveDeleted`) or page causes (`Reported { job_id, origin
-}`, `Edited`) on a delta the engine attributes to an impact; a key that
+`ProcessingFinished`, `ProcessingFailed { reason }`, `LabelsChanged {
+detached }`, `Erased`, `Deleted`, `FolderDeleted`, `DriveDeleted`), page
+causes (`Reported { job_id, origin
+}`, `Edited`), label causes (`Created`, `Updated`, `Deleted`) or rule causes
+(`Saved { unknown_runner_types }`, `Deleted`) on a delta the engine attributes
+to an impact; a key that
 **enters or leaves** a live session's window (a created or deleted file, a
 page the runner reports for the first time, a drive gained or lost) is
 delivered by the engine's window repopulation and carries no cause in engine
@@ -225,7 +249,7 @@ runner reports and never interprets a media type.
 |---|---|
 | `<p>RunnerContext(fileId, jobId): RunnerContext!` | `{ fileId, mediaType, name, pageCount, summary, pages[] { number, markdown, origin, updatedAt }, images[], sourceUrl }` — a **fresh** presigned GET on the source (inline) at every call, plus the current rendition read directly by file id, so an indexer or a page-regeneration runner reads the pages, not the source. `FILE_NOT_FOUND` for an unknown file, `JOB_NOT_ACTIVE` for any job but the file's, `SOURCE_NOT_AVAILABLE` while the engine reaper has not promoted the source yet (retry). |
 | `<p>RunnerRequestImageUpload(fileId, jobId, name, mediaType, size: ByteCount, sha256): UploadTicket!` | a verified presigned POST for a `drive_image` blob (the runner hashes first; `FILE_TOO_LARGE` past `DriveHost::IMAGE_MAX_BYTES`) and the `file_image` row, unique per file by name. An existing name is **replaced only when the new object lands**: until then the old image stays readable and a failed replacement upload changes nothing; when it lands, the row swaps and the old object is released in the same transaction. A re-request for a name whose upload is still in flight is refused with `IMAGE_UPLOAD_PENDING` (the first ticket stands, one blob per request — the same posture as the source's `KEY_REUSED`); past the host's `upload_window` a re-request replaces the abandoned blob. |
-| `<p>RunnerReport(fileId, jobId, pages: [ReportedPageInput!], origin: PageOrigin, summary, pageCount, estimatedTokens, done): MutationAck!` | pages in one or several batches of at most `MAX_REPORT_PAGES` (512, `BATCH_TOO_LARGE`), **upserted by number** (a replayed batch changes nothing; a number twice in one batch is `INVALID_PAGE`); each page reaches `<p>FilePages` on its own key (`Reported { job_id, origin }`) and the file row is touched only by the indexer's triple. `origin` `RUNNER` (default) or `REGENERATED` — on a regenerated page the images of that page that its new markdown no longer references (matched on the whole name, `![…](p001-img01.png)`, never as a substring) are dropped and released (`ImagesDropped { names }` on the file); `summary`, `pageCount` and `estimatedTokens` are the indexer's triple and move together (`INDEXER_FIELDS_TOGETHER`, `INVALID_INDEXER_VALUE` when negative; `ReportStored { job_id, done }` on the file when the triple changes); an empty report is `NOTHING_TO_CHANGE` unless `done`; `done: true` calls the `report_done` seam. |
+| `<p>RunnerReport(fileId, jobId, pages: [ReportedPageInput!], origin: PageOrigin, summary, pageCount, estimatedTokens, done): MutationAck!` | pages in one or several batches of at most `MAX_REPORT_PAGES` (512, `BATCH_TOO_LARGE`), **upserted by number** (a replayed batch changes nothing; a number twice in one batch is `INVALID_PAGE`); each page reaches `<p>FilePages` on its own key (`Reported { job_id, origin }`) and the file row is touched only by the indexer's triple. `origin` `RUNNER` (default) or `REGENERATED` — on a regenerated page the images of that page that its new markdown no longer references (matched on the whole name, `![…](p001-img01.png)`, never as a substring) are dropped and released (`ImagesDropped { names }` on the file); `summary`, `pageCount` and `estimatedTokens` are the indexer's triple and move together (`INDEXER_FIELDS_TOGETHER`, `INVALID_INDEXER_VALUE` when negative; `ReportStored { job_id, done }` on the file when the triple changes); an empty report is `NOTHING_TO_CHANGE` unless `done`; `done: true` records `done_at` and stages `job.finish.v2` (see "Processing rules"). |
 
 The job. Every runner root validates `jobId` against the File's own `job_id`
 — the job of the step that is running (`JOB_NOT_ACTIVE` for any other job, for
@@ -349,6 +373,30 @@ and the catalogue is published by a non-engine producer under a dot prefix
 with a per-value `version`; the watch is replaced by the kit when the kit
 accepts such a prefix.
 
+## Erase
+
+The library implements the engine's `Erasable` for its rows and registers it
+at `br_drive::register`; the host drives it through the engine's erase
+pipeline (`engine.eraser().erase(person)`), never through a GraphQL root, and
+the pipeline records the erasure, purges what the manifest names and emits
+the engine's `PersonErased` fact. `DriveHost::erase_mode` picks the mode:
+
+- `Anonymise` (default): every `created_by` / `updated_by` the person left on
+  drives, files, pages, labels, label links and rules, and the `triggered_by`
+  of the chains they started, is rewritten to `br_drive::REDACTED_PERSON`
+  (the nil UUID); nothing is deleted.
+- `Delete`: every file the person created is deleted (its pages, images and
+  label links cascade, its objects are purged through the manifest), then the
+  rest is anonymised. A job still running on such a file is not cancelled —
+  the erase pipeline's `Ops` has no outbound identity — the deleted file
+  refuses the runner's next call and Jobs times the job out. Drives
+  are the host's to delete (`delete_drive`). The erase context cannot stage a
+  projector reset, so live sessions are told file by file up to
+  `BULK_RESET_THRESHOLD` and catch up on their next reset past it.
+
+A second erase of the same person is absorbed by the engine (`fresh: false`)
+and changes nothing.
+
 ## Reason codes
 
 `DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`, `FILE_PROTECTED`,
@@ -361,13 +409,22 @@ accepts such a prefix.
 `INVALID_INDEXER_VALUE`, `BATCH_TOO_LARGE`, `RULESET_NOT_FOUND`,
 `RULESET_NAME_TAKEN`, `INVALID_RULESET`, `DEFAULT_ALREADY_SET`,
 `RULESET_MISMATCH`, `NO_RULESET_MATCHES`, `RUNNER_TYPE_UNAVAILABLE`,
-`CATALOGUE_NOT_WATCHED` — plus the host's own codes through the gate and the
-hooks. On a `FAILED` file, `processingError` carries the runner's
+`CATALOGUE_NOT_WATCHED`, `LABEL_NOT_FOUND`, `LABEL_NAME_TAKEN`,
+`INVALID_LABEL` — plus the host's own codes through the gate and the hooks. On a `FAILED` file, `processingError` carries the runner's
 `reason_code` verbatim, or one of the library's: `runner_type_unavailable`,
 `catalogue_not_watched`, `cancelled`.
 
 ## Follow-ups
 
+- The erase pipeline's `Ops` has no outbound identity and cannot stage a
+  projector reset: a job running on a file deleted by an erase is left to
+  Jobs' timeout, and past
+  `BULK_RESET_THRESHOLD` deleted files, live `DriveChanged` sessions catch up
+  on their next reset instead of receiving one `Remove` per file.
+- The catalogue watch stamps `seen_at` and `scanned_at` from the database
+  clock: it runs outside the engine's `Ops` and has no engine clock.
+- `select_ruleset` reads the defaults of one trigger per gesture — fine at a
+  host's scale (tens of rules), noted for the record.
 - The catalogue watch's health is not on the engine's readiness: the readiness
   assembly is the engine's, and its mirror-handle registration is a
   test-support API in 0.3.0. `drive.catalogue_scan` says whether a scan ever

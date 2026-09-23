@@ -8,6 +8,7 @@ use service_engine::pipeline::Ops;
 use service_engine::principal::Principal;
 use uuid::Uuid;
 
+use crate::erase::EraseMode;
 use crate::file::FileRow;
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
@@ -109,6 +110,11 @@ pub trait DriveHost: Principal {
 
     fn display_name(&self) -> Option<String> {
         None
+    }
+
+    /// What the engine's erase pipeline does with the rows a person created.
+    fn erase_mode() -> EraseMode {
+        EraseMode::Anonymise
     }
 
     fn upload_window(&self) -> Duration {

@@ -52,6 +52,17 @@ macro_rules! drive_slice {
                         .await
                 }
 
+                async fn [<$prefix _labels>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                ) -> ::async_graphql::Result<::std::vec::Vec<$crate::DriveLabel>> {
+                    ::service_engine::Query::<$p>::new(ctx)?
+                        .fetch_view_window::<$crate::DriveLabels<$p>>(
+                            &::core::default::Default::default(),
+                        )
+                        .await
+                }
+
                 async fn [<$prefix _file_access>](
                     &self,
                     ctx: &::async_graphql::Context<'_>,
@@ -273,6 +284,71 @@ macro_rules! drive_slice {
                     )
                 }
 
+                async fn [<$prefix _create_label>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    id: ::uuid::Uuid,
+                    name: ::std::string::String,
+                    color: ::std::string::String,
+                    description: ::core::option::Option<::std::string::String>,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::CreateLabel>(
+                        ctx,
+                        $crate::CreateLabel {
+                            id,
+                            name,
+                            color,
+                            description,
+                        },
+                    )
+                    .await
+                }
+
+                async fn [<$prefix _update_label>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    id: ::uuid::Uuid,
+                    name: ::core::option::Option<::std::string::String>,
+                    color: ::core::option::Option<::std::string::String>,
+                    description: ::core::option::Option<::std::string::String>,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::UpdateLabel>(
+                        ctx,
+                        $crate::UpdateLabel {
+                            id,
+                            name,
+                            color,
+                            description,
+                        },
+                    )
+                    .await
+                }
+
+                async fn [<$prefix _delete_label>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    id: ::uuid::Uuid,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack_bulk::<$p, $crate::DeleteLabel>(
+                        ctx,
+                        $crate::DeleteLabel { id },
+                    )
+                    .await
+                }
+
+                async fn [<$prefix _set_file_labels>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    label_ids: ::std::vec::Vec<::uuid::Uuid>,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::SetFileLabels>(
+                        ctx,
+                        $crate::SetFileLabels { file_id, label_ids },
+                    )
+                    .await
+                }
+
                 async fn [<$prefix _delete_ruleset>](
                     &self,
                     ctx: &::async_graphql::Context<'_>,
@@ -466,6 +542,48 @@ macro_rules! drive_slice {
                         ::std::vec![::service_engine::session::WindowSpec::view::<
                             $crate::DrivePages<$p>,
                         >(&$crate::PageWindow::of(file_id), false)?],
+                    )
+                    .await?;
+                    ::core::result::Result::Ok(
+                        stream.map(|delta| $crate::DriveDelta::from_delta::<$p>(&delta)),
+                    )
+                }
+
+                async fn [<$prefix _labels_changed>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                ) -> ::async_graphql::Result<
+                    impl ::futures_util::Stream<
+                        Item = ::async_graphql::Result<$crate::DriveDelta>,
+                    >,
+                > {
+                    use ::futures_util::StreamExt;
+                    let stream = ::service_engine::attach::<$p>(
+                        ctx,
+                        ::std::vec![::service_engine::session::WindowSpec::view::<
+                            $crate::DriveLabels<$p>,
+                        >(&::core::default::Default::default(), false)?],
+                    )
+                    .await?;
+                    ::core::result::Result::Ok(
+                        stream.map(|delta| $crate::DriveDelta::from_delta::<$p>(&delta)),
+                    )
+                }
+
+                async fn [<$prefix _rulesets_changed>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                ) -> ::async_graphql::Result<
+                    impl ::futures_util::Stream<
+                        Item = ::async_graphql::Result<$crate::DriveDelta>,
+                    >,
+                > {
+                    use ::futures_util::StreamExt;
+                    let stream = ::service_engine::attach::<$p>(
+                        ctx,
+                        ::std::vec![::service_engine::session::WindowSpec::view::<
+                            $crate::DriveRulesets<$p>,
+                        >(&::core::default::Default::default(), false)?],
                     )
                     .await?;
                     ::core::result::Result::Ok(

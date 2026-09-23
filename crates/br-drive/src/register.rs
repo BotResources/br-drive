@@ -1,6 +1,7 @@
 use service_engine::Engine;
 use service_engine::error::EngineError;
 
+use crate::erase::DriveErasure;
 use crate::file::images::{IMAGE_LANDED_DURABLE, ImageLanded, image_landed};
 use crate::file::{
     DeleteFile, DriveFiles, DrivePages, EditPage, Process, RegeneratePage, UpdateFile, delete_file,
@@ -8,6 +9,10 @@ use crate::file::{
 };
 use crate::folders::{self, DeleteFolder, MoveFolder};
 use crate::host::DriveHost;
+use crate::label::{
+    CreateLabel, DeleteLabel, DriveLabels, SetFileLabels, UpdateLabel, create_label, delete_label,
+    set_file_labels, update_label,
+};
 use crate::processing::{
     self, CancelledFact, CompletedFact, CreationRejectedFact, FailedFact, PlanDeclaredFact,
     QueuedFact, StartedFact, StepStartedFact,
@@ -38,6 +43,8 @@ pub fn register<H: DriveHost>(
     engine.register_view(DrivePages::<H>::default())?;
     engine.register_view(RunnerSources::<H>::default())?;
     engine.register_view(DriveRulesets::<H>::default())?;
+    engine.register_view(DriveLabels::<H>::default())?;
+    engine.register_erasable(DriveErasure::<H>::default())?;
     engine.register_mutation::<RequestUpload, _>(upload::request_upload::<H>)?;
     let reader = engine.blob_reader();
     engine.register_mutation::<CommitUpload, _>(move |cx, input| {
@@ -51,10 +58,14 @@ pub fn register<H: DriveHost>(
     engine.register_mutation::<CreateRuleset, _>(create_ruleset::<H>)?;
     engine.register_mutation::<UpdateRuleset, _>(update_ruleset::<H>)?;
     engine.register_mutation::<DeleteRuleset, _>(delete_ruleset::<H>)?;
+    engine.register_mutation::<CreateLabel, _>(create_label::<H>)?;
+    engine.register_mutation::<UpdateLabel, _>(update_label::<H>)?;
+    engine.register_mutation::<SetFileLabels, _>(set_file_labels::<H>)?;
     engine.register_mutation::<RunnerRequestImageUpload, _>(runner_request_image_upload::<H>)?;
     engine.register_mutation::<RunnerReport, _>(runner_report::<H>)?;
     engine.register_bulk::<MoveFolder, _>(folders::move_folder::<H>)?;
     engine.register_bulk::<DeleteFolder, _>(folders::delete_folder::<H>)?;
+    engine.register_bulk::<DeleteLabel, _>(delete_label::<H>)?;
     let durable = |suffix: &str| processing::durable(H::SERVICE, suffix);
     engine.register_reaction::<UploadDeadline<H>, _, _>(
         &durable(UPLOAD_DEADLINE_DURABLE),

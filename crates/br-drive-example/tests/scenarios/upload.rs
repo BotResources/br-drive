@@ -285,7 +285,9 @@ async fn an_upload_that_landed_but_was_never_committed_is_reaped_with_its_object
     poll_until!(Duration::from_secs(30), {
         (!world.object_exists(&object_key).await).then_some(())
     });
-    assert!(world.blob_state(source).await.is_none());
+    poll_until!(Duration::from_secs(10), {
+        world.blob_state(source).await.is_none().then_some(())
+    });
 
     world.cleanup().await;
 }

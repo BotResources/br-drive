@@ -44,7 +44,7 @@ impl DriveHost for AppPrincipal {
             return Gate::blocked(UNRENDERABLE_MEDIA_TYPE);
         }
         match request {
-            DriveRequest::ManageRulesets => {
+            DriveRequest::ManageRulesets | DriveRequest::ManageLabels => {
                 return if self.holds_scope(MANAGE_SCOPE) {
                     Gate::allowed()
                 } else {

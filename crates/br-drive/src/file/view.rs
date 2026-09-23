@@ -41,6 +41,7 @@ pub struct ImageSummary {
 pub struct FileView<H> {
     pub file: FileRow<H>,
     pub images: Vec<ImageSummary>,
+    pub label_ids: Vec<Uuid>,
 }
 
 impl<H> Clone for FileView<H> {
@@ -48,6 +49,7 @@ impl<H> Clone for FileView<H> {
         Self {
             file: self.file.clone(),
             images: self.images.clone(),
+            label_ids: self.label_ids.clone(),
         }
     }
 }
@@ -70,6 +72,7 @@ async fn load_views<H: DriveHost>(
             row_to_file(row).map(|file| FileView {
                 file,
                 images: Vec::new(),
+                label_ids: Vec::new(),
             })
         })
         .collect::<Result<_, _>>()?;
@@ -83,6 +86,12 @@ async fn load_views<H: DriveHost>(
     .bind(keys)
     .fetch_all(&mut *conn)
     .await?;
+    let mut labels = crate::label::label_ids_of_files(&mut *conn, keys).await?;
+    for view in &mut views {
+        if let Some(ids) = labels.remove(&view.file.id) {
+            view.label_ids = ids;
+        }
+    }
     for row in &images {
         let file_id: Uuid = row.get("file_id");
         if let Some(view) = views.iter_mut().find(|view| view.file.id == file_id) {
@@ -215,6 +224,7 @@ pub struct DriveFile {
     pub page_count: Option<i32>,
     pub estimated_tokens: Option<i64>,
     pub images: Vec<DriveImage>,
+    pub label_ids: Vec<Uuid>,
     pub ruleset_id: Option<Uuid>,
     pub steps: Option<Vec<DriveStep>>,
     pub progress: Option<DriveProgress>,
@@ -332,6 +342,7 @@ impl<H: DriveHost> Projector for DriveFiles<H> {
                     source: image.blob_ref,
                 })
                 .collect(),
+            label_ids: view.label_ids.clone(),
             ruleset_id: row.ruleset_id,
             steps: row
                 .steps

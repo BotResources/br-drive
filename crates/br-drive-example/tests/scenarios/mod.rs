@@ -1,8 +1,10 @@
 mod bulk;
 mod cascade;
 mod concurrency;
+mod erase;
 mod folders;
 mod hosts;
+mod labels;
 mod pages;
 mod processing;
 mod replay;
