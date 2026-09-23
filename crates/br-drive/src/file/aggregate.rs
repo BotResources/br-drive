@@ -1,4 +1,3 @@
-use std::collections::{BTreeSet, HashSet};
 use std::marker::PhantomData;
 
 use chrono::{DateTime, Utc};
@@ -13,7 +12,6 @@ use uuid::Uuid;
 
 use crate::fault::codes;
 use crate::host::{DRIVE_DIM, DriveHost, DriveRequest};
-use crate::image::ImageName;
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
 
@@ -96,57 +94,17 @@ pub enum FileCause {
     UploadAbandoned,
     SourceAvailable,
     Renamed,
-    Moved {
-        from_drive: Uuid,
-    },
+    Moved { from_drive: Uuid },
     FolderMoved,
-    ProtectionChanged {
-        protected: bool,
-    },
+    ProtectionChanged { protected: bool },
     MetadataChanged,
-    ImageRequested {
-        name: String,
-    },
-    ImageAvailable {
-        name: String,
-    },
-    ReportStored {
-        job_id: Uuid,
-        pages: usize,
-        done: bool,
-    },
-    PageEdited {
-        number: i32,
-    },
+    ImageRequested { name: String },
+    ImageAvailable { name: String },
+    ImagesDropped { names: Vec<String> },
+    ReportStored { job_id: Uuid, done: bool },
     Deleted,
     FolderDeleted,
     DriveDeleted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageRow {
-    pub number: i32,
-    pub markdown: String,
-    pub origin: PageOrigin,
-    pub updated_by: Uuid,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageRow {
-    pub name: ImageName,
-    pub blob_ref: Uuid,
-    pub media_type: MediaType,
-    pub size_bytes: i64,
-    pub sha256: [u8; 32],
-    pub page: Option<i32>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Changes {
-    pub pages: BTreeSet<i32>,
-    pub images: BTreeSet<String>,
-    pub dropped_images: BTreeSet<String>,
 }
 
 pub struct FileRow<H> {
@@ -168,9 +126,6 @@ pub struct FileRow<H> {
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub pages: Vec<PageRow>,
-    pub images: Vec<ImageRow>,
-    pub(crate) changes: Changes,
     pub(crate) host: PhantomData<fn() -> H>,
 }
 
@@ -195,9 +150,6 @@ impl<H> Clone for FileRow<H> {
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            pages: self.pages.clone(),
-            images: self.images.clone(),
-            changes: self.changes.clone(),
             host: PhantomData,
         }
     }
@@ -211,72 +163,7 @@ impl<H> std::fmt::Debug for FileRow<H> {
             .field("path", &self.path)
             .field("name", &self.name)
             .field("processing_state", &self.processing_state)
-            .field("pages", &self.pages.len())
-            .field("images", &self.images.len())
             .finish_non_exhaustive()
-    }
-}
-
-impl<H> FileRow<H> {
-    pub fn page(&self, number: i32) -> Option<&PageRow> {
-        self.pages.iter().find(|page| page.number == number)
-    }
-
-    pub fn image(&self, name: &str) -> Option<&ImageRow> {
-        self.images.iter().find(|image| image.name.as_str() == name)
-    }
-
-    pub fn upsert_page(
-        &mut self,
-        number: i32,
-        markdown: String,
-        origin: PageOrigin,
-        by: Uuid,
-        at: DateTime<Utc>,
-    ) {
-        let page = PageRow {
-            number,
-            markdown,
-            origin,
-            updated_by: by,
-            updated_at: at,
-        };
-        match self.pages.iter_mut().find(|page| page.number == number) {
-            Some(existing) => *existing = page,
-            None => {
-                self.pages.push(page);
-                self.pages.sort_by_key(|page| page.number);
-            }
-        }
-        self.changes.pages.insert(number);
-    }
-
-    pub fn put_image(&mut self, image: ImageRow) {
-        let name = image.name.as_str().to_string();
-        match self
-            .images
-            .iter_mut()
-            .find(|existing| existing.name == image.name)
-        {
-            Some(existing) => *existing = image,
-            None => self.images.push(image),
-        }
-        self.changes.dropped_images.remove(&name);
-        self.changes.images.insert(name);
-    }
-
-    pub fn drop_page_images_except(&mut self, page: i32, keep: &HashSet<&str>) {
-        let dropped: Vec<String> = self
-            .images
-            .iter()
-            .filter(|image| image.page == Some(page) && !keep.contains(image.name.as_str()))
-            .map(|image| image.name.as_str().to_string())
-            .collect();
-        for name in dropped {
-            self.images.retain(|image| image.name.as_str() != name);
-            self.changes.images.remove(&name);
-            self.changes.dropped_images.insert(name);
-        }
     }
 }
 
@@ -362,6 +249,10 @@ impl<H: DriveHost> FileRow<H> {
         }
     }
 
+    pub fn read_gate(&self, principal: &H) -> Gate {
+        principal.drive_gate(&DriveRequest::ReadFile { file: self })
+    }
+
     pub fn require_active_job(&self, job_id: Uuid) -> Result<(), Reason> {
         if H::active_job(self) == Some(job_id) {
             Ok(())
@@ -384,12 +275,16 @@ impl<H: DriveHost> Visibility for FileVisibility<H> {
     }
 
     fn memberships(principal: &H) -> Cohorts {
-        principal
-            .visible_drives()
-            .into_iter()
-            .map(|drive| Cohort::uuid(DRIVE_DIM, drive))
-            .collect()
+        drive_memberships(principal)
     }
+}
+
+pub(crate) fn drive_memberships<H: DriveHost>(principal: &H) -> Cohorts {
+    principal
+        .visible_drives()
+        .into_iter()
+        .map(|drive| Cohort::uuid(DRIVE_DIM, drive))
+        .collect()
 }
 
 #[cfg(test)]

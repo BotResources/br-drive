@@ -30,6 +30,8 @@ impl DriveHost for AppPrincipal {
 
     const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(8);
 
+    const IMAGE_MAX_BYTES: u64 = 1 << 20;
+
     const BULK_RESET_THRESHOLD: usize = 3;
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate {

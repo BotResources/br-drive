@@ -1,13 +1,15 @@
 use service_engine::Engine;
 use service_engine::error::EngineError;
 
+use crate::file::images::{IMAGE_LANDED_DURABLE, ImageLanded, image_landed};
 use crate::file::{
-    DeleteFile, DriveFiles, EditPage, UpdateFile, delete_file, edit_page, update_file,
+    DeleteFile, DriveFiles, DrivePages, EditPage, UpdateFile, delete_file, edit_page, update_file,
 };
 use crate::folders::{self, DeleteFolder, MoveFolder};
 use crate::host::DriveHost;
 use crate::runner::{
-    RunnerFiles, RunnerReport, RunnerRequestImageUpload, runner_report, runner_request_image_upload,
+    RunnerReport, RunnerRequestImageUpload, RunnerSources, runner_report,
+    runner_request_image_upload,
 };
 use crate::upload::{self, CommitUpload, RequestUpload, UPLOAD_DEADLINE_DURABLE, UploadDeadline};
 
@@ -20,7 +22,8 @@ pub fn register<H: DriveHost>(engine: &mut Engine<H>) -> Result<(), EngineError>
         ));
     }
     engine.register_view(DriveFiles::<H>::default())?;
-    engine.register_view(RunnerFiles::<H>::default())?;
+    engine.register_view(DrivePages::<H>::default())?;
+    engine.register_view(RunnerSources::<H>::default())?;
     engine.register_mutation::<RequestUpload, _>(upload::request_upload::<H>)?;
     let reader = engine.blob_reader();
     engine.register_mutation::<CommitUpload, _>(move |cx, input| {
@@ -37,6 +40,7 @@ pub fn register<H: DriveHost>(engine: &mut Engine<H>) -> Result<(), EngineError>
         UPLOAD_DEADLINE_DURABLE,
         upload::upload_deadline::<H>,
     )?;
+    engine.register_reaction::<ImageLanded<H>, _, _>(IMAGE_LANDED_DURABLE, image_landed::<H>)?;
     crate::blob::register::<H>(engine)?;
     Ok(())
 }

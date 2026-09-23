@@ -106,6 +106,12 @@ pub async fn boot(
     if options.await_ready {
         let deadline = Instant::now() + Duration::from_secs(30);
         while readiness.snapshot() != Readiness::Ready {
+            if handle.is_finished() {
+                let outcome = handle.await.expect("the engine task joined");
+                return Err(EngineError::Config(format!(
+                    "the engine task ended during boot: {outcome:?}"
+                )));
+            }
             if Instant::now() >= deadline {
                 let reason = format!("{:?}", readiness.snapshot());
                 stop.notify_one();

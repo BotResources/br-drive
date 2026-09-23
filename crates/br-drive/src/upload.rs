@@ -114,9 +114,6 @@ pub fn request_upload<'m, H: DriveHost>(
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,
-            pages: Vec::new(),
-            images: Vec::new(),
-            changes: Default::default(),
             host: PhantomData,
         };
         cx.create(&file).await?;

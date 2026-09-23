@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
+use service_engine::BlobRef;
 use service_engine::gate::Reason;
 use service_engine::persistence::Aggregate;
 use service_engine::pipeline::{Bulk, MutationInput};
@@ -10,7 +11,7 @@ use uuid::Uuid;
 use crate::drive::DriveRow;
 use crate::fault::{DriveFault, codes};
 use crate::file::store;
-use crate::file::{DriveFiles, File, FileCause, FileRow};
+use crate::file::{DriveFiles, DrivePages, File, FileCause, FileRow};
 use crate::host::{DriveHost, DriveRequest};
 use crate::path::DrivePath;
 
@@ -35,11 +36,15 @@ pub(crate) async fn delete_rows<H: DriveHost>(
     files: &[FileRow<H>],
 ) -> Result<(), DriveFault> {
     let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
+    let images = store::image_refs_of_files(cx.connection(), &ids).await?;
     store::delete_many(cx.connection(), &ids).await?;
     for file in files {
         for reference in file.blob_refs() {
             cx.release_blob(reference)?;
         }
+    }
+    for reference in images {
+        cx.release_blob(BlobRef(reference))?;
     }
     Ok(())
 }
@@ -51,6 +56,7 @@ pub(crate) fn impact_rows<H: DriveHost>(
 ) -> Result<(), DriveFault> {
     if ids.len() > H::BULK_RESET_THRESHOLD {
         cx.impact_all_view::<DriveFiles<H>>();
+        cx.impact_all_view::<DrivePages<H>>();
         return Ok(());
     }
     for id in ids {

@@ -29,6 +29,18 @@ macro_rules! drive_slice {
                         .await
                 }
 
+                async fn [<$prefix _pages>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                ) -> ::async_graphql::Result<::std::vec::Vec<$crate::DrivePage>> {
+                    ::service_engine::Query::<$p>::new(ctx)?
+                        .fetch_view_window::<$crate::DrivePages<$p>>(
+                            &$crate::PageWindow::of(file_id),
+                        )
+                        .await
+                }
+
                 async fn [<$prefix _file_access>](
                     &self,
                     ctx: &::async_graphql::Context<'_>,
@@ -83,28 +95,21 @@ macro_rules! drive_slice {
                     &self,
                     ctx: &::async_graphql::Context<'_>,
                     file_id: ::uuid::Uuid,
+                    job_id: ::uuid::Uuid,
                 ) -> ::async_graphql::Result<$crate::RunnerContext> {
                     let principal = ctx.data::<$p>()?;
-                    if !$crate::DriveHost::is_runner(principal) {
-                        return ::core::result::Result::Err(::service_engine::coded_error(
-                            $crate::codes::RUNNER_SCOPE_REQUIRED.code(),
-                            "the runner roots need the host's runner scope",
-                        ));
-                    }
-                    let query = ::service_engine::Query::<$p>::new(ctx)?;
-                    let mut contexts = query
-                        .fetch_view_window::<$crate::RunnerFiles<$p>>(&$crate::RunnerWindow {
-                            file_id: ::core::option::Option::Some(file_id),
-                        })
-                        .await?;
-                    let ::core::option::Option::Some(mut context) = contexts.pop() else {
-                        return ::core::result::Result::Err(::service_engine::coded_error(
-                            $crate::codes::FILE_NOT_FOUND.code(),
-                            "no such file",
-                        ));
-                    };
-                    let url = query
-                        .download::<$crate::RunnerFiles<$p>>(
+                    let state = ctx
+                        .data::<::std::sync::Arc<::service_engine::GraphqlState<$p>>>()?;
+                    let mut context = $crate::runner_context::<$p>(
+                        state.pg(),
+                        principal,
+                        file_id,
+                        job_id,
+                    )
+                    .await
+                    .map_err($crate::DriveFault::into_graphql)?;
+                    let url = ::service_engine::Query::<$p>::new(ctx)?
+                        .download::<$crate::RunnerSources<$p>>(
                             &file_id,
                             ::service_engine::BlobRef(context.source),
                             ::service_engine::blobs::Disposition::Inline,
@@ -327,6 +332,28 @@ macro_rules! drive_slice {
                         ::std::vec![::service_engine::session::WindowSpec::view::<
                             $crate::DriveFiles<$p>,
                         >(&$crate::DriveWindow::of(drive_id), false)?],
+                    )
+                    .await?;
+                    ::core::result::Result::Ok(
+                        stream.map(|delta| $crate::DriveDelta::from_delta::<$p>(&delta)),
+                    )
+                }
+
+                async fn [<$prefix _file_pages>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                ) -> ::async_graphql::Result<
+                    impl ::futures_util::Stream<
+                        Item = ::async_graphql::Result<$crate::DriveDelta>,
+                    >,
+                > {
+                    use ::futures_util::StreamExt;
+                    let stream = ::service_engine::attach::<$p>(
+                        ctx,
+                        ::std::vec![::service_engine::session::WindowSpec::view::<
+                            $crate::DrivePages<$p>,
+                        >(&$crate::PageWindow::of(file_id), false)?],
                     )
                     .await?;
                     ::core::result::Result::Ok(

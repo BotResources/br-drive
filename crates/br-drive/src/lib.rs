@@ -20,10 +20,12 @@ pub use blob::{DriveImage as DriveImageBlob, DriveSource};
 pub use drive::{DriveDeleted, create_drive, delete_drive};
 pub use fault::{DriveFault, DriveReactionFault, codes};
 pub use file::{
-    ByteCount, DeleteFile, DriveDelta, DriveFile, DriveFileUnion, DriveFiles, DriveImage,
-    DrivePage, DriveRemove, DriveReset, DriveUpsert, DriveWindow, EditPage, File, FileCause,
-    FileRow, FileVisibility, ImageRow, PageOrigin, PageRow, ProcessingState, UpdateFile, drive_of,
-    set_metadata, set_protected,
+    ByteCount, DeleteFile, DriveDelta, DriveFile, DriveFiles, DriveImage, DrivePage, DrivePages,
+    DriveRemove, DriveReset, DriveUpsert, DriveView, DriveWindow, EDIT_PAGE_ACTION, EditPage, File,
+    FileCause, FileRow, FileVisibility, IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE,
+    IMAGE_LANDED_VERB, ImageKey, ImageLanded, ImageRecord, Page, PageCause, PageKey, PageOrigin,
+    PageWindow, ProcessingState, RunnerPage, UpdateFile, drive_of, references_image, set_metadata,
+    set_protected,
 };
 pub use folders::{DeleteFolder, MoveFolder};
 pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
@@ -32,8 +34,8 @@ pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
 pub use register::register;
 pub use runner::{
-    ReportedPage, ReportedPageInput, RunnerContext, RunnerFiles, RunnerReport,
-    RunnerRequestImageUpload, RunnerWindow, report_done,
+    MAX_REPORT_PAGES, ReportedPage, ReportedPageInput, RunnerContext, RunnerReport,
+    RunnerRequestImageUpload, RunnerSource, RunnerSources, RunnerWindow, runner_context,
 };
 pub use upload::{CommitUpload, RequestUpload, UploadTicket};
 

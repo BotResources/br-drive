@@ -29,6 +29,9 @@ pub mod codes {
     pub const INVALID_PAGE_ORIGIN: Reason = Reason::new("INVALID_PAGE_ORIGIN");
     pub const PAGE_NOT_FOUND: Reason = Reason::new("PAGE_NOT_FOUND");
     pub const INDEXER_FIELDS_TOGETHER: Reason = Reason::new("INDEXER_FIELDS_TOGETHER");
+    pub const INVALID_INDEXER_VALUE: Reason = Reason::new("INVALID_INDEXER_VALUE");
+    pub const BATCH_TOO_LARGE: Reason = Reason::new("BATCH_TOO_LARGE");
+    pub const IMAGE_UPLOAD_PENDING: Reason = Reason::new("IMAGE_UPLOAD_PENDING");
     pub const KEY_REUSED: Reason = Reason::new("KEY_REUSED");
 }
 
@@ -45,6 +48,17 @@ impl MutationFault for DriveFault {
         match self {
             Self::Refused(reason) => Some(*reason),
             Self::Engine(_) => None,
+        }
+    }
+}
+
+impl DriveFault {
+    pub fn into_graphql(self) -> async_graphql::Error {
+        match self {
+            Self::Refused(reason) => {
+                service_engine::coded_error(reason.code(), "the drive refused the request")
+            }
+            Self::Engine(error) => async_graphql::Error::new(error.to_string()),
         }
     }
 }
