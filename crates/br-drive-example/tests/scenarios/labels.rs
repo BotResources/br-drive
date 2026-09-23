@@ -62,10 +62,29 @@ async fn labels_are_a_host_catalogue_managed_by_its_managers_and_read_live_by_ev
     assert_eq!(created["view"]["description"], "");
     let urgent = id_of(&created["view"]);
 
+    let accented = "é".repeat(100);
+    ok(&create_label(&world, &manager, &accented, "#0000ff").await);
+    assert!(
+        world
+            .labels(&reader)
+            .await
+            .iter()
+            .any(|label| label["name"] == accented),
+        "a 100-character name is accepted whatever its byte length"
+    );
+    let long_description = world
+        .gql(
+            &manager,
+            "mutation($id:UUID!,$d:String){workspaceCreateLabel(id:$id,name:\"Wordy\",color:\"#000000\",description:$d){success}}",
+            serde_json::json!({ "id": Uuid::now_v7(), "d": "é".repeat(600) }),
+        )
+        .await;
+    assert_eq!(error_code(&long_description), "INVALID_LABEL");
     for (name, color, code) in [
         ("urgent", "#00ff00", "LABEL_NAME_TAKEN"),
         ("", "#00ff00", "INVALID_LABEL"),
         (&"x".repeat(101), "#00ff00", "INVALID_LABEL"),
+        (&"é".repeat(101), "#00ff00", "INVALID_LABEL"),
         ("Blue", "blue", "INVALID_LABEL"),
         ("Blue", "#00f", "INVALID_LABEL"),
     ] {
@@ -76,14 +95,18 @@ async fn labels_are_a_host_catalogue_managed_by_its_managers_and_read_live_by_ev
     let listed = world.labels(&reader).await;
     assert_eq!(
         listed.len(),
-        2,
+        3,
         "any principal of the host reads the catalogue"
     );
     assert_eq!(
         listed[0]["name"], "Urgent",
         "listed in id order: the first created first"
     );
-    assert_eq!(world.labels(&runner).await.len(), 2);
+    assert!(
+        listed[0].get("createdBy").is_none(),
+        "the creator's id is not on the wire"
+    );
+    assert_eq!(world.labels(&runner).await.len(), 3);
 
     ok(&world
         .gql(
@@ -133,7 +156,92 @@ async fn labels_are_a_host_catalogue_managed_by_its_managers_and_read_live_by_ev
     })
     .await;
     assert_eq!(removed["key"], urgent.to_string());
-    assert_eq!(world.labels(&reader).await.len(), 1);
+    assert_eq!(world.labels(&reader).await.len(), 2);
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn two_concurrent_creates_of_one_label_name_answer_exactly_one_name_taken() {
+    let world = World::start("pod-labels-concurrent").await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+
+    let (left, right) = tokio::join!(
+        create_label(&world, &manager, "Same Name", "#111111"),
+        create_label(&world, &manager, "same name", "#222222"),
+    );
+    let mut codes: Vec<String> = [&left, &right]
+        .into_iter()
+        .map(|response| {
+            if response.get("errors").is_none() {
+                ok(response);
+                "OK".to_string()
+            } else {
+                error_code(response)
+            }
+        })
+        .collect();
+    codes.sort();
+    assert_eq!(
+        codes,
+        vec!["LABEL_NAME_TAKEN".to_string(), "OK".to_string()],
+        "the advisory lock serializes the two saves: {left} / {right}"
+    );
+    assert_eq!(world.labels(&manager).await.len(), 1);
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn deleting_a_label_on_more_files_than_the_threshold_resets_the_file_sessions() {
+    let world = World::start("pod-labels-bulk-delete").await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let owner = passport(Uuid::now_v7());
+    ok(&create_label(&world, &manager, "Everywhere", "#ff00ff").await);
+    let everywhere = id_of(&world.labels(&owner).await[0]);
+    let drive = world.create_workspace(&owner, "library").await;
+    let mut files = Vec::new();
+    for index in 0..4 {
+        let name = format!("file-{index}.txt");
+        let file_id = upload(
+            &world,
+            &owner,
+            &UploadRequest::text(drive, "", &name, BYTES),
+        )
+        .await;
+        ok(&set_labels(&world, &owner, file_id, &[everywhere]).await);
+        files.push(file_id);
+    }
+    for file_id in &files {
+        world.await_source_promoted(*file_id).await;
+    }
+    let mut session = drive_subscription(&world, &owner, drive).await;
+
+    ok(&world
+        .gql(
+            &manager,
+            "mutation($id:UUID!){workspaceDeleteLabel(id:$id){success}}",
+            serde_json::json!({ "id": everywhere }),
+        )
+        .await);
+    let reset = next_drive_delta(&mut session, |node| {
+        node["__typename"] == "DriveReset" && node["views"].as_array().unwrap().len() == 4
+    })
+    .await;
+    assert!(
+        reset["views"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|view| view["labelIds"] == serde_json::json!([])),
+        "past the threshold the session is reset from the committed state: {reset}"
+    );
+    for file_id in &files {
+        assert_eq!(
+            world.file(&owner, *file_id).await["labelIds"],
+            serde_json::json!([])
+        );
+    }
 
     world.cleanup().await;
 }

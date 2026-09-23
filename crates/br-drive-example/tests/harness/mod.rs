@@ -278,7 +278,7 @@ impl World {
         let response = self
             .gql(
                 passport,
-                "query{workspaceLabels{id name color description createdBy}}",
+                "query{workspaceLabels{id name color description createdAt}}",
                 serde_json::json!({}),
             )
             .await;
@@ -496,7 +496,7 @@ pub fn error_code(response: &serde_json::Value) -> String {
 
 pub const DRIVE_DELTAS: &str = "subscription($d:UUID!){workspaceDriveChanged(driveId:$d){\
     __typename \
-    ... on DriveReset{revision views{... on DriveFile{id path name processingState}}} \
+    ... on DriveReset{revision views{... on DriveFile{id path name processingState labelIds}}} \
     ... on DriveUpsert{revision cause view{... on DriveFile{id path name processingState processingError affordances summary pageCount estimatedTokens images{name page} labelIds rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
     ... on DriveRemove{revision projector key cause}}}";
 
