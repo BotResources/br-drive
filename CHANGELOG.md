@@ -179,9 +179,11 @@ The first release: milestones 1 to 5 on engine `v0.3.0`.
   `<p>CreateLabel` / `<p>UpdateLabel` / `<p>DeleteLabel` (gate `ManageLabels`)
   and `<p>SetFileLabels(fileId, labelIds)` (gate `SetFileLabels { file }`,
   target set, idempotent); `DriveFile.labelIds` computed by label name and the
-  `setLabels` affordance; deleting a label detaches its files
-  (`LabelsChanged { detached }`); labels travel with a file across the host's
-  drives; `<p>LabelsChanged` and `<p>RulesetsChanged` subscriptions (the
+  `setLabels` affordance; `DeleteLabel` on the bulk pipeline detaches its
+  files (`LabelsChanged { detached }` per file, a projector reset past the
+  threshold); the name check is serialized like the rulesets'; labels travel
+  with a file across the host's drives; `<p>LabelsChanged` and
+  `<p>RulesetsChanged` subscriptions (the
   union is `DriveView = DriveFile | DrivePage | DriveLabel | DriveRuleset`,
   a rule save carries `Saved { unknown_runner_types }` as its cause). The
   engine's `Erasable` for the library's rows, driven by the engine's erase
