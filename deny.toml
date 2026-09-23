@@ -35,4 +35,5 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/BotResources/br-service-engine",
     "https://github.com/BotResources/br-rust-common",
+    "https://github.com/BotResources/svc-jobs",
 ]

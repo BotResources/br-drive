@@ -1,11 +1,12 @@
 use std::time::Duration;
 
-use br_drive::{DriveHost, DrivePath, DriveRequest, FileRow};
+use br_drive::{DriveHost, DrivePath, DriveRequest};
 use futures_util::future::BoxFuture;
 use service_engine::error::EngineError;
 use service_engine::gate::{Gate, Reason};
 use service_engine::impact::Deps;
 use service_engine::pipeline::Ops;
+use service_engine::principal::Principal;
 use uuid::Uuid;
 
 use crate::kernel::facts::HostSettings;
@@ -17,7 +18,9 @@ pub const FORBIDDEN_FOLDER: Reason = Reason::new("FORBIDDEN_FOLDER");
 
 pub const UNRENDERABLE: &str = "application/x-unrenderable";
 pub const FORBIDDEN_PREFIX: &str = "forbidden";
-pub const ACTIVE_JOB_KEY: &str = "job_id";
+pub const MANAGE_SCOPE: &str = "workspace:manage";
+pub const NOT_A_MANAGER: Reason = Reason::new("NOT_A_WORKSPACE_MANAGER");
+pub const DISPLAY_NAME_CLAIM: &str = "name";
 
 impl DriveHost for AppPrincipal {
     const SERVICE: &'static str = crate::SERVICE;
@@ -40,6 +43,23 @@ impl DriveHost for AppPrincipal {
         {
             return Gate::blocked(UNRENDERABLE_MEDIA_TYPE);
         }
+        match request {
+            DriveRequest::ManageRulesets => {
+                return if self.holds_scope(MANAGE_SCOPE) {
+                    Gate::allowed()
+                } else {
+                    Gate::blocked(NOT_A_MANAGER)
+                };
+            }
+            DriveRequest::ReadRulesets => {
+                return if self.is_service() {
+                    Gate::blocked(NOT_A_MANAGER)
+                } else {
+                    Gate::allowed()
+                };
+            }
+            _ => {}
+        }
         let owned = request
             .drive()
             .is_some_and(|drive| self.owns_workspace(drive));
@@ -58,11 +78,8 @@ impl DriveHost for AppPrincipal {
         self.owned_workspaces()
     }
 
-    fn active_job(file: &FileRow<Self>) -> Option<Uuid> {
-        file.metadata
-            .get(ACTIVE_JOB_KEY)
-            .and_then(serde_json::Value::as_str)
-            .and_then(|raw| Uuid::parse_str(raw).ok())
+    fn display_name(&self) -> Option<String> {
+        self.passport().claim::<String>(DISPLAY_NAME_CLAIM)
     }
 
     fn upload_window(&self) -> Duration {

@@ -1,4 +1,5 @@
 mod blob;
+mod catalogue;
 mod drive;
 mod fault;
 mod file;
@@ -7,7 +8,9 @@ mod host;
 mod image;
 mod media;
 mod path;
+mod processing;
 mod register;
+mod ruleset;
 mod runner;
 mod slice;
 mod upload;
@@ -17,22 +20,33 @@ use std::ops::RangeInclusive;
 use service_engine::LibraryMigrations;
 
 pub use blob::{DriveImage as DriveImageBlob, DriveSource};
+pub use catalogue::{CatalogueWatch, watch_runner_types};
 pub use drive::{DriveDeleted, create_drive, delete_drive};
 pub use fault::{DriveFault, DriveReactionFault, codes};
 pub use file::{
     ByteCount, DeleteFile, DriveDelta, DriveFile, DriveFiles, DriveImage, DrivePage, DrivePages,
-    DriveRemove, DriveReset, DriveUpsert, DriveView, DriveWindow, EDIT_PAGE_ACTION, EditPage, File,
-    FileCause, FileRow, FileVisibility, IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE,
-    IMAGE_LANDED_VERB, ImageKey, ImageLanded, ImageRecord, Page, PageCause, PageKey, PageOrigin,
-    PageWindow, ProcessingState, RunnerPage, UpdateFile, drive_of, references_image, set_metadata,
-    set_protected,
+    DriveProgress, DriveRemove, DriveReset, DriveUpsert, DriveView, DriveWindow, EDIT_PAGE_ACTION,
+    EditPage, File, FileCause, FileRow, FileVisibility, IMAGE_LANDED_AGGREGATE,
+    IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded, ImageRecord, Page, PageCause,
+    PageKey, PageOrigin, PageWindow, Process, ProcessingState, REGENERATE_PAGE_ACTION,
+    RegeneratePage, RunnerPage, UnknownDbValue, UpdateFile, drive_of, references_image,
+    set_metadata, set_protected,
 };
 pub use folders::{DeleteFolder, MoveFolder};
 pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
 pub use image::{ImageName, InvalidImageName, MAX_IMAGE_NAME_BYTES};
 pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
+pub use processing::{
+    CANCELLED, CATALOGUE_NOT_WATCHED, ChainPlan, Initiator, RUNNER_TYPE_UNAVAILABLE, RootNames,
+    durable,
+};
 pub use register::register;
+pub use ruleset::{
+    ANY_MEDIA_TYPE, CreateRuleset, DeleteRuleset, DriveRuleset, DriveRulesets, DriveStep,
+    MAX_RULESET_NAME_BYTES, MAX_RULESET_STEPS, MAX_RUNNER_TYPE_BYTES, RulesetRow, RulesetSaved,
+    RulesetStep, RulesetStepInput, Trigger, UpdateRuleset,
+};
 pub use runner::{
     MAX_REPORT_PAGES, ReportedPage, ReportedPageInput, RunnerContext, RunnerReport,
     RunnerRequestImageUpload, RunnerSource, RunnerSources, RunnerWindow, runner_context,

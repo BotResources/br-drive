@@ -21,7 +21,7 @@ use crate::media::MediaType;
 
 pub const IMAGE_LANDED_AGGREGATE: &str = "drive_image";
 pub const IMAGE_LANDED_VERB: &str = "landed";
-pub const IMAGE_LANDED_DURABLE: &str = "drive-image-landed";
+pub const IMAGE_LANDED_DURABLE: &str = "image-landed";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -1,3 +1,5 @@
+pub mod archive;
+pub mod jobs;
 pub mod minio;
 pub mod nats;
 pub mod pg;
@@ -15,6 +17,8 @@ use service_engine::config::EngineConfig;
 use service_engine::name::{ChannelName, PodId};
 use uuid::Uuid;
 
+pub use archive::ArchiveHost;
+pub use jobs::JobsStandIn;
 pub use minio::TestMinio;
 pub use nats::TestNats;
 pub use pg::TestDb;
@@ -126,8 +130,10 @@ impl World {
             .gql(
                 passport,
                 "query($id:UUID!){workspaceFile(fileId:$id){id driveId path name protected \
-                 mediaType sizeBytes sha256 processingState summary pageCount estimatedTokens \
-                 images{name mediaType sizeBytes page} affordances updatedAt}}",
+                 mediaType sizeBytes sha256 processingState processingError summary pageCount \
+                 estimatedTokens images{name mediaType sizeBytes page} rulesetId \
+                 steps{runnerType options} progress{stepIndex stepCount runnerType plan \
+                 currentIndex currentLabel at} affordances updatedAt}}",
                 serde_json::json!({ "id": file_id }),
             )
             .await;
@@ -203,6 +209,83 @@ impl World {
             .fetch_optional(&self.db.app)
             .await
             .expect("read the blob row")
+    }
+
+    pub async fn job_of(&self, file_id: Uuid) -> Option<Uuid> {
+        sqlx::query_scalar("SELECT job_id FROM drive.file WHERE id = $1")
+            .bind(file_id)
+            .fetch_one(&self.db.app)
+            .await
+            .expect("the file row carries its job")
+    }
+
+    pub async fn await_job(&self, file_id: Uuid) -> Uuid {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(job) = self.job_of(file_id).await {
+                return job;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no job was minted for {file_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+
+    pub async fn await_state(
+        &self,
+        passport: &str,
+        file_id: Uuid,
+        state: &str,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let file = self.file(passport, file_id).await;
+            if file["processingState"] == state {
+                return file;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{file_id} never reached {state}: {file}"
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+
+    pub async fn await_known_runner_type(&self, runner_type: &str, lifecycle: Option<&str>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let found: Option<String> = sqlx::query_scalar(
+                "SELECT lifecycle FROM drive.known_runner_type WHERE runner_type = $1",
+            )
+            .bind(runner_type)
+            .fetch_optional(&self.db.app)
+            .await
+            .expect("read the catalogue mirror");
+            if found.as_deref() == lifecycle {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the catalogue mirror never showed {runner_type} as {lifecycle:?} (found {found:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+
+    pub async fn rulesets(&self, passport: &str) -> Vec<serde_json::Value> {
+        let response = self
+            .gql(
+                passport,
+                "query{workspaceRulesets{id name trigger mediaTypes steps{runnerType options} isDefault}}",
+                serde_json::json!({}),
+            )
+            .await;
+        ok(&response)["workspaceRulesets"]
+            .as_array()
+            .expect("a list of rulesets")
+            .clone()
     }
 
     pub async fn await_source_promoted(&self, file_id: Uuid) {
@@ -339,6 +422,24 @@ pub fn passport(user: Uuid) -> String {
     .to_header()
 }
 
+pub fn manager_passport(user: Uuid, display_name: &str) -> String {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "scopes".to_string(),
+        serde_json::json!(["workspace:manage"]),
+    );
+    map.insert("name".to_string(), serde_json::json!(display_name));
+    Passport::human(
+        user,
+        false,
+        true,
+        AuthMethod::Jwt,
+        None,
+        PassportClaims::from_map(map),
+    )
+    .to_header()
+}
+
 #[macro_export]
 macro_rules! poll_until {
     ($within:expr, $probe:block) => {{
@@ -375,7 +476,7 @@ pub fn error_code(response: &serde_json::Value) -> String {
 pub const DRIVE_DELTAS: &str = "subscription($d:UUID!){workspaceDriveChanged(driveId:$d){\
     __typename \
     ... on DriveReset{revision views{... on DriveFile{id path name processingState}}} \
-    ... on DriveUpsert{revision cause view{... on DriveFile{id path name processingState affordances summary pageCount estimatedTokens images{name page}}}} \
+    ... on DriveUpsert{revision cause view{... on DriveFile{id path name processingState processingError affordances summary pageCount estimatedTokens images{name page} rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
     ... on DriveRemove{revision projector key cause}}}";
 
 pub const PAGE_DELTAS: &str = "subscription($f:UUID!){workspaceFilePages(fileId:$f){\

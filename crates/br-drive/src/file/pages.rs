@@ -24,6 +24,7 @@ use super::store::{FileStore, config_error, file_columns_as, row_to_file_prefixe
 use crate::host::{DRIVE_DIM, DriveHost};
 
 pub const EDIT_PAGE_ACTION: ActionName = ActionName::from_static("editPage");
+pub const REGENERATE_PAGE_ACTION: ActionName = ActionName::from_static("regeneratePage");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -266,10 +267,13 @@ impl<H: DriveHost> Projector for DrivePages<H> {
             origin: page.origin,
             updated_by: page.updated_by,
             updated_at: page.updated_at,
-            affordances: Affordances::from_pairs([(
-                EDIT_PAGE_ACTION,
-                page.file.edit_page_gate(principal),
-            )]),
+            affordances: Affordances::from_pairs([
+                (EDIT_PAGE_ACTION, page.file.edit_page_gate(principal)),
+                (
+                    REGENERATE_PAGE_ACTION,
+                    page.file.regenerate_page_gate(principal, page.key.number),
+                ),
+            ]),
         })
     }
 

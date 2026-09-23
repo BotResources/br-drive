@@ -11,10 +11,13 @@ repository.workspace = true
 async-graphql = { workspace = true }
 br-core-integration = { workspace = true }
 chrono = { workspace = true }
+contract-jobs = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 service-engine = { workspace = true }
 sqlx = { workspace = true, features = ["chrono", "json", "macros", "migrate", "uuid"] }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }

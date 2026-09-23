@@ -19,10 +19,12 @@ use crate::file::{File, FileCause, FileRow, ProcessingState};
 use crate::host::{DriveHost, DriveRequest};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
+use crate::processing;
+use crate::ruleset::{Trigger, select_ruleset};
 
 pub const UPLOAD_DEADLINE_AGGREGATE: &str = "drive_file";
 pub const UPLOAD_DEADLINE_VERB: &str = "upload-deadline";
-pub const UPLOAD_DEADLINE_DURABLE: &str = "drive-upload-deadline";
+pub const UPLOAD_DEADLINE_DURABLE: &str = "upload-deadline";
 
 #[derive(Debug, Deserialize)]
 pub struct RequestUpload {
@@ -111,6 +113,19 @@ pub fn request_upload<'m, H: DriveHost>(
             summary: None,
             page_count: None,
             estimated_tokens: None,
+            ruleset_id: None,
+            steps: None,
+            step_index: None,
+            step_count: None,
+            step_runner_type: None,
+            job_id: None,
+            plan: None,
+            progress_index: None,
+            progress_label: None,
+            progress_at: None,
+            triggered_by: None,
+            done_at: None,
+            completed_at: None,
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,
@@ -132,6 +147,7 @@ pub fn request_upload<'m, H: DriveHost>(
 #[derive(Debug, Deserialize)]
 pub struct CommitUpload {
     pub file_id: Uuid,
+    pub ruleset_id: Option<Uuid>,
 }
 
 impl MutationInput for CommitUpload {
@@ -163,8 +179,22 @@ pub fn commit_upload<'m, H: DriveHost>(
         }
         file.processing_state = ProcessingState::Ready;
         file.updated_at = cx.now().as_datetime();
-        cx.save(&file).await?;
+        let ruleset = select_ruleset(
+            cx.connection(),
+            Trigger::Upload,
+            &file.media_type,
+            input.ruleset_id,
+        )
+        .await?;
         cx.impact_caused::<File, _>(&file.id, FileCause::UploadCommitted)?;
+        match ruleset {
+            Some(ruleset) => {
+                let initiator = processing::Initiator::of(cx.principal());
+                let plan = processing::ChainPlan::from_ruleset(&ruleset, None);
+                processing::start_chain(cx, &mut file, plan, initiator).await?;
+            }
+            None => cx.save(&file).await?,
+        }
         Ok(())
     })
 }

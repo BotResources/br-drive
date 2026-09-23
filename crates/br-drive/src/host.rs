@@ -48,6 +48,12 @@ pub enum DriveRequest<'a, H> {
     EditPage {
         file: &'a FileRow<H>,
     },
+    RegeneratePage {
+        file: &'a FileRow<H>,
+        number: i32,
+    },
+    ManageRulesets,
+    ReadRulesets,
     ManageLabels,
     SetFileLabels {
         file: &'a FileRow<H>,
@@ -65,8 +71,9 @@ impl<H> DriveRequest<'_, H> {
             | Self::DeleteFile { file }
             | Self::Process { file }
             | Self::EditPage { file }
+            | Self::RegeneratePage { file, .. }
             | Self::SetFileLabels { file } => Some(file.drive_id),
-            Self::ManageLabels => None,
+            Self::ManageRulesets | Self::ReadRulesets | Self::ManageLabels => None,
         }
     }
 }
@@ -100,7 +107,9 @@ pub trait DriveHost: Principal {
                 .is_some_and(|scopes| scopes.iter().any(|scope| scope == Self::RUNNER_SCOPE))
     }
 
-    fn active_job(file: &FileRow<Self>) -> Option<Uuid>;
+    fn display_name(&self) -> Option<String> {
+        None
+    }
 
     fn upload_window(&self) -> Duration {
         Duration::from_secs(15 * 60)

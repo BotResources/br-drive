@@ -5,16 +5,99 @@ use super::{World, ok};
 
 pub const RUNNER_SCOPE: &str = "workspace:runner";
 
-pub async fn assign_job(world: &World, owner: &str, file_id: Uuid) -> Uuid {
-    let job_id = Uuid::now_v7();
-    ok(&world
+pub const RENDER: &str = "render";
+pub const INDEX: &str = "index";
+
+pub struct RuleSpec<'a> {
+    pub name: &'a str,
+    pub trigger: &'a str,
+    pub media_types: &'a [&'a str],
+    pub steps: &'a [(&'a str, serde_json::Value)],
+    pub is_default: bool,
+}
+
+pub async fn create_ruleset(world: &World, manager: &str, spec: RuleSpec<'_>) -> serde_json::Value {
+    let steps: Vec<serde_json::Value> = spec
+        .steps
+        .iter()
+        .map(|(runner_type, options)| {
+            serde_json::json!({ "runnerType": runner_type, "options": options })
+        })
+        .collect();
+    world
         .gql(
-            owner,
-            "mutation($f:UUID!,$m:JSON!){workspaceAnnotateFile(fileId:$f,metadata:$m){success}}",
-            serde_json::json!({ "f": file_id, "m": { "job_id": job_id } }),
+            manager,
+            "mutation($id:UUID!,$n:String!,$t:Trigger!,$m:[String!]!,$s:[RulesetStepInput!]!,$d:Boolean!){\
+             workspaceCreateRuleset(id:$id,name:$n,trigger:$t,mediaTypes:$m,steps:$s,isDefault:$d){id unknownRunnerTypes}}",
+            serde_json::json!({
+                "id": Uuid::now_v7(),
+                "n": spec.name,
+                "t": spec.trigger,
+                "m": spec.media_types,
+                "s": steps,
+                "d": spec.is_default,
+            }),
         )
-        .await);
-    job_id
+        .await
+}
+
+pub fn ruleset_id(response: &serde_json::Value) -> Uuid {
+    Uuid::parse_str(
+        ok(response)["workspaceCreateRuleset"]["id"]
+            .as_str()
+            .expect("the ruleset id"),
+    )
+    .expect("a uuid")
+}
+
+/// Declares the two stand-in runner types ACTIVE and one default upload rule
+/// `text/plain → [render]`, so an uploaded text file gets one job.
+pub async fn install_render_rule(world: &World, jobs: &super::JobsStandIn, manager: &str) -> Uuid {
+    jobs.declare_runner_type(RENDER, contract_jobs::catalog::RunnerTypeLifecycle::Active)
+        .await;
+    jobs.declare_runner_type(INDEX, contract_jobs::catalog::RunnerTypeLifecycle::Active)
+        .await;
+    world.await_known_runner_type(RENDER, Some("active")).await;
+    world.await_known_runner_type(INDEX, Some("active")).await;
+    ruleset_id(
+        &create_ruleset(
+            world,
+            manager,
+            RuleSpec {
+                name: "render text",
+                trigger: "UPLOAD",
+                media_types: &["text/plain"],
+                steps: &[(RENDER, serde_json::json!({}))],
+                is_default: true,
+            },
+        )
+        .await,
+    )
+}
+
+pub async fn install_regenerate_rule(world: &World, manager: &str) -> Uuid {
+    ruleset_id(
+        &create_ruleset(
+            world,
+            manager,
+            RuleSpec {
+                name: "regenerate text page",
+                trigger: "REGENERATE_PAGE",
+                media_types: &["text/plain"],
+                steps: &[(RENDER, serde_json::json!({}))],
+                is_default: true,
+            },
+        )
+        .await,
+    )
+}
+
+/// Drives one job to completion the way the runner and jobs would: the runner
+/// reports `done`, the host finishes the job, jobs confirms it completed.
+pub async fn finish_job(world: &World, jobs: &super::JobsStandIn, job_id: Uuid) {
+    jobs.await_finish(job_id).await;
+    jobs.complete(job_id).await;
+    let _ = world;
 }
 
 pub async fn context(

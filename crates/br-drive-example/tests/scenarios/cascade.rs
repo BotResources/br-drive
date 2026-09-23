@@ -1,9 +1,10 @@
 use uuid::Uuid;
 
-use crate::harness::runner::{RUNNER_SCOPE, Report, assign_job, report, upload_image};
+use crate::harness::runner::{RUNNER_SCOPE, Report, install_render_rule, report, upload_image};
 use crate::harness::upload::{UploadRequest, upload};
 use crate::harness::{
-    World, drive_subscription, error_code, next_drive_delta, ok, passport, service_passport,
+    JobsStandIn, World, drive_subscription, error_code, manager_passport, next_drive_delta, ok,
+    passport, service_passport,
 };
 
 const BYTES: &[u8] = b"cascade bytes";
@@ -57,6 +58,8 @@ async fn deleting_one_file_releases_its_image_blobs_with_its_source_and_closes_i
     let world = World::start("pod-cascade-file-images").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
+    let jobs = JobsStandIn::attach(&world).await;
+    install_render_rule(&world, &jobs, &manager_passport(Uuid::now_v7(), "Ada")).await;
     let drive = world.create_workspace(&owner, "library").await;
     let file_id = upload(
         &world,
@@ -64,7 +67,7 @@ async fn deleting_one_file_releases_its_image_blobs_with_its_source_and_closes_i
         &UploadRequest::text(drive, "", "illustrated.txt", BYTES),
     )
     .await;
-    let job_id = assign_job(&world, &owner, file_id).await;
+    let job_id = world.await_job(file_id).await;
     upload_image(&world, &runner, file_id, job_id, "p001-img01.png", b"one").await;
     upload_image(&world, &runner, file_id, job_id, "p002-img01.png", b"two").await;
     ok(&report(
@@ -102,6 +105,8 @@ async fn deleting_one_file_releases_its_image_blobs_with_its_source_and_closes_i
             "the per-row delete releases every image blob in its transaction"
         );
     }
+    jobs.await_cancel(job_id).await;
+    jobs.cancel(job_id).await;
     assert_eq!(world.blob_state(source).await.as_deref(), Some("orphaned"));
     crate::harness::next_page_delta(&mut pages, |node| {
         node["__typename"] == "DriveRemove" && node["key"]["number"] == 1

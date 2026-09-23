@@ -113,6 +113,60 @@ single git tag `v{version}` releases the set. Format follows
   row, a page window that follows one file and closes on a visibility loss,
   page regeneration replacing images by name, per-row and per-folder deletes
   releasing image blobs.
+- Processing rules and the chain over Jobs (milestone 4). `drive.ruleset`
+  (`id`, `name` unique case-insensitive, `trigger` `upload | reprocess |
+  regenerate_page`, `media_types text[]` of `type/subtype`, `type/*` or `*`,
+  `steps jsonb` of `{ runnerType, options }`, `is_default`), the roots
+  `<p>Rulesets` / `<p>CreateRuleset` / `<p>UpdateRuleset` / `<p>DeleteRuleset`
+  gated by the host's `ManageRulesets` / `ReadRulesets`, one default per
+  (trigger, pattern) enforced at save (`DEFAULT_ALREADY_SET`), the unknown
+  runner types of a saved rule answered as a warning, precedence exact >
+  `type/*` > `*`. `drive.file` gains `ruleset_id`, the `steps` snapshot,
+  `step_index` / `step_count` / `step_runner_type`, `job_id` (unique while
+  set), `plan`, `progress_index` / `progress_label` / `progress_at` and the
+  trigger's principal; `DriveFile` carries `rulesetId`, `steps` and
+  `progress { stepIndex, stepCount, runnerType, plan, currentIndex,
+  currentLabel, at }`. `CommitUpload(fileId, rulesetId?)` starts the `upload`
+  chain or lands `READY` when no rule matches; `<p>Process(fileId,
+  rulesetId?)` (wipes pages, images and the indexer triple at chain start) and
+  `<p>RegeneratePage(fileId, number, comment?, rulesetId?)` (page and comment
+  merged into the first step's options). The chain checks the runner type in
+  `drive.known_runner_type` (`runner_type_unavailable` before any job),
+  stages `integration.cmd.jobs.job.create.v1` with the documented config
+  (`host`, `file_id`, `job_id`, the three root names, `step`, `options`;
+  `source_bc` / `source_entity_id` = the file, `triggered_by` from
+  `DriveHost::display_name`), consumes the eight `integration.evt.jobs.job.*.v1`
+  facts filtered on the File's `job_id` (unknown job → acknowledged no-op;
+  `completed` → next step or `READY`; `creation_rejected` / `failed` →
+  `FAILED` with the reason code; foreign `cancelled` → `FAILED cancelled`),
+  stages `job.finish.v2` on the report's `done` and `job.cancel.v2` when a
+  `PROCESSING` file is deleted (per row, per folder, with its drive).
+  `br_drive::watch_runner_types` mirrors the Jobs catalogue (boot scan + KV
+  watch, tolerant). The `active_job` host seam and the example's metadata stub
+  are gone; `DriveHost::display_name` is new; `EditPage` / `RegeneratePage`
+  during a chain are `FILE_PROCESSING`; a report on a file without a running
+  job is `JOB_NOT_ACTIVE`; the runner source population is restricted to the
+  files with a live job. Pinned `contract-jobs` 0.5.0. Ten more e2e scenarios
+  with a Jobs stand-in publishing the real DTOs on the real subjects: rules
+  empty → `READY` and no job; ruleset CRUD, gates, validation, name and
+  default uniqueness, save-time warning; the full chain (queued → plan → step
+  → report → finish → next step → `READY`) with every `job.create` field
+  asserted; variant by id, catch-all, mismatch; unknown / deprecated runner
+  type; failure and rejection with reason codes, reprocess wiping the
+  rendition; foreign cancel vs own cancel; a rule edited or deleted mid-chain,
+  non-retroactivity; every fact replayed idempotent; the processing guards.
+  The workspace MSRV follows `contract-jobs` 0.5.0: Rust 1.94. Review round:
+  every durable the library binds is namespaced by `DriveHost::SERVICE`
+  (`{service}-drive-…`, proven by a two-host scenario on one broker); the
+  config root names follow the engine's camel-casing of the prefix; `Process`
+  falls back to the file's own `steps` snapshot when no `reprocess` rule
+  matches; the catalogue watch records its boot scan and a host that never
+  started it is refused `CATALOGUE_NOT_WATCHED` on rule saves and fails chains
+  `catalogue_not_watched`; a catalogue entry of another wire version is
+  treated as unknown; the report's `done_at` gates the chain's advance and a
+  `completed` fact that arrives first waits for the report; a step cursor
+  moves forward by index or by a newer start instant; a malformed snapshot
+  is read as absent rather than breaking the file's view.
 - Reason codes: `DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`,
   `FILE_PROTECTED`, `FILE_NOT_PENDING`, `FILE_NOT_READY`, `FILE_TOO_LARGE`,
   `UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,
@@ -120,7 +174,10 @@ single git tag `v{version}` releases the set. Format follows
   `RUNNER_SCOPE_REQUIRED`, `JOB_NOT_ACTIVE`, `SOURCE_NOT_AVAILABLE`,
   `INVALID_IMAGE_NAME`, `INVALID_PAGE`, `INVALID_PAGE_ORIGIN`, `PAGE_NOT_FOUND`,
   `INDEXER_FIELDS_TOGETHER`, `INVALID_INDEXER_VALUE`, `BATCH_TOO_LARGE`,
-  `IMAGE_UPLOAD_PENDING`, plus
+  `IMAGE_UPLOAD_PENDING`, `RULESET_NOT_FOUND`, `RULESET_NAME_TAKEN`,
+  `INVALID_RULESET`, `DEFAULT_ALREADY_SET`, `RULESET_MISMATCH`,
+  `NO_RULESET_MATCHES`, `RUNNER_TYPE_UNAVAILABLE`, `FILE_PROCESSING`,
+  `CATALOGUE_NOT_WATCHED`, plus
   the engine's `KEY_REUSED` and the host's own codes through the gate and the
   hooks.
 - Example host: `workspaceCreate` / `workspaceDelete` wrap `create_drive` /
