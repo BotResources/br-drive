@@ -14,7 +14,7 @@ use crate::fault::codes;
 use crate::host::{DRIVE_DIM, DriveHost, DriveRequest};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
-use crate::processing::Trigger;
+use crate::processing::Initiator;
 use crate::ruleset::RulesetStep;
 
 pub struct File;
@@ -139,7 +139,9 @@ pub struct FileRow<H> {
     pub progress_index: Option<i32>,
     pub progress_label: Option<String>,
     pub progress_at: Option<DateTime<Utc>>,
-    pub triggered_by: Option<Trigger>,
+    pub triggered_by: Option<Initiator>,
+    pub done_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -175,6 +177,8 @@ impl<H> Clone for FileRow<H> {
             progress_label: self.progress_label.clone(),
             progress_at: self.progress_at,
             triggered_by: self.triggered_by.clone(),
+            done_at: self.done_at,
+            completed_at: self.completed_at,
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,

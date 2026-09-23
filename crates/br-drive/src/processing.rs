@@ -1,4 +1,6 @@
-use std::sync::OnceLock;
+use std::any::TypeId;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use br_core_integration::CommandCoords;
 use contract_jobs::command::{CancelJob, CreateJob, FinishJob, TriggeredBy};
@@ -10,6 +12,7 @@ use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use service_engine::BlobRef;
 use service_engine::error::EngineError;
+use service_engine::graphql::RootPrefix;
 use service_engine::inbound::{ReactionCoordinates, ReactionMessage};
 use service_engine::pipeline::{Ops, OutboundCommand, Reaction};
 use sqlx::PgConnection;
@@ -24,7 +27,15 @@ use crate::host::DriveHost;
 use crate::ruleset::{RulesetRow, RulesetStep};
 
 pub const RUNNER_TYPE_UNAVAILABLE: &str = "runner_type_unavailable";
+pub const CATALOGUE_NOT_WATCHED: &str = "catalogue_not_watched";
 pub const CANCELLED: &str = "cancelled";
+
+/// The name of one of the library's durables on the host's NATS consumers: every
+/// host service gets its own consumer on the shared integration streams, so two
+/// hosts on one cluster never split the facts between them.
+pub fn durable(service: &str, suffix: &str) -> String {
+    format!("{service}-drive-{suffix}")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootNames {
@@ -34,40 +45,51 @@ pub struct RootNames {
 }
 
 impl RootNames {
-    pub fn for_prefix(prefix: &str) -> Self {
-        Self {
-            context_root: format!("{prefix}RunnerContext"),
-            image_upload_root: format!("{prefix}RunnerRequestImageUpload"),
-            report_root: format!("{prefix}RunnerReport"),
-        }
+    pub fn for_prefix(prefix: &'static str) -> Result<Self, EngineError> {
+        let prefix = RootPrefix::from_snake(prefix)?;
+        let camel = prefix.as_str();
+        Ok(Self {
+            context_root: format!("{camel}RunnerContext"),
+            image_upload_root: format!("{camel}RunnerRequestImageUpload"),
+            report_root: format!("{camel}RunnerReport"),
+        })
     }
 }
 
-static ROOTS: OnceLock<RootNames> = OnceLock::new();
+static ROOTS: Mutex<Option<HashMap<TypeId, RootNames>>> = Mutex::new(None);
 
-pub fn declare_roots(prefix: &str) -> Result<(), EngineError> {
-    let roots = RootNames::for_prefix(prefix);
-    match ROOTS.get() {
-        Some(declared) if *declared == roots => Ok(()),
-        Some(declared) => Err(EngineError::Config(format!(
-            "the drive slice is already registered under the root names {declared:?}; a process \
-             hosts one drive slice"
+pub fn declare_roots<H: DriveHost>(prefix: &'static str) -> Result<(), EngineError> {
+    let roots = RootNames::for_prefix(prefix)?;
+    let mut declared = ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let declared = declared.get_or_insert_with(HashMap::new);
+    match declared.get(&TypeId::of::<H>()) {
+        Some(existing) if *existing == roots => Ok(()),
+        Some(existing) => Err(EngineError::Config(format!(
+            "the drive slice is already registered for this principal under the root names \
+             {existing:?}; one drive slice per host principal"
         ))),
         None => {
-            let _ = ROOTS.set(roots);
+            declared.insert(TypeId::of::<H>(), roots);
             Ok(())
         }
     }
 }
 
-fn roots() -> Result<&'static RootNames, EngineError> {
-    ROOTS.get().ok_or_else(|| {
-        EngineError::Config(
-            "the drive slice's root names are not declared; register the slice through \
-             `drive_slice!` before starting a processing chain"
-                .into(),
-        )
-    })
+fn roots<H: DriveHost>() -> Result<RootNames, EngineError> {
+    ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(|declared| declared.get(&TypeId::of::<H>()).cloned())
+        .ok_or_else(|| {
+            EngineError::Config(
+                "the drive slice's root names are not declared for this principal; register the \
+                 slice through `drive_slice!` before starting a processing chain"
+                    .into(),
+            )
+        })
 }
 
 macro_rules! outgoing {
@@ -106,13 +128,15 @@ outgoing!(
     contract_jobs::cmd_job_cancel_v2_coords
 );
 
+/// The principal whose gesture started a chain; every step of the chain names
+/// it as the job's `triggered_by`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Trigger {
+pub struct Initiator {
     pub id: Uuid,
     pub display_name: Option<String>,
 }
 
-impl Trigger {
+impl Initiator {
     pub fn of<H: DriveHost>(principal: &H) -> Self {
         Self {
             id: principal.id().as_uuid(),
@@ -144,15 +168,33 @@ fn merge_options(base: &serde_json::Value, extra: &serde_json::Value) -> serde_j
     serde_json::Value::Object(merged)
 }
 
-pub fn snapshot(
-    ruleset: &RulesetRow,
-    first_options: Option<&serde_json::Value>,
-) -> Vec<RulesetStep> {
-    let mut steps = ruleset.steps.clone();
-    if let (Some(first), Some(extra)) = (steps.first_mut(), first_options) {
-        first.options = merge_options(&first.options, extra);
+/// What a chain runs: the rule it came from (none when a file replays its own
+/// snapshot) and the steps, with the gesture's options merged into the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainPlan {
+    pub ruleset_id: Option<Uuid>,
+    pub steps: Vec<RulesetStep>,
+}
+
+impl ChainPlan {
+    pub fn from_ruleset(ruleset: &RulesetRow, first_options: Option<&serde_json::Value>) -> Self {
+        let mut steps = ruleset.steps.clone();
+        if let (Some(first), Some(extra)) = (steps.first_mut(), first_options) {
+            first.options = merge_options(&first.options, extra);
+        }
+        Self {
+            ruleset_id: Some(ruleset.id),
+            steps,
+        }
     }
-    steps
+
+    pub fn replay<H>(file: &FileRow<H>) -> Option<Self> {
+        let steps = file.steps.clone().filter(|steps| !steps.is_empty())?;
+        Some(Self {
+            ruleset_id: file.ruleset_id,
+            steps,
+        })
+    }
 }
 
 fn clear_run<H>(file: &mut FileRow<H>) {
@@ -164,6 +206,8 @@ fn clear_run<H>(file: &mut FileRow<H>) {
     file.progress_index = None;
     file.progress_label = None;
     file.progress_at = None;
+    file.done_at = None;
+    file.completed_at = None;
 }
 
 pub(crate) fn mark_failed<H>(file: &mut FileRow<H>, reason: &str) {
@@ -193,6 +237,9 @@ pub(crate) async fn wipe_rendition<H: DriveHost>(
     Ok(())
 }
 
+/// Launches step `index` of the file's snapshot: `Ok(true)` when a job was
+/// staged, `Ok(false)` when the chain ended instead (READY past the last step,
+/// FAILED when the step cannot run).
 async fn launch_step<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
@@ -204,12 +251,22 @@ async fn launch_step<H: DriveHost>(
         mark_ready(file);
         return Ok(false);
     };
+    if !catalogue::scanned(cx.connection()).await? {
+        tracing::error!(
+            file = %file.id,
+            runner_type = %step.runner_type,
+            "no runner-type catalogue watch has ever scanned on this host; start \
+             `br_drive::watch_runner_types` next to the engine"
+        );
+        mark_failed(file, CATALOGUE_NOT_WATCHED);
+        return Ok(false);
+    }
     if !catalogue::is_active(cx.connection(), &step.runner_type).await? {
         mark_failed(file, RUNNER_TYPE_UNAVAILABLE);
         return Ok(false);
     }
-    let roots = roots()?;
-    let trigger = file.triggered_by.clone().unwrap_or(Trigger {
+    let roots = roots::<H>()?;
+    let initiator = file.triggered_by.clone().unwrap_or(Initiator {
         id: file.created_by,
         display_name: None,
     });
@@ -224,16 +281,13 @@ async fn launch_step<H: DriveHost>(
         "step": index,
         "options": step.options,
     });
+    clear_run(file);
     file.processing_state = ProcessingState::Processing;
     file.processing_error = None;
     file.job_id = Some(job_id);
     file.step_index = Some(index as i32);
     file.step_count = Some(steps.len() as i32);
     file.step_runner_type = Some(step.runner_type.clone());
-    file.plan = None;
-    file.progress_index = None;
-    file.progress_label = None;
-    file.progress_at = None;
     cx.command(JobCreate {
         payload: CreateJob {
             job_id,
@@ -241,7 +295,7 @@ async fn launch_step<H: DriveHost>(
             producer: H::SERVICE.to_string(),
             config: Some(config),
             parent_job_id,
-            triggered_by: Some(trigger.triggered_by()),
+            triggered_by: Some(initiator.triggered_by()),
             source_bc: Some(H::SERVICE.to_string()),
             source_entity_id: Some(file.id),
             max_attempts: None,
@@ -250,36 +304,50 @@ async fn launch_step<H: DriveHost>(
     Ok(true)
 }
 
+fn outcome_cause<H>(file: &FileRow<H>, launched: bool, step: usize) -> FileCause {
+    match (launched, file.processing_state) {
+        (true, _) => FileCause::ProcessingStarted {
+            job_id: file.job_id.expect("a launched step carries its job"),
+            step: step as i32,
+        },
+        (false, ProcessingState::Ready) => FileCause::ProcessingFinished,
+        (false, _) => FileCause::ProcessingFailed {
+            reason: file
+                .processing_error
+                .clone()
+                .unwrap_or_else(|| RUNNER_TYPE_UNAVAILABLE.to_string()),
+        },
+    }
+}
+
 pub(crate) async fn start_chain<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
-    ruleset: &RulesetRow,
-    first_options: Option<&serde_json::Value>,
-    trigger: Trigger,
+    plan: ChainPlan,
+    initiator: Initiator,
 ) -> Result<(), DriveFault> {
-    let steps = snapshot(ruleset, first_options);
-    file.ruleset_id = Some(ruleset.id);
-    file.steps = Some(steps);
-    file.triggered_by = Some(trigger);
+    file.ruleset_id = plan.ruleset_id;
+    file.steps = Some(plan.steps);
+    file.triggered_by = Some(initiator);
     file.updated_at = cx.now().as_datetime();
     let launched = launch_step(cx, file, 0, None).await?;
     cx.save(file).await?;
-    if launched {
-        cx.impact_caused::<File, _>(
-            &file.id,
-            FileCause::ProcessingStarted {
-                job_id: file.job_id.expect("a launched step carries its job"),
-                step: 0,
-            },
-        )?;
-    } else {
-        cx.impact_caused::<File, _>(
-            &file.id,
-            FileCause::ProcessingFailed {
-                reason: RUNNER_TYPE_UNAVAILABLE.to_string(),
-            },
-        )?;
-    }
+    cx.impact_caused::<File, _>(&file.id, outcome_cause(file, launched, 0))?;
+    Ok(())
+}
+
+/// The step whose job `finished` is over and the runner reported `done`: the
+/// next step is launched, or the chain lands READY.
+pub(crate) async fn advance<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    file: &mut FileRow<H>,
+    finished: Uuid,
+) -> Result<(), DriveFault> {
+    let next = file.step_index.unwrap_or(0) as usize + 1;
+    let launched = launch_step(cx, file, next, Some(finished)).await?;
+    file.updated_at = cx.now().as_datetime();
+    cx.save(file).await?;
+    cx.impact_caused::<File, _>(&file.id, outcome_cause(file, launched, next))?;
     Ok(())
 }
 
@@ -390,14 +458,14 @@ job_fact!(
     contract_jobs::evt_job_cancelled_v1_coords
 );
 
-pub const DURABLE_QUEUED: &str = "drive-job-queued";
-pub const DURABLE_CREATION_REJECTED: &str = "drive-job-creation-rejected";
-pub const DURABLE_STARTED: &str = "drive-job-started";
-pub const DURABLE_PLAN_DECLARED: &str = "drive-job-plan-declared";
-pub const DURABLE_STEP_STARTED: &str = "drive-job-step-started";
-pub const DURABLE_COMPLETED: &str = "drive-job-completed";
-pub const DURABLE_FAILED: &str = "drive-job-failed";
-pub const DURABLE_CANCELLED: &str = "drive-job-cancelled";
+pub const DURABLE_QUEUED: &str = "job-queued";
+pub const DURABLE_CREATION_REJECTED: &str = "job-creation-rejected";
+pub const DURABLE_STARTED: &str = "job-started";
+pub const DURABLE_PLAN_DECLARED: &str = "job-plan-declared";
+pub const DURABLE_STEP_STARTED: &str = "job-step-started";
+pub const DURABLE_COMPLETED: &str = "job-completed";
+pub const DURABLE_FAILED: &str = "job-failed";
+pub const DURABLE_CANCELLED: &str = "job-cancelled";
 
 async fn fail_file<H: DriveHost>(
     cx: &mut Reaction<'_>,
@@ -416,25 +484,25 @@ async fn fail_file<H: DriveHost>(
     Ok(())
 }
 
-pub fn on_queued<'r, H: DriveHost>(
+pub fn on_queued<'r>(
     cx: &'r mut Reaction<'r>,
     fact: QueuedFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        if let Some(file) = active_file::<H>(cx, fact.0.job_id).await? {
-            tracing::debug!(file = %file.id, job = %fact.0.job_id, runner_type = %fact.0.runner_type, "job queued");
+        if let Some(file) = file_of_job(cx.connection(), fact.0.job_id).await? {
+            tracing::debug!(%file, job = %fact.0.job_id, runner_type = %fact.0.runner_type, "job queued");
         }
         Ok(())
     })
 }
 
-pub fn on_started<'r, H: DriveHost>(
+pub fn on_started<'r>(
     cx: &'r mut Reaction<'r>,
     fact: StartedFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        if let Some(file) = active_file::<H>(cx, fact.0.job_id).await? {
-            tracing::debug!(file = %file.id, job = %fact.0.job_id, run = %fact.0.run_id, "job started");
+        if let Some(file) = file_of_job(cx.connection(), fact.0.job_id).await? {
+            tracing::debug!(%file, job = %fact.0.job_id, run = %fact.0.run_id, "job started");
         }
         Ok(())
     })
@@ -480,7 +548,14 @@ pub fn on_step_started<'r, H: DriveHost>(
             return Ok(());
         };
         let index = i32::try_from(fact.0.index).unwrap_or(i32::MAX);
-        if file.progress_index.is_some_and(|current| current >= index) {
+        // A later index on the same run moves the cursor forward; a newer start
+        // instant (a retry attempt restarting the plan) moves it too. Anything
+        // else is a redelivery or a stale fact.
+        let forward = match (file.progress_index, file.progress_at) {
+            (Some(current), Some(at)) => index > current || fact.0.started_at > at,
+            _ => true,
+        };
+        if !forward {
             return Ok(());
         }
         file.progress_index = Some(index);
@@ -501,25 +576,17 @@ pub fn on_completed<'r, H: DriveHost>(
         let Some(mut file) = active_file::<H>(cx, fact.0.job_id).await? else {
             return Ok(());
         };
-        let finished = fact.0.job_id;
-        let next = file.step_index.unwrap_or(0) as usize + 1;
-        let launched = launch_step(cx, &mut file, next, Some(finished)).await?;
-        file.updated_at = cx.now().as_datetime();
-        cx.save(&file).await?;
-        let cause = match (launched, file.processing_state) {
-            (true, _) => FileCause::ProcessingStarted {
-                job_id: file.job_id.expect("a launched step carries its job"),
-                step: next as i32,
-            },
-            (false, ProcessingState::Ready) => FileCause::ProcessingFinished,
-            (false, _) => FileCause::ProcessingFailed {
-                reason: file
-                    .processing_error
-                    .clone()
-                    .unwrap_or_else(|| RUNNER_TYPE_UNAVAILABLE.to_string()),
-            },
-        };
-        cx.impact_caused::<File, _>(&file.id, cause)?;
+        if file.done_at.is_none() {
+            // Jobs says the job is over but the runner's final report has not
+            // landed: the fact is kept on the row and the report advances the
+            // chain when it comes.
+            if file.completed_at.is_none() {
+                file.completed_at = Some(cx.now().as_datetime());
+                cx.save(&file).await?;
+            }
+            return Ok(());
+        }
+        advance(cx, &mut file, fact.0.job_id).await?;
         Ok(())
     })
 }
@@ -558,42 +625,63 @@ pub fn on_cancelled<'r, H: DriveHost>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_first_steps_options_are_merged_with_the_gestures_own() {
-        let ruleset = RulesetRow {
+    fn ruleset(steps: Vec<RulesetStep>) -> RulesetRow {
+        RulesetRow {
             id: Uuid::now_v7(),
             name: "regen".into(),
             trigger: crate::ruleset::Trigger::RegeneratePage,
             media_types: vec!["*".into()],
-            steps: vec![
-                RulesetStep {
-                    runner_type: "render".into(),
-                    options: serde_json::json!({ "dpi": 300 }),
-                },
-                RulesetStep {
-                    runner_type: "index".into(),
-                    options: serde_json::json!({}),
-                },
-            ],
+            steps,
             is_default: true,
             created_by: Uuid::now_v7(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
-        };
-        let steps = snapshot(&ruleset, Some(&serde_json::json!({ "page": 3, "dpi": 72 })));
-        assert_eq!(
-            steps[0].options,
-            serde_json::json!({ "dpi": 72, "page": 3 }),
-            "the gesture's keys win over the rule's"
-        );
-        assert_eq!(steps[1].options, serde_json::json!({}));
+        }
     }
 
     #[test]
-    fn the_root_names_follow_the_host_prefix() {
-        let roots = RootNames::for_prefix("workspace");
+    fn the_first_steps_options_are_merged_with_the_gestures_own() {
+        let ruleset = ruleset(vec![
+            RulesetStep {
+                runner_type: "render".into(),
+                options: serde_json::json!({ "dpi": 300 }),
+            },
+            RulesetStep {
+                runner_type: "index".into(),
+                options: serde_json::json!({}),
+            },
+        ]);
+        let plan =
+            ChainPlan::from_ruleset(&ruleset, Some(&serde_json::json!({ "page": 3, "dpi": 72 })));
+        assert_eq!(plan.ruleset_id, Some(ruleset.id));
+        assert_eq!(
+            plan.steps[0].options,
+            serde_json::json!({ "dpi": 72, "page": 3 }),
+            "the gesture's keys win over the rule's"
+        );
+        assert_eq!(plan.steps[1].options, serde_json::json!({}));
+    }
+
+    #[test]
+    fn the_root_names_are_camel_cased_like_the_graphql_fields() {
+        let roots = RootNames::for_prefix("workspace").unwrap();
         assert_eq!(roots.context_root, "workspaceRunnerContext");
-        assert_eq!(roots.image_upload_root, "workspaceRunnerRequestImageUpload");
-        assert_eq!(roots.report_root, "workspaceRunnerReport");
+        let roots = RootNames::for_prefix("my_host").unwrap();
+        assert_eq!(roots.context_root, "myHostRunnerContext");
+        assert_eq!(roots.image_upload_root, "myHostRunnerRequestImageUpload");
+        assert_eq!(roots.report_root, "myHostRunnerReport");
+        assert!(RootNames::for_prefix("Bad_Prefix").is_err());
+    }
+
+    #[test]
+    fn a_durable_is_namespaced_by_the_host_service() {
+        assert_eq!(
+            durable("workspace", DURABLE_COMPLETED),
+            "workspace-drive-job-completed"
+        );
+        assert_ne!(
+            durable("workspace", DURABLE_COMPLETED),
+            durable("archive", DURABLE_COMPLETED)
+        );
     }
 }

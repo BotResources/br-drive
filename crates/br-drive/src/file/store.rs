@@ -16,17 +16,22 @@ use crate::path::{DrivePath, FileName};
 pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, protected, media_type, size_bytes, sha256, blob_ref, \
      processing_state, processing_error, metadata, summary, page_count, estimated_tokens, \
      ruleset_id, steps, step_index, step_count, step_runner_type, job_id, plan, \
-     progress_index, progress_label, progress_at, triggered_by, \
+     progress_index, progress_label, progress_at, triggered_by, done_at, completed_at, \
      created_by, created_at, updated_at";
 
+/// The library is the only writer of these columns; a value that does not
+/// decode is reported and read as absent rather than breaking the file's view.
 fn decode_json<T: serde::de::DeserializeOwned>(
     what: &'static str,
     value: Option<serde_json::Value>,
-) -> Result<Option<T>, EngineError> {
-    value
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|e| EngineError::Config(format!("{what} does not decode: {e}")))
+) -> Option<T> {
+    value.and_then(|value| match serde_json::from_value(value) {
+        Ok(decoded) => Some(decoded),
+        Err(error) => {
+            tracing::warn!(%error, "{what} does not decode; read as absent");
+            None
+        }
+    })
 }
 
 fn encode_json<T: serde::Serialize>(
@@ -79,7 +84,7 @@ pub(crate) fn row_to_file_prefixed<H>(
         page_count: row.get(column("page_count").as_str()),
         estimated_tokens: row.get(column("estimated_tokens").as_str()),
         ruleset_id: row.get(column("ruleset_id").as_str()),
-        steps: decode_json("a file's steps snapshot", row.get(column("steps").as_str()))?,
+        steps: decode_json("a file's steps snapshot", row.get(column("steps").as_str())),
         step_index: row.get(column("step_index").as_str()),
         step_count: row.get(column("step_count").as_str()),
         step_runner_type: row.get(column("step_runner_type").as_str()),
@@ -88,7 +93,12 @@ pub(crate) fn row_to_file_prefixed<H>(
         progress_index: row.get(column("progress_index").as_str()),
         progress_label: row.get(column("progress_label").as_str()),
         progress_at: row.get(column("progress_at").as_str()),
-        triggered_by: decode_json("a file's trigger", row.get(column("triggered_by").as_str()))?,
+        triggered_by: decode_json(
+            "a file's initiator",
+            row.get(column("triggered_by").as_str()),
+        ),
+        done_at: row.get(column("done_at").as_str()),
+        completed_at: row.get(column("completed_at").as_str()),
         created_by: row.get(column("created_by").as_str()),
         created_at: row.get(column("created_at").as_str()),
         updated_at: row.get(column("updated_at").as_str()),
@@ -164,7 +174,8 @@ impl<H: DriveHost> Persistence for FileStore<H> {
                    page_count = $10, estimated_tokens = $11, updated_at = $12, \
                    ruleset_id = $13, steps = $14, step_index = $15, step_count = $16, \
                    step_runner_type = $17, job_id = $18, plan = $19, progress_index = $20, \
-                   progress_label = $21, progress_at = $22, triggered_by = $23 \
+                   progress_label = $21, progress_at = $22, triggered_by = $23, \
+                   done_at = $24, completed_at = $25 \
                  WHERE id = $1",
             )
             .bind(file.id)
@@ -189,7 +200,12 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.progress_index)
             .bind(&file.progress_label)
             .bind(file.progress_at)
-            .bind(encode_json("a file's trigger", file.triggered_by.as_ref())?)
+            .bind(encode_json(
+                "a file's initiator",
+                file.triggered_by.as_ref(),
+            )?)
+            .bind(file.done_at)
+            .bind(file.completed_at)
             .execute(conn)
             .await?;
             Ok(())
@@ -205,7 +221,8 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             sqlx::query(&format!(
                 "INSERT INTO drive.file ({FILE_COLUMNS}) VALUES \
                  ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                  $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)"
+                  $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, \
+                  $30, $31)"
             ))
             .bind(file.id)
             .bind(file.drive_id)
@@ -232,7 +249,12 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.progress_index)
             .bind(&file.progress_label)
             .bind(file.progress_at)
-            .bind(encode_json("a file's trigger", file.triggered_by.as_ref())?)
+            .bind(encode_json(
+                "a file's initiator",
+                file.triggered_by.as_ref(),
+            )?)
+            .bind(file.done_at)
+            .bind(file.completed_at)
             .bind(file.created_by)
             .bind(file.created_at)
             .bind(file.updated_at)

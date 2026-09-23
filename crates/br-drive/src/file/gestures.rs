@@ -196,17 +196,23 @@ pub fn process<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.process_gate(cx.principal()).require()?;
-        let ruleset = select_ruleset(
+        // The given rule, else the default `reprocess` rule of the media type,
+        // else the file's own snapshot (a replay of what last ran).
+        let plan = match select_ruleset(
             cx.connection(),
             Trigger::Reprocess,
             &file.media_type,
             input.ruleset_id,
         )
         .await?
-        .ok_or(DriveFault::Refused(codes::NO_RULESET_MATCHES))?;
+        {
+            Some(ruleset) => processing::ChainPlan::from_ruleset(&ruleset, None),
+            None => processing::ChainPlan::replay(&file)
+                .ok_or(DriveFault::Refused(codes::NO_RULESET_MATCHES))?,
+        };
         processing::wipe_rendition(cx, &mut file).await?;
-        let trigger = processing::Trigger::of(cx.principal());
-        processing::start_chain(cx, &mut file, &ruleset, None, trigger).await?;
+        let initiator = processing::Initiator::of(cx.principal());
+        processing::start_chain(cx, &mut file, plan, initiator).await?;
         Ok(())
     })
 }
@@ -253,15 +259,12 @@ pub fn regenerate_page<'m, H: DriveHost>(
             options.insert("comment".into(), serde_json::Value::String(comment));
         }
         debug_assert_eq!(file.processing_state, ProcessingState::Ready);
-        let trigger = processing::Trigger::of(cx.principal());
-        processing::start_chain(
-            cx,
-            &mut file,
+        let initiator = processing::Initiator::of(cx.principal());
+        let plan = processing::ChainPlan::from_ruleset(
             &ruleset,
             Some(&serde_json::Value::Object(options)),
-            trigger,
-        )
-        .await?;
+        );
+        processing::start_chain(cx, &mut file, plan, initiator).await?;
         Ok(())
     })
 }

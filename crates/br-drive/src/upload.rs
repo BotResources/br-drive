@@ -24,7 +24,7 @@ use crate::ruleset::{Trigger, select_ruleset};
 
 pub const UPLOAD_DEADLINE_AGGREGATE: &str = "drive_file";
 pub const UPLOAD_DEADLINE_VERB: &str = "upload-deadline";
-pub const UPLOAD_DEADLINE_DURABLE: &str = "drive-upload-deadline";
+pub const UPLOAD_DEADLINE_DURABLE: &str = "upload-deadline";
 
 #[derive(Debug, Deserialize)]
 pub struct RequestUpload {
@@ -124,6 +124,8 @@ pub fn request_upload<'m, H: DriveHost>(
             progress_label: None,
             progress_at: None,
             triggered_by: None,
+            done_at: None,
+            completed_at: None,
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,
@@ -187,8 +189,9 @@ pub fn commit_upload<'m, H: DriveHost>(
         cx.impact_caused::<File, _>(&file.id, FileCause::UploadCommitted)?;
         match ruleset {
             Some(ruleset) => {
-                let trigger = processing::Trigger::of(cx.principal());
-                processing::start_chain(cx, &mut file, &ruleset, None, trigger).await?;
+                let initiator = processing::Initiator::of(cx.principal());
+                let plan = processing::ChainPlan::from_ruleset(&ruleset, None);
+                processing::start_chain(cx, &mut file, plan, initiator).await?;
             }
             None => cx.save(&file).await?,
         }

@@ -37,7 +37,10 @@ pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
 pub use image::{ImageName, InvalidImageName, MAX_IMAGE_NAME_BYTES};
 pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
-pub use processing::{CANCELLED, RUNNER_TYPE_UNAVAILABLE, RootNames};
+pub use processing::{
+    CANCELLED, CATALOGUE_NOT_WATCHED, ChainPlan, Initiator, RUNNER_TYPE_UNAVAILABLE, RootNames,
+    durable,
+};
 pub use register::register;
 pub use ruleset::{
     ANY_MEDIA_TYPE, CreateRuleset, DeleteRuleset, DriveRuleset, DriveRulesets, DriveStep,

@@ -22,8 +22,11 @@ use crate::runner::{
 };
 use crate::upload::{self, CommitUpload, RequestUpload, UPLOAD_DEADLINE_DURABLE, UploadDeadline};
 
-pub fn register<H: DriveHost>(engine: &mut Engine<H>, prefix: &str) -> Result<(), EngineError> {
-    processing::declare_roots(prefix)?;
+pub fn register<H: DriveHost>(
+    engine: &mut Engine<H>,
+    prefix: &'static str,
+) -> Result<(), EngineError> {
+    processing::declare_roots::<H>(prefix)?;
     if !engine.blobs_configured() {
         return Err(EngineError::Config(
             "br-drive needs object storage: configure EngineConfig::with_blob_storage before \
@@ -52,41 +55,45 @@ pub fn register<H: DriveHost>(engine: &mut Engine<H>, prefix: &str) -> Result<()
     engine.register_mutation::<RunnerReport, _>(runner_report::<H>)?;
     engine.register_bulk::<MoveFolder, _>(folders::move_folder::<H>)?;
     engine.register_bulk::<DeleteFolder, _>(folders::delete_folder::<H>)?;
+    let durable = |suffix: &str| processing::durable(H::SERVICE, suffix);
     engine.register_reaction::<UploadDeadline<H>, _, _>(
-        UPLOAD_DEADLINE_DURABLE,
+        &durable(UPLOAD_DEADLINE_DURABLE),
         upload::upload_deadline::<H>,
     )?;
-    engine.register_reaction::<ImageLanded<H>, _, _>(IMAGE_LANDED_DURABLE, image_landed::<H>)?;
+    engine.register_reaction::<ImageLanded<H>, _, _>(
+        &durable(IMAGE_LANDED_DURABLE),
+        image_landed::<H>,
+    )?;
     engine.register_reaction::<QueuedFact, _, _>(
-        processing::DURABLE_QUEUED,
-        processing::on_queued::<H>,
+        &durable(processing::DURABLE_QUEUED),
+        processing::on_queued,
     )?;
     engine.register_reaction::<CreationRejectedFact, _, _>(
-        processing::DURABLE_CREATION_REJECTED,
+        &durable(processing::DURABLE_CREATION_REJECTED),
         processing::on_creation_rejected::<H>,
     )?;
     engine.register_reaction::<StartedFact, _, _>(
-        processing::DURABLE_STARTED,
-        processing::on_started::<H>,
+        &durable(processing::DURABLE_STARTED),
+        processing::on_started,
     )?;
     engine.register_reaction::<PlanDeclaredFact, _, _>(
-        processing::DURABLE_PLAN_DECLARED,
+        &durable(processing::DURABLE_PLAN_DECLARED),
         processing::on_plan_declared::<H>,
     )?;
     engine.register_reaction::<StepStartedFact, _, _>(
-        processing::DURABLE_STEP_STARTED,
+        &durable(processing::DURABLE_STEP_STARTED),
         processing::on_step_started::<H>,
     )?;
     engine.register_reaction::<CompletedFact, _, _>(
-        processing::DURABLE_COMPLETED,
+        &durable(processing::DURABLE_COMPLETED),
         processing::on_completed::<H>,
     )?;
     engine.register_reaction::<FailedFact, _, _>(
-        processing::DURABLE_FAILED,
+        &durable(processing::DURABLE_FAILED),
         processing::on_failed::<H>,
     )?;
     engine.register_reaction::<CancelledFact, _, _>(
-        processing::DURABLE_CANCELLED,
+        &durable(processing::DURABLE_CANCELLED),
         processing::on_cancelled::<H>,
     )?;
     crate::blob::register::<H>(engine)?;

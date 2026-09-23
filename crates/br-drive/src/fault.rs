@@ -41,6 +41,7 @@ pub mod codes {
     pub const NO_RULESET_MATCHES: Reason = Reason::new("NO_RULESET_MATCHES");
     pub const RUNNER_TYPE_UNAVAILABLE: Reason = Reason::new("RUNNER_TYPE_UNAVAILABLE");
     pub const FILE_PROCESSING: Reason = Reason::new("FILE_PROCESSING");
+    pub const CATALOGUE_NOT_WATCHED: Reason = Reason::new("CATALOGUE_NOT_WATCHED");
 }
 
 #[derive(Debug, thiserror::Error)]

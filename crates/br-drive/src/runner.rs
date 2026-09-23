@@ -349,6 +349,8 @@ pub fn runner_report<'m, H: DriveHost>(
         if !dropped.is_empty() {
             cx.impact_caused::<File, _>(&file.id, FileCause::ImagesDropped { names: dropped })?;
         }
+        let mut dirty = false;
+        let mut cause = None;
         if let (Some(summary), Some(page_count), Some(estimated_tokens)) =
             (input.summary, input.page_count, input.estimated_tokens)
         {
@@ -359,19 +361,36 @@ pub fn runner_report<'m, H: DriveHost>(
                 file.summary = Some(summary);
                 file.page_count = Some(page_count);
                 file.estimated_tokens = Some(estimated_tokens);
-                file.updated_at = now;
-                cx.save(&file).await?;
-                cx.impact_caused::<File, _>(
-                    &file.id,
-                    FileCause::ReportStored {
-                        job_id: input.job_id,
-                        done: input.done,
-                    },
-                )?;
+                dirty = true;
+                cause = Some(FileCause::ReportStored {
+                    job_id: input.job_id,
+                    done: input.done,
+                });
             }
         }
-        if input.done {
+        if input.done && file.done_at.is_none() {
+            file.done_at = Some(now);
+            dirty = true;
+            if file.completed_at.is_some() {
+                // Jobs already said the job is over: the report is what the
+                // chain was waiting for.
+                if dirty {
+                    file.updated_at = now;
+                }
+                if let Some(cause) = cause {
+                    cx.impact_caused::<File, _>(&file.id, cause)?;
+                }
+                crate::processing::advance(cx, &mut file, input.job_id).await?;
+                return Ok(());
+            }
             crate::processing::finish_active_job(cx, &file)?;
+        }
+        if dirty {
+            file.updated_at = now;
+            cx.save(&file).await?;
+        }
+        if let Some(cause) = cause {
+            cx.impact_caused::<File, _>(&file.id, cause)?;
         }
         Ok(())
     })

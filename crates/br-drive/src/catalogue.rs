@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use contract_jobs::catalog::{RUNNER_TYPE_PREFIX, RunnerType, RunnerTypeLifecycle};
+use contract_jobs::runner::WIRE_VERSION;
 use service_engine::error::EngineError;
 use service_engine::nats::{KvEvent, KvPrefix, Nats, Watched};
 use sqlx::{PgConnection, PgPool};
@@ -16,6 +17,15 @@ pub fn lifecycle_str(lifecycle: RunnerTypeLifecycle) -> &'static str {
         RunnerTypeLifecycle::Active => "active",
         RunnerTypeLifecycle::Deprecated => "deprecated",
     }
+}
+
+/// Whether a catalogue watch has ever completed its boot scan on this host's
+/// database: until then no runner type is known and a chain cannot start.
+pub async fn scanned(conn: &mut PgConnection) -> Result<bool, EngineError> {
+    let scanned: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM drive.catalogue_scan)")
+        .fetch_one(conn)
+        .await?;
+    Ok(scanned)
 }
 
 pub async fn is_active(conn: &mut PgConnection, runner_type: &str) -> Result<bool, EngineError> {
@@ -46,6 +56,17 @@ pub async fn inactive_among(
     unknown.sort();
     unknown.dedup();
     Ok(unknown)
+}
+
+async fn mark_scanned(conn: &mut PgConnection) -> Result<(), EngineError> {
+    sqlx::query(
+        "INSERT INTO drive.catalogue_scan (singleton, scanned_at) VALUES (true, $1) \
+         ON CONFLICT (singleton) DO UPDATE SET scanned_at = EXCLUDED.scanned_at",
+    )
+    .bind(Utc::now())
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 async fn upsert(conn: &mut PgConnection, entry: &RunnerType) -> Result<(), EngineError> {
@@ -80,9 +101,22 @@ async fn retain(conn: &mut PgConnection, runner_types: &[String]) -> Result<(), 
     Ok(())
 }
 
+/// Decodes one catalogue entry; anything the mirror cannot trust — an entry that
+/// does not decode, one that names another type than its key, one of a wire
+/// version this library does not speak — is reported and treated as unknown.
 fn parse(key: &str, value: &serde_json::Value) -> Option<RunnerType> {
     let name = key.strip_prefix(RUNNER_TYPE_PREFIX)?;
     match serde_json::from_value::<RunnerType>(value.clone()) {
+        Ok(entry) if entry.version != WIRE_VERSION => {
+            tracing::error!(
+                key,
+                found = entry.version,
+                supported = WIRE_VERSION,
+                "a runner-type catalogue entry speaks a wire version this library does not; \
+                 the type is treated as unknown"
+            );
+            None
+        }
         Ok(entry) if entry.runner_type == name => Some(entry),
         Ok(entry) => {
             tracing::warn!(
@@ -99,6 +133,25 @@ fn parse(key: &str, value: &serde_json::Value) -> Option<RunnerType> {
     }
 }
 
+async fn apply_put(
+    conn: &mut PgConnection,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<Option<String>, EngineError> {
+    match parse(key, value) {
+        Some(entry) => {
+            upsert(conn, &entry).await?;
+            Ok(Some(entry.runner_type))
+        }
+        None => {
+            if let Some(name) = key.strip_prefix(RUNNER_TYPE_PREFIX) {
+                forget(conn, name).await?;
+            }
+            Ok(None)
+        }
+    }
+}
+
 async fn sync_once(nats: &Nats, pool: &PgPool, stop: &Notify) -> Result<(), EngineError> {
     let prefix =
         KvPrefix::new(RUNNER_TYPE_PREFIX).map_err(|e| EngineError::Config(e.to_string()))?;
@@ -107,12 +160,12 @@ async fn sync_once(nats: &Nats, pool: &PgPool, stop: &Notify) -> Result<(), Engi
     let mut conn = pool.acquire().await.map_err(EngineError::from)?;
     let mut present = Vec::new();
     for (key, value) in &entries {
-        if let Some(entry) = parse(key.as_str(), value) {
-            upsert(&mut conn, &entry).await?;
-            present.push(entry.runner_type);
+        if let Some(name) = apply_put(&mut conn, key.as_str(), value).await? {
+            present.push(name);
         }
     }
     retain(&mut conn, &present).await?;
+    mark_scanned(&mut conn).await?;
     drop(conn);
     let mut watch = bucket.watch_all_from(revision + 1).await?;
     loop {
@@ -131,9 +184,7 @@ async fn sync_once(nats: &Nats, pool: &PgPool, stop: &Notify) -> Result<(), Engi
         let mut conn = pool.acquire().await.map_err(EngineError::from)?;
         match event {
             KvEvent::Put { key, value, .. } => {
-                if let Some(entry) = parse(key.as_str(), &value) {
-                    upsert(&mut conn, &entry).await?;
-                }
+                apply_put(&mut conn, key.as_str(), &value).await?;
             }
             KvEvent::Delete { key, .. } => {
                 if let Some(name) = key.as_str().strip_prefix(RUNNER_TYPE_PREFIX) {
@@ -180,4 +231,22 @@ pub fn watch_runner_types(nats: Nats, pool: PgPool) -> CatalogueWatch {
         }
     });
     CatalogueWatch { stop, task }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_entry_of_another_wire_version_is_unknown_not_active() {
+        let key = "jobs.runner_type.render";
+        let current = serde_json::json!({ "runner_type": "render", "lifecycle": "ACTIVE", "version": WIRE_VERSION });
+        assert!(parse(key, &current).is_some());
+        let newer = serde_json::json!({ "runner_type": "render", "lifecycle": "ACTIVE", "version": WIRE_VERSION + 1 });
+        assert!(parse(key, &newer).is_none());
+        let misnamed = serde_json::json!({ "runner_type": "other", "lifecycle": "ACTIVE" });
+        assert!(parse(key, &misnamed).is_none());
+        assert!(parse(key, &serde_json::json!("garbled")).is_none());
+        assert!(parse("jobs.something_else", &current).is_none());
+    }
 }

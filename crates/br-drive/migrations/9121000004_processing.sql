@@ -10,6 +10,8 @@ ALTER TABLE drive.file
     ADD COLUMN progress_label   text,
     ADD COLUMN progress_at      timestamptz,
     ADD COLUMN triggered_by     jsonb,
+    ADD COLUMN done_at          timestamptz,
+    ADD COLUMN completed_at     timestamptz,
     ADD CONSTRAINT file_job_only_while_processing
         CHECK (job_id IS NULL OR processing_state = 'processing');
 
@@ -34,4 +36,9 @@ CREATE TABLE drive.known_runner_type (
     lifecycle   text        NOT NULL CHECK (lifecycle IN ('active', 'deprecated')),
     version     integer     NOT NULL,
     seen_at     timestamptz NOT NULL
+);
+
+CREATE TABLE drive.catalogue_scan (
+    singleton  boolean     PRIMARY KEY DEFAULT true CHECK (singleton),
+    scanned_at timestamptz NOT NULL
 );
