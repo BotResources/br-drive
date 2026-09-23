@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use br_core_integration::CommandCoords;
+use chrono::SubsecRound;
 use contract_jobs::command::{CancelJob, CreateJob, FinishJob, TriggeredBy};
 use contract_jobs::event::{
     JobCancelled, JobCompleted, JobCreationRejected, JobFailed, JobPlanDeclared, JobQueued,
@@ -548,11 +549,14 @@ pub fn on_step_started<'r, H: DriveHost>(
             return Ok(());
         };
         let index = i32::try_from(fact.0.index).unwrap_or(i32::MAX);
+        // The row stores microseconds; the wire may carry nanoseconds. Compared
+        // at the row's precision, a redelivered fact is never "newer".
+        let started_at = fact.0.started_at.trunc_subsecs(6);
         // A later index on the same run moves the cursor forward; a newer start
         // instant (a retry attempt restarting the plan) moves it too. Anything
         // else is a redelivery or a stale fact.
         let forward = match (file.progress_index, file.progress_at) {
-            (Some(current), Some(at)) => index > current || fact.0.started_at > at,
+            (Some(current), Some(at)) => index > current || started_at > at,
             _ => true,
         };
         if !forward {
@@ -560,7 +564,7 @@ pub fn on_step_started<'r, H: DriveHost>(
         }
         file.progress_index = Some(index);
         file.progress_label = Some(fact.0.label);
-        file.progress_at = Some(fact.0.started_at);
+        file.progress_at = Some(started_at);
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
         cx.impact_caused::<File, _>(&file.id, FileCause::ProgressChanged)?;
