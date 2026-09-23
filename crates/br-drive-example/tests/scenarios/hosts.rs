@@ -122,11 +122,14 @@ async fn two_hosts_on_one_broker_each_receive_every_jobs_fact_about_their_own_jo
     loop {
         let ours = world.file(&manager, workspace_file).await;
         let theirs = archive.file_state(&world, &archivist, archive_file).await;
-        if ours["progress"]["currentLabel"] == "render"
-            && theirs["progress"]["currentLabel"] == "render"
-        {
-            assert_eq!(ours["progress"]["plan"], serde_json::json!(["render"]));
-            assert_eq!(theirs["progress"]["plan"], serde_json::json!(["render"]));
+        // The plan and the current step are projected by two independent
+        // reactions over two facts, in no guaranteed order: wait for both
+        // before reading either, or the faster one ends the poll alone.
+        let done = |file: &serde_json::Value| {
+            file["progress"]["currentLabel"] == "render"
+                && file["progress"]["plan"] == serde_json::json!(["render"])
+        };
+        if done(&ours) && done(&theirs) {
             break;
         }
         assert!(
