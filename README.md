@@ -19,6 +19,9 @@ git tag is the release.
 
 ## Install
 
+The workspace's MSRV is Rust 1.94 — the floor of the pinned `contract-jobs`
+0.5.0, ahead of the engine's own 1.89.
+
 ```toml
 [dependencies]
 br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.1.0", version = "0.1.0" }
@@ -278,20 +281,28 @@ run *steps* in order" — a list, never a graph.
 | `<p>UpdateRuleset(id, name?, mediaTypes?, steps?, isDefault?): RulesetSaved!` | same rules; `NOTHING_TO_CHANGE` when nothing differs; the trigger is immutable. |
 | `<p>DeleteRuleset(id): MutationAck!` | `RULESET_NOT_FOUND`; files keep the `rulesetId` and the `steps` snapshot of a deleted rule. |
 
-Matching, on `CommitUpload` / `Process` / `RegeneratePage`: the given
-`rulesetId` must exist (`RULESET_NOT_FOUND`) and carry the gesture's trigger
-and a pattern matching the file's media type (`RULESET_MISMATCH`); without an
-id the default of that trigger wins by precedence exact > `type/*` > `*`. No
-rule → `READY` on commit, `NO_RULESET_MATCHES` on the two gestures. A rule
-never applies retroactively, and a rule edited or deleted while a chain runs
-never reaches that chain: the File keeps a `steps` snapshot taken when the
-rule fired.
+Matching: the given `rulesetId` must exist (`RULESET_NOT_FOUND`) and carry
+the gesture's trigger and a pattern matching the file's media type
+(`RULESET_MISMATCH`); without an id the default of that trigger wins by
+precedence exact > `type/*` > `*`. `CommitUpload` runs the `upload` rule or
+lands `READY` when none matches. `Process` resolves in this order: the given
+rule, else the default `reprocess` rule, else the file's own `steps` snapshot
+(a replay of what last ran — so a failed upload chain can be retried without a
+second rule), else `NO_RULESET_MATCHES` and the file is left as it is.
+`RegeneratePage` takes the given rule, else the default `regenerate_page`
+rule, else `NO_RULESET_MATCHES` (a regeneration cannot be inferred from an
+upload snapshot). A rule never applies retroactively, and a rule edited or
+deleted while a chain runs never reaches that chain: the File keeps a `steps`
+snapshot taken when the rule fired. Saving a rule on a host whose catalogue
+watch has never scanned is refused with `CATALOGUE_NOT_WATCHED`.
 
 The chain, one step at a time, in the library's own transactions:
 
 1. the step's runner type must be `ACTIVE` in the mirrored catalogue, else
    `FAILED` with `processingError = runner_type_unavailable` before any job
-   (Jobs would not refuse an unknown type — it would wait);
+   (Jobs would not refuse an unknown type — it would wait); on a host whose
+   catalogue watch has never scanned the chain fails `catalogue_not_watched`
+   and an error is logged;
 2. a `job_id` is minted on the File (`PROCESSING`, `progress { stepIndex,
    stepCount, runnerType }`) and `integration.cmd.jobs.job.create.v1` is
    staged through the engine outbox: `producer`, `source_bc` and `config.host`
@@ -299,32 +310,68 @@ The chain, one step at a time, in the library's own transactions:
    live job per file), `parent_job_id` the previous step's job,
    `triggered_by` the principal of the gesture (`DriveHost::display_name`);
 3. the eight `integration.evt.jobs.job.*.v1` facts are consumed on eight
-   durables and matched on the File's `job_id` — a fact about a job no file
-   holds is acknowledged and ignored, so every fact can be redelivered:
+   durables named `{service}-drive-job-…` (every durable the library binds,
+   the `upload-deadline` and `image-landed` ones included, is namespaced by
+   `DriveHost::SERVICE`, so N hosts on one cluster never share a consumer)
+   and matched on the File's `job_id` — a fact about a job no file holds is
+   acknowledged and ignored, so every fact can be redelivered:
    `plan_declared` fills `progress.plan`, `step_started` moves
-   `progress.currentIndex / currentLabel / at` (never backwards),
+   `progress.currentIndex / currentLabel / at` (forward by index, or by a
+   newer start instant when a retry attempt restarts the plan),
    `completed` launches the next step or lands `READY`
-   (`ProcessingFinished`), `creation_rejected` / `failed` land `FAILED` with
+   (`ProcessingFinished`) — only once the runner's final report landed
+   (`done_at`); a `completed` that arrives first is kept on the row and the
+   report advances the chain — `creation_rejected` / `failed` land `FAILED` with
    the reason code (`ProcessingFailed { reason }`), `cancelled` lands `FAILED`
    `cancelled` — unless the cancel was ours: `DeleteFile`, `DeleteFolder` and
    `delete_drive` stage `job.cancel.v2` for every file they remove while it
    is `PROCESSING`, and the later `cancelled` fact finds no file;
-4. the runner's `done: true` report stages `job.finish.v2`.
+4. the runner's `done: true` report records `done_at` and stages
+   `job.finish.v2` (or advances the chain directly when Jobs already said
+   `completed`).
 
 `ruleset_id` and `steps` stay on the File for replay; `job_id`, `step_*`,
 `plan` and `progress_*` are null outside `PROCESSING`.
 
 The catalogue mirror: `drive.known_runner_type` is fed by
 `br_drive::watch_runner_types` — a boot scan of `PUBLISHED_LANGUAGE` under
-`jobs.runner_type.` then a KV watch, tolerant of an entry that does not decode
-(warned and skipped), restarted after a fault. It is a hand-rolled watch and
-not the engine's mirror kit because engine 0.3.0's kit requires a
-`/`-terminated consumed prefix and the catalogue is published by a non-engine
-producer under a dot prefix with a per-value `version`; the watch is replaced
-by the kit when the kit accepts such a prefix.
+`jobs.runner_type.` (recorded in `drive.catalogue_scan`) then a KV watch,
+tolerant of an entry that does not decode (warned and skipped) and strict on
+the wire: an entry whose `version` is not `contract_jobs::runner::WIRE_VERSION`
+is logged as an error and treated as unknown, never as active; the watch is
+restarted after a fault. The host starts it next to the engine and stops it at
+shutdown — engine 0.3.0 gives a library no boot or shutdown hook, so the
+library cannot own that lifecycle; a host that forgets it is told loudly:
+`CATALOGUE_NOT_WATCHED` on every rule save and `catalogue_not_watched` on
+every chain, with an error log. It is a hand-rolled watch and not the
+engine's mirror kit because the kit requires a `/`-terminated consumed prefix
+and the catalogue is published by a non-engine producer under a dot prefix
+with a per-value `version`; the watch is replaced by the kit when the kit
+accepts such a prefix.
+
+## Reason codes
+
+`DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`, `FILE_PROTECTED`,
+`FILE_NOT_PENDING`, `FILE_NOT_READY`, `FILE_PROCESSING`, `FILE_TOO_LARGE`,
+`UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,
+`INVALID_NAME`, `NAME_TAKEN`, `FOLDER_INTO_ITSELF`, `NOTHING_TO_CHANGE`,
+`KEY_REUSED`, `RUNNER_SCOPE_REQUIRED`, `JOB_NOT_ACTIVE`, `SOURCE_NOT_AVAILABLE`,
+`INVALID_IMAGE_NAME`, `IMAGE_UPLOAD_PENDING`, `INVALID_PAGE`,
+`INVALID_PAGE_ORIGIN`, `PAGE_NOT_FOUND`, `INDEXER_FIELDS_TOGETHER`,
+`INVALID_INDEXER_VALUE`, `BATCH_TOO_LARGE`, `RULESET_NOT_FOUND`,
+`RULESET_NAME_TAKEN`, `INVALID_RULESET`, `DEFAULT_ALREADY_SET`,
+`RULESET_MISMATCH`, `NO_RULESET_MATCHES`, `RUNNER_TYPE_UNAVAILABLE`,
+`CATALOGUE_NOT_WATCHED` — plus the host's own codes through the gate and the
+hooks. On a `FAILED` file, `processingError` carries the runner's
+`reason_code` verbatim, or one of the library's: `runner_type_unavailable`,
+`catalogue_not_watched`, `cancelled`.
 
 ## Follow-ups
 
+- The catalogue watch's health is not on the engine's readiness: the readiness
+  assembly is the engine's, and its mirror-handle registration is a
+  test-support API in 0.3.0. `drive.catalogue_scan` says whether a scan ever
+  ran; a readiness reason for it needs the engine hook.
 - Engine 0.3.0's `Query::download` populates the projector with its default
   window and then asks membership by key, so the runner's source presign
   cannot be told which file it is about: the `drive_runner_sources` projector

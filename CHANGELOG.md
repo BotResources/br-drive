@@ -155,7 +155,18 @@ single git tag `v{version}` releases the set. Format follows
   type; failure and rejection with reason codes, reprocess wiping the
   rendition; foreign cancel vs own cancel; a rule edited or deleted mid-chain,
   non-retroactivity; every fact replayed idempotent; the processing guards.
-  The workspace MSRV follows `contract-jobs` 0.5.0: Rust 1.94.
+  The workspace MSRV follows `contract-jobs` 0.5.0: Rust 1.94. Review round:
+  every durable the library binds is namespaced by `DriveHost::SERVICE`
+  (`{service}-drive-…`, proven by a two-host scenario on one broker); the
+  config root names follow the engine's camel-casing of the prefix; `Process`
+  falls back to the file's own `steps` snapshot when no `reprocess` rule
+  matches; the catalogue watch records its boot scan and a host that never
+  started it is refused `CATALOGUE_NOT_WATCHED` on rule saves and fails chains
+  `catalogue_not_watched`; a catalogue entry of another wire version is
+  treated as unknown; the report's `done_at` gates the chain's advance and a
+  `completed` fact that arrives first waits for the report; a step cursor
+  moves forward by index or by a newer start instant; a malformed snapshot
+  is read as absent rather than breaking the file's view.
 - Reason codes: `DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`,
   `FILE_PROTECTED`, `FILE_NOT_PENDING`, `FILE_NOT_READY`, `FILE_TOO_LARGE`,
   `UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,
@@ -165,7 +176,8 @@ single git tag `v{version}` releases the set. Format follows
   `INDEXER_FIELDS_TOGETHER`, `INVALID_INDEXER_VALUE`, `BATCH_TOO_LARGE`,
   `IMAGE_UPLOAD_PENDING`, `RULESET_NOT_FOUND`, `RULESET_NAME_TAKEN`,
   `INVALID_RULESET`, `DEFAULT_ALREADY_SET`, `RULESET_MISMATCH`,
-  `NO_RULESET_MATCHES`, `RUNNER_TYPE_UNAVAILABLE`, `FILE_PROCESSING`, plus
+  `NO_RULESET_MATCHES`, `RUNNER_TYPE_UNAVAILABLE`, `FILE_PROCESSING`,
+  `CATALOGUE_NOT_WATCHED`, plus
   the engine's `KEY_REUSED` and the host's own codes through the gate and the
   hooks.
 - Example host: `workspaceCreate` / `workspaceDelete` wrap `create_drive` /
