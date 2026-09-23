@@ -41,20 +41,50 @@ impl ProcessingState {
         }
     }
 
-    pub fn from_db_str(text: &str) -> Result<Self, UnknownProcessingState> {
+    pub fn from_db_str(text: &str) -> Result<Self, UnknownDbValue> {
         match text {
             "pending" => Ok(Self::Pending),
             "processing" => Ok(Self::Processing),
             "ready" => Ok(Self::Ready),
             "failed" => Ok(Self::Failed),
-            other => Err(UnknownProcessingState(other.to_string())),
+            other => Err(UnknownDbValue("processing_state", other.to_string())),
+        }
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, async_graphql::Enum,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PageOrigin {
+    #[default]
+    Runner,
+    Regenerated,
+    Edited,
+}
+
+impl PageOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runner => "runner",
+            Self::Regenerated => "regenerated",
+            Self::Edited => "edited",
+        }
+    }
+
+    pub fn from_db_str(text: &str) -> Result<Self, UnknownDbValue> {
+        match text {
+            "runner" => Ok(Self::Runner),
+            "regenerated" => Ok(Self::Regenerated),
+            "edited" => Ok(Self::Edited),
+            other => Err(UnknownDbValue("origin", other.to_string())),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown_processing_state: {0}")]
-pub struct UnknownProcessingState(pub String);
+#[error("unknown_db_value: {0} = {1}")]
+pub struct UnknownDbValue(pub &'static str, pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
@@ -68,6 +98,10 @@ pub enum FileCause {
     FolderMoved,
     ProtectionChanged { protected: bool },
     MetadataChanged,
+    ImageRequested { name: String },
+    ImageAvailable { name: String },
+    ImagesDropped { names: Vec<String> },
+    ReportStored { job_id: Uuid, done: bool },
     Deleted,
     FolderDeleted,
     DriveDeleted,
@@ -86,6 +120,9 @@ pub struct FileRow<H> {
     pub processing_state: ProcessingState,
     pub processing_error: Option<String>,
     pub metadata: serde_json::Value,
+    pub summary: Option<String>,
+    pub page_count: Option<i32>,
+    pub estimated_tokens: Option<i64>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -107,6 +144,9 @@ impl<H> Clone for FileRow<H> {
             processing_state: self.processing_state,
             processing_error: self.processing_error.clone(),
             metadata: self.metadata.clone(),
+            summary: self.summary.clone(),
+            page_count: self.page_count,
+            estimated_tokens: self.estimated_tokens,
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -138,6 +178,13 @@ fn unprotected<H: DriveHost>(
     principal.drive_gate(&request)
 }
 
+fn ready<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
+    if file.processing_state != ProcessingState::Ready {
+        return Gate::blocked(codes::FILE_NOT_READY);
+    }
+    principal.drive_gate(&request)
+}
+
 service_engine::gated! {
     generics [H: DriveHost];
     FileRow<H>, H;
@@ -165,10 +212,10 @@ service_engine::gated! {
         )
     }
     "download" => fn download_gate(this, principal) {
-        if this.processing_state != ProcessingState::Ready {
-            return Gate::blocked(codes::FILE_NOT_READY);
-        }
-        principal.drive_gate(&DriveRequest::ReadFile { file: this })
+        ready(this, principal, DriveRequest::ReadFile { file: this })
+    }
+    "editPage" => fn edit_page_gate(this, principal) {
+        ready(this, principal, DriveRequest::EditPage { file: this })
     }
 }
 
@@ -201,6 +248,18 @@ impl<H: DriveHost> FileRow<H> {
             size: u64::try_from(self.size_bytes).unwrap_or(0),
         }
     }
+
+    pub fn read_gate(&self, principal: &H) -> Gate {
+        principal.drive_gate(&DriveRequest::ReadFile { file: self })
+    }
+
+    pub fn require_active_job(&self, job_id: Uuid) -> Result<(), Reason> {
+        if H::active_job(self) == Some(job_id) {
+            Ok(())
+        } else {
+            Err(codes::JOB_NOT_ACTIVE)
+        }
+    }
 }
 
 pub struct FileVisibility<H>(PhantomData<fn() -> H>);
@@ -216,12 +275,16 @@ impl<H: DriveHost> Visibility for FileVisibility<H> {
     }
 
     fn memberships(principal: &H) -> Cohorts {
-        principal
-            .visible_drives()
-            .into_iter()
-            .map(|drive| Cohort::uuid(DRIVE_DIM, drive))
-            .collect()
+        drive_memberships(principal)
     }
+}
+
+pub(crate) fn drive_memberships<H: DriveHost>(principal: &H) -> Cohorts {
+    principal
+        .visible_drives()
+        .into_iter()
+        .map(|drive| Cohort::uuid(DRIVE_DIM, drive))
+        .collect()
 }
 
 #[cfg(test)]
@@ -240,8 +303,20 @@ mod tests {
         }
         assert_eq!(
             ProcessingState::from_db_str("weird"),
-            Err(UnknownProcessingState("weird".into()))
+            Err(UnknownDbValue("processing_state", "weird".into()))
         );
+    }
+
+    #[test]
+    fn the_page_origin_maps_totally() {
+        for origin in [
+            PageOrigin::Runner,
+            PageOrigin::Regenerated,
+            PageOrigin::Edited,
+        ] {
+            assert_eq!(PageOrigin::from_db_str(origin.as_str()), Ok(origin));
+        }
+        assert!(PageOrigin::from_db_str("guessed").is_err());
     }
 
     #[test]
@@ -249,6 +324,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ProcessingState::Ready).unwrap(),
             "\"READY\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PageOrigin::Regenerated).unwrap(),
+            "\"REGENERATED\""
         );
     }
 }

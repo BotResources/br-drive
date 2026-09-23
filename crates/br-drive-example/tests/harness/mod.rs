@@ -1,6 +1,7 @@
 pub mod minio;
 pub mod nats;
 pub mod pg;
+pub mod runner;
 pub mod upload;
 pub mod ws;
 
@@ -125,11 +126,38 @@ impl World {
             .gql(
                 passport,
                 "query($id:UUID!){workspaceFile(fileId:$id){id driveId path name protected \
-                 mediaType sizeBytes sha256 processingState affordances}}",
+                 mediaType sizeBytes sha256 processingState summary pageCount estimatedTokens \
+                 images{name mediaType sizeBytes page} affordances updatedAt}}",
                 serde_json::json!({ "id": file_id }),
             )
             .await;
         ok(&response)["workspaceFile"].clone()
+    }
+
+    pub async fn file_pages(&self, passport: &str, file_id: Uuid) -> Vec<serde_json::Value> {
+        let response = self
+            .gql(
+                passport,
+                "query($f:UUID!){workspacePages(fileId:$f){fileId number markdown origin updatedBy affordances}}",
+                serde_json::json!({ "f": file_id }),
+            )
+            .await;
+        ok(&response)["workspacePages"]
+            .as_array()
+            .expect("a list of pages")
+            .clone()
+    }
+
+    pub async fn image_row(&self, file_id: Uuid, name: &str) -> Option<(Uuid, Option<Uuid>, bool)> {
+        sqlx::query_as(
+            "SELECT blob_ref, pending_blob_ref, landed_at IS NOT NULL FROM drive.file_image \
+             WHERE file_id = $1 AND name = $2",
+        )
+        .bind(file_id)
+        .bind(name)
+        .fetch_optional(&self.db.app)
+        .await
+        .expect("read the image row")
     }
 
     pub async fn drive_files(&self, passport: &str, drive: Uuid) -> Vec<serde_json::Value> {
@@ -144,6 +172,20 @@ impl World {
             .as_array()
             .expect("a list of files")
             .clone()
+    }
+
+    pub async fn image_access(
+        &self,
+        passport: &str,
+        file_id: Uuid,
+        name: &str,
+    ) -> serde_json::Value {
+        self.gql(
+            passport,
+            "query($id:UUID!,$n:String){workspaceFileAccess(fileId:$id,name:$n)}",
+            serde_json::json!({ "id": file_id, "n": name }),
+        )
+        .await
     }
 
     pub async fn file_access(&self, passport: &str, file_id: Uuid) -> serde_json::Value {
@@ -161,6 +203,18 @@ impl World {
             .fetch_optional(&self.db.app)
             .await
             .expect("read the blob row")
+    }
+
+    pub async fn await_source_promoted(&self, file_id: Uuid) {
+        let source = self.source_of(file_id).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while self.blob_state(source).await.as_deref() != Some("uploaded") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the engine reaper never promoted the source of {file_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
     }
 
     pub async fn source_of(&self, file_id: Uuid) -> Uuid {
@@ -259,6 +313,20 @@ fn base_config(pod: &str, addr: SocketAddr) -> EngineConfig {
     .with_http_addr(addr)
 }
 
+pub fn service_passport(scopes: &[&str]) -> String {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "scopes".to_string(),
+        serde_json::Value::Array(
+            scopes
+                .iter()
+                .map(|scope| serde_json::Value::String((*scope).to_string()))
+                .collect(),
+        ),
+    );
+    Passport::service(Uuid::now_v7(), PassportClaims::from_map(map)).to_header()
+}
+
 pub fn passport(user: Uuid) -> String {
     Passport::human(
         user,
@@ -307,8 +375,45 @@ pub fn error_code(response: &serde_json::Value) -> String {
 pub const DRIVE_DELTAS: &str = "subscription($d:UUID!){workspaceDriveChanged(driveId:$d){\
     __typename \
     ... on DriveReset{revision views{... on DriveFile{id path name processingState}}} \
-    ... on DriveUpsert{revision cause view{... on DriveFile{id path name processingState affordances}}} \
+    ... on DriveUpsert{revision cause view{... on DriveFile{id path name processingState affordances summary pageCount estimatedTokens images{name page}}}} \
     ... on DriveRemove{revision projector key cause}}}";
+
+pub const PAGE_DELTAS: &str = "subscription($f:UUID!){workspaceFilePages(fileId:$f){\
+    __typename \
+    ... on DriveReset{revision views{... on DrivePage{fileId number markdown origin affordances}}} \
+    ... on DriveUpsert{revision cause view{... on DrivePage{fileId number markdown origin updatedBy affordances}}} \
+    ... on DriveRemove{revision projector key cause}}}";
+
+pub async fn pages_subscription(world: &World, passport: &str, file_id: Uuid) -> Subscription {
+    let mut sub = Subscription::open_with(
+        &world.subscription_url(),
+        passport,
+        PAGE_DELTAS,
+        serde_json::json!({ "f": file_id }),
+    )
+    .await;
+    let reset = sub.next_payload(Duration::from_secs(10)).await;
+    assert_eq!(
+        reset["workspaceFilePages"]["__typename"], "DriveReset",
+        "the first delta on attach is a Reset: {reset}"
+    );
+    sub
+}
+
+pub async fn pages_reset(world: &World, passport: &str, file_id: Uuid) -> Vec<serde_json::Value> {
+    let mut sub = Subscription::open_with(
+        &world.subscription_url(),
+        passport,
+        PAGE_DELTAS,
+        serde_json::json!({ "f": file_id }),
+    )
+    .await;
+    let reset = sub.next_payload(Duration::from_secs(10)).await;
+    reset["workspaceFilePages"]["views"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
 
 pub async fn drive_subscription(world: &World, passport: &str, drive: Uuid) -> Subscription {
     let mut sub = Subscription::open_with(
@@ -326,14 +431,51 @@ pub async fn drive_subscription(world: &World, passport: &str, drive: Uuid) -> S
     sub
 }
 
+pub async fn drain_with_a_rename(
+    world: &World,
+    passport: &str,
+    sub: &mut Subscription,
+    file_id: Uuid,
+    name: &str,
+) {
+    ok(&world
+        .gql(
+            passport,
+            "mutation($f:UUID!,$n:String){workspaceUpdateFile(fileId:$f,name:$n){success}}",
+            serde_json::json!({ "f": file_id, "n": name }),
+        )
+        .await);
+    next_drive_delta(sub, |node| {
+        node["__typename"] == "DriveUpsert"
+            && node["cause"]["kind"] == "Renamed"
+            && node["view"]["id"] == file_id.to_string()
+    })
+    .await;
+}
+
 pub async fn next_drive_delta(
     sub: &mut Subscription,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    next_delta(sub, "workspaceDriveChanged", matches).await
+}
+
+pub async fn next_page_delta(
+    sub: &mut Subscription,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    next_delta(sub, "workspaceFilePages", matches).await
+}
+
+pub async fn next_delta(
+    sub: &mut Subscription,
+    root: &str,
     matches: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         let delta = sub.next_payload(Duration::from_secs(15)).await;
-        let node = &delta["workspaceDriveChanged"];
+        let node = &delta[root];
         if std::env::var("DRIVE_TRACE_DELTAS").is_ok() {
             eprintln!("delta: {node}");
         }

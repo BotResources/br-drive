@@ -2,11 +2,20 @@ mod aggregate;
 mod curation;
 mod delta;
 mod gestures;
+pub(crate) mod images;
+pub(crate) mod pages;
 pub(crate) mod store;
 mod view;
 
-pub use aggregate::{File, FileCause, FileRow, FileVisibility, ProcessingState};
+pub use aggregate::{File, FileCause, FileRow, FileVisibility, PageOrigin, ProcessingState};
 pub use curation::{drive_of, set_metadata, set_protected};
-pub use delta::{DriveDelta, DriveFileUnion, DriveRemove, DriveReset, DriveUpsert};
-pub use gestures::{DeleteFile, UpdateFile, delete_file, update_file};
-pub use view::{ByteCount, DriveFile, DriveFiles, DriveWindow};
+pub use delta::{DriveDelta, DriveRemove, DriveReset, DriveUpsert, DriveView};
+pub use gestures::{DeleteFile, EditPage, UpdateFile, delete_file, edit_page, update_file};
+pub use images::{
+    IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded,
+    ImageRecord, references_image,
+};
+pub use pages::{
+    DrivePage, DrivePages, EDIT_PAGE_ACTION, Page, PageCause, PageKey, PageWindow, RunnerPage,
+};
+pub use view::{ByteCount, DriveFile, DriveFiles, DriveImage, DriveWindow};

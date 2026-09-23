@@ -1,15 +1,68 @@
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
+use service_engine::BlobRef;
 use service_engine::gate::Reason;
 use service_engine::pipeline::{Mutation, MutationInput};
 use uuid::Uuid;
 
-use super::aggregate::{File, FileCause, FileRow};
-use super::store;
+use super::aggregate::{File, FileCause, FileRow, PageOrigin};
+use super::pages::{Page, PageCause, PageKey};
+use super::store::{self, PageWrite};
 use crate::drive::DriveRow;
 use crate::fault::{DriveFault, codes};
 use crate::host::DriveHost;
 use crate::path::{DrivePath, FileName};
+
+#[derive(Debug, Deserialize)]
+pub struct EditPage {
+    pub file_id: Uuid,
+    pub number: i32,
+    pub markdown: String,
+}
+
+impl MutationInput for EditPage {
+    type Output = ();
+    type Error = DriveFault;
+    const NAME: &'static str = "drive_edit_page";
+}
+
+pub fn edit_page<'m, H: DriveHost>(
+    cx: &'m mut Mutation<'m, H>,
+    input: EditPage,
+) -> BoxFuture<'m, Result<(), DriveFault>> {
+    Box::pin(async move {
+        let file = cx
+            .load::<FileRow<H>>(&input.file_id)
+            .await?
+            .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
+        file.edit_page_gate(cx.principal()).require()?;
+        if !store::page_exists(cx.connection(), file.id, input.number).await? {
+            return Err(DriveFault::Refused(codes::PAGE_NOT_FOUND));
+        }
+        let by = cx.principal().id().as_uuid();
+        let now = cx.now().as_datetime();
+        store::upsert_pages(
+            cx.connection(),
+            file.id,
+            &[PageWrite {
+                number: input.number,
+                markdown: &input.markdown,
+                origin: PageOrigin::Edited,
+            }],
+            by,
+            now,
+        )
+        .await?;
+        cx.impact_caused::<Page, _>(
+            &PageKey {
+                file_id: file.id,
+                number: input.number,
+            },
+            PageCause::Edited,
+        )?;
+        Ok(())
+    })
+}
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateFile {
@@ -108,7 +161,11 @@ pub fn delete_file<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.delete_gate(cx.principal()).require()?;
+        let images = store::image_refs_of_files(cx.connection(), &[file.id]).await?;
         cx.delete(&file).await?;
+        for reference in images {
+            cx.release_blob(BlobRef(reference))?;
+        }
         cx.impact_caused::<File, _>(&file.id, FileCause::Deleted)?;
         Ok(())
     })

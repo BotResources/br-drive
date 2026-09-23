@@ -6,6 +6,7 @@ use service_engine::{Blobs, Engine};
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::file::images::{ImageLanded, image_of_blob};
 use crate::file::{File, FileCause};
 use crate::host::DriveHost;
 
@@ -13,6 +14,25 @@ pub struct DriveSource;
 
 impl Blobs for DriveSource {
     const KIND: &'static str = "drive_source";
+}
+
+pub struct DriveImage;
+
+impl Blobs for DriveImage {
+    const KIND: &'static str = "drive_image";
+}
+
+pub fn image_available<'a, H: DriveHost>(
+    uploaded: Uploaded<'a>,
+    ps: &'a mut PostSave<'_, '_>,
+) -> BoxFuture<'a, Result<(), PostUpload>> {
+    Box::pin(async move {
+        let reference = uploaded.reference.as_uuid();
+        if let Some(key) = image_of_blob(ps.connection(), reference).await? {
+            ps.command(ImageLanded::<H>::new(key, reference))?;
+        }
+        Ok(())
+    })
 }
 
 pub fn source_available<'a>(
@@ -41,5 +61,11 @@ pub fn register<P: DriveHost>(
     })?;
     engine.register_post_upload_policy::<DriveSource, _>(source_available)?;
     engine.require_post_upload_policy::<DriveSource>()?;
+    engine.register_blobs::<DriveImage>(service_engine::BlobPolicy {
+        max_bytes: P::IMAGE_MAX_BYTES,
+        orphan_after: P::IMAGE_ORPHAN_AFTER,
+    })?;
+    engine.register_post_upload_policy::<DriveImage, _>(image_available::<P>)?;
+    engine.require_post_upload_policy::<DriveImage>()?;
     Ok(())
 }

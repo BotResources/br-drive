@@ -23,27 +23,51 @@ type DriveFile {
 	processingState: ProcessingState!
 	processingError: String
 	metadata: JSON!
+	summary: String
+	pageCount: Int
+	estimatedTokens: Int
+	images: [DriveImage!]!
 	createdBy: UUID!
 	createdAt: DateTime!
 	updatedAt: DateTime!
 	affordances: Affordances!
 }
 
-union DriveFileUnion = DriveFile
+type DriveImage {
+	name: String!
+	mediaType: String!
+	sizeBytes: ByteCount!
+	page: Int!
+}
 
 type DriveMutation {
 	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
 	workspaceCommitUpload(fileId: UUID!): MutationAck!
 	workspaceUpdateFile(fileId: UUID!, name: String, path: String, driveId: UUID): MutationAck!
 	workspaceDeleteFile(fileId: UUID!): MutationAck!
+	workspaceEditPage(fileId: UUID!, number: Int!, markdown: String!): MutationAck!
+	workspaceRunnerRequestImageUpload(fileId: UUID!, jobId: UUID!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
+	workspaceRunnerReport(fileId: UUID!, jobId: UUID!, pages: [ReportedPageInput!]! = [], origin: PageOrigin, summary: String, pageCount: Int, estimatedTokens: Int, done: Boolean! = false): MutationAck!
 	workspaceMoveFolder(driveId: UUID!, oldPrefix: String!, newPrefix: String!): MutationAck!
 	workspaceDeleteFolder(driveId: UUID!, prefix: String!): MutationAck!
+}
+
+type DrivePage {
+	fileId: UUID!
+	number: Int!
+	markdown: String!
+	origin: PageOrigin!
+	updatedBy: UUID!
+	updatedAt: DateTime!
+	affordances: Affordances!
 }
 
 type DriveQuery {
 	workspaceFile(fileId: UUID!): DriveFile
 	workspaceDriveFiles(driveId: UUID!): [DriveFile!]!
+	workspacePages(fileId: UUID!): [DrivePage!]!
 	workspaceFileAccess(fileId: UUID!, name: String): String
+	workspaceRunnerContext(fileId: UUID!, jobId: UUID!): RunnerContext!
 }
 
 type DriveRemove {
@@ -55,18 +79,21 @@ type DriveRemove {
 
 type DriveReset {
 	revision: Int!
-	views: [DriveFileUnion!]!
+	views: [DriveView!]!
 }
 
 type DriveSubscription {
 	workspaceDriveChanged(driveId: UUID!): DriveDelta!
+	workspaceFilePages(fileId: UUID!): DriveDelta!
 }
 
 type DriveUpsert {
 	revision: Int!
-	view: DriveFileUnion!
+	view: DriveView!
 	cause: JSON
 }
+
+union DriveView = DriveFile | DrivePage
 
 """
 A scalar that can represent any JSON value.
@@ -90,11 +117,40 @@ type MutationAck {
 	success: Boolean!
 }
 
+enum PageOrigin {
+	RUNNER
+	REGENERATED
+	EDITED
+}
+
 enum ProcessingState {
 	PENDING
 	PROCESSING
 	READY
 	FAILED
+}
+
+input ReportedPageInput {
+	number: Int!
+	markdown: String!
+}
+
+type RunnerContext {
+	fileId: UUID!
+	mediaType: String!
+	name: String!
+	pageCount: Int
+	summary: String
+	pages: [RunnerPage!]!
+	images: [String!]!
+	sourceUrl: String
+}
+
+type RunnerPage {
+	number: Int!
+	markdown: String!
+	origin: PageOrigin!
+	updatedAt: DateTime!
 }
 
 """

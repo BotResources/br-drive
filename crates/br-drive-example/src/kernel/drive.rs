@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use br_drive::{DriveHost, DrivePath, DriveRequest};
+use br_drive::{DriveHost, DrivePath, DriveRequest, FileRow};
 use futures_util::future::BoxFuture;
 use service_engine::error::EngineError;
 use service_engine::gate::{Gate, Reason};
@@ -17,6 +17,7 @@ pub const FORBIDDEN_FOLDER: Reason = Reason::new("FORBIDDEN_FOLDER");
 
 pub const UNRENDERABLE: &str = "application/x-unrenderable";
 pub const FORBIDDEN_PREFIX: &str = "forbidden";
+pub const ACTIVE_JOB_KEY: &str = "job_id";
 
 impl DriveHost for AppPrincipal {
     const SERVICE: &'static str = crate::SERVICE;
@@ -26,6 +27,10 @@ impl DriveHost for AppPrincipal {
     const VISIBILITY_DEPS: Deps = Deps::from_bits(1 << OWNERSHIP_DEP);
 
     const SOURCE_ORPHAN_AFTER: Duration = Duration::from_secs(8);
+
+    const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(8);
+
+    const IMAGE_MAX_BYTES: u64 = 1 << 20;
 
     const BULK_RESET_THRESHOLD: usize = 3;
 
@@ -51,6 +56,13 @@ impl DriveHost for AppPrincipal {
 
     fn visible_drives(&self) -> Vec<Uuid> {
         self.owned_workspaces()
+    }
+
+    fn active_job(file: &FileRow<Self>) -> Option<Uuid> {
+        file.metadata
+            .get(ACTIVE_JOB_KEY)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| Uuid::parse_str(raw).ok())
     }
 
     fn upload_window(&self) -> Duration {
