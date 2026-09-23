@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use br_core_auth::Passport;
 use br_core_integration::Actor;
-use br_drive::{DriveHost, DriveRequest};
+use br_drive::{DriveHost, DriveRequest, EraseMode};
 use futures_util::future::BoxFuture;
 use service_engine::config::EngineConfig;
 use service_engine::error::EngineError;
@@ -125,6 +125,10 @@ impl DriveHost for ArchivePrincipal {
     fn display_name(&self) -> Option<String> {
         self.passport.claim::<String>("name")
     }
+
+    fn erase_mode() -> EraseMode {
+        EraseMode::Delete
+    }
 }
 
 pub mod schema {
@@ -141,6 +145,7 @@ pub struct ArchiveHost {
     stop: Arc<tokio::sync::Notify>,
     handle: tokio::task::JoinHandle<Result<(), EngineError>>,
     catalogue: br_drive::CatalogueWatch,
+    eraser: service_engine::Eraser<ArchivePrincipal>,
 }
 
 impl ArchiveHost {
@@ -212,6 +217,7 @@ impl ArchiveHost {
         engine.set_schema_sdl(graphql.sdl());
         let app = service_engine::app(graphql, state, readiness.clone());
         let stop = engine.shutdown_handle();
+        let eraser = engine.eraser();
         let catalogue = br_drive::watch_runner_types(engine.nats().clone(), db.app.clone());
         let listener = TcpListener::bind(addr)
             .await
@@ -237,7 +243,15 @@ impl ArchiveHost {
             stop,
             handle,
             catalogue,
+            eraser,
         }
+    }
+
+    pub async fn erase(&self, person: Uuid) -> service_engine::EraseOutcome {
+        self.eraser
+            .erase(service_engine::PersonId(person))
+            .await
+            .expect("the archive host erases the person")
     }
 
     pub async fn gql(

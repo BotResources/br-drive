@@ -6,7 +6,8 @@ use uuid::Uuid;
 use crate::harness::runner::{INDEX, RENDER, RuleSpec, create_ruleset, ruleset_id};
 use crate::harness::upload::{UploadRequest, upload};
 use crate::harness::{
-    JobsStandIn, World, error_code, manager_passport, ok, passport, service_passport,
+    JobsStandIn, RULESET_DELTAS, World, catalogue_subscription, error_code, manager_passport,
+    next_delta, ok, passport, service_passport,
 };
 
 const BYTES: &[u8] = b"ruled bytes";
@@ -331,6 +332,76 @@ async fn a_rule_cannot_be_saved_on_a_host_whose_catalogue_was_never_scanned() {
     )
     .await;
     assert_eq!(error_code(&refused), "CATALOGUE_NOT_WATCHED");
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_rule_table_is_read_live_and_a_save_carries_its_warning_as_the_cause() {
+    let world = World::start("pod-rules-live").await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    jobs.declare_runner_type(RENDER, RunnerTypeLifecycle::Active)
+        .await;
+    world.await_known_runner_type(RENDER, Some("active")).await;
+    let mut live =
+        catalogue_subscription(&world, &manager, RULESET_DELTAS, "workspaceRulesetsChanged").await;
+
+    let saved = create_ruleset(
+        &world,
+        &manager,
+        RuleSpec {
+            name: "Live",
+            trigger: "UPLOAD",
+            media_types: &["*"],
+            steps: &[
+                (RENDER, serde_json::json!({})),
+                ("ghost", serde_json::json!({})),
+            ],
+            is_default: true,
+        },
+    )
+    .await;
+    let id = ruleset_id(&saved);
+    let upsert = next_delta(&mut live, "workspaceRulesetsChanged", |node| {
+        node["__typename"] == "DriveUpsert" && node["view"]["id"] == id.to_string()
+    })
+    .await;
+    assert!(
+        upsert["cause"].is_null()
+            || upsert["cause"]["unknown_runner_types"] == serde_json::json!(["ghost"]),
+        "a rule entering the window arrives by repopulation, a later save carries its warning: {upsert}"
+    );
+    ok(&world
+        .gql(
+            &manager,
+            "mutation($id:UUID!,$s:[RulesetStepInput!]){workspaceUpdateRuleset(id:$id,steps:$s){id}}",
+            serde_json::json!({ "id": id, "s": [{ "runnerType": RENDER }] }),
+        )
+        .await);
+    let updated = next_delta(&mut live, "workspaceRulesetsChanged", |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "Saved"
+    })
+    .await;
+    assert_eq!(
+        updated["cause"]["unknown_runner_types"],
+        serde_json::json!([]),
+        "the warning list is the save's cause"
+    );
+    assert_eq!(updated["view"]["steps"].as_array().unwrap().len(), 1);
+    ok(&world
+        .gql(
+            &manager,
+            "mutation($id:UUID!){workspaceDeleteRuleset(id:$id){success}}",
+            serde_json::json!({ "id": id }),
+        )
+        .await);
+    let removed = next_delta(&mut live, "workspaceRulesetsChanged", |node| {
+        node["__typename"] == "DriveRemove"
+    })
+    .await;
+    assert_eq!(removed["projector"], "drive_rulesets");
+    assert_eq!(removed["key"], id.to_string());
 
     world.cleanup().await;
 }

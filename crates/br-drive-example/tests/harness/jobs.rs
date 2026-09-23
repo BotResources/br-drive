@@ -34,6 +34,8 @@ const EVENT_VERSION: u8 = 1;
 pub struct JobsStandIn {
     js: async_nats::jetstream::Context,
     commands: tokio::sync::Mutex<async_nats::jetstream::consumer::pull::Stream>,
+    /// Commands read while waiting for another one, kept for a later wait.
+    skipped: tokio::sync::Mutex<std::collections::VecDeque<(String, Value)>>,
     actor: Uuid,
 }
 
@@ -71,6 +73,7 @@ impl JobsStandIn {
         Self {
             js,
             commands: tokio::sync::Mutex::new(commands),
+            skipped: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
             actor: Uuid::now_v7(),
         }
     }
@@ -252,7 +255,16 @@ impl JobsStandIn {
         .await;
     }
 
+    /// The next command addressed to jobs: one skipped by an earlier wait
+    /// first, then the stream.
     pub async fn next_command(&self, within: Duration) -> Option<(String, Value)> {
+        if let Some(skipped) = self.skipped.lock().await.pop_front() {
+            return Some(skipped);
+        }
+        self.read_command(within).await
+    }
+
+    async fn read_command(&self, within: Duration) -> Option<(String, Value)> {
         let mut messages = self.commands.lock().await;
         let next = tokio::time::timeout(within, messages.next()).await.ok()??;
         let message = next.expect("read a command");
@@ -268,19 +280,33 @@ impl JobsStandIn {
         subject: &str,
         matches: impl Fn(&T) -> bool,
     ) -> T {
+        let wanted = |found: &str, payload: &Value| -> Option<T> {
+            if found != subject {
+                return None;
+            }
+            let decoded: T = serde_json::from_value(payload.clone()).expect("the command decodes");
+            matches(&decoded).then_some(decoded)
+        };
+        {
+            let mut skipped = self.skipped.lock().await;
+            if let Some(index) = skipped
+                .iter()
+                .position(|(found, payload)| wanted(found, payload).is_some())
+            {
+                let (found, payload) = skipped.remove(index).expect("the index is in range");
+                return wanted(&found, &payload).expect("checked by position");
+            }
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let Some((found, payload)) = self.next_command(remaining).await else {
+            let Some((found, payload)) = self.read_command(remaining).await else {
                 panic!("no {subject} command reached jobs in time");
             };
-            if found != subject {
-                continue;
-            }
-            let decoded: T = serde_json::from_value(payload).expect("the command decodes");
-            if matches(&decoded) {
+            if let Some(decoded) = wanted(&found, &payload) {
                 return decoded;
             }
+            self.skipped.lock().await.push_back((found, payload));
         }
     }
 
