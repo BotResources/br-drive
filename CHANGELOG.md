@@ -7,6 +7,12 @@ single git tag `v{version}` releases the set. Format follows
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.1.0 — 2026-09-23
+
+The first release: milestones 1 to 5 on engine `v0.3.0`.
+
 ### Added
 
 - Repository skeleton on the `br-service-engine` template, pinned on engine
@@ -155,7 +161,7 @@ single git tag `v{version}` releases the set. Format follows
   type; failure and rejection with reason codes, reprocess wiping the
   rendition; foreign cancel vs own cancel; a rule edited or deleted mid-chain,
   non-retroactivity; every fact replayed idempotent; the processing guards.
-  The workspace MSRV follows `contract-jobs` 0.5.0: Rust 1.94. Review round:
+  Review round:
   every durable the library binds is namespaced by `DriveHost::SERVICE`
   (`{service}-drive-…`, proven by a two-host scenario on one broker); the
   config root names follow the engine's camel-casing of the prefix; `Process`
@@ -167,6 +173,28 @@ single git tag `v{version}` releases the set. Format follows
   `completed` fact that arrives first waits for the report; a step cursor
   moves forward by index or by a newer start instant; a malformed snapshot
   is read as absent rather than breaking the file's view.
+- Labels and erase (milestone 5). `drive.label` (`name` ≤ 100 characters,
+  trimmed, unique per host case-insensitive; `color` `#rrggbb` lowercase hex;
+  `description` default `''`) and `drive.file_label`; roots `<p>Labels`,
+  `<p>CreateLabel` / `<p>UpdateLabel` / `<p>DeleteLabel` (gate `ManageLabels`)
+  and `<p>SetFileLabels(fileId, labelIds)` (gate `SetFileLabels { file }`,
+  target set, idempotent); `DriveFile.labelIds` computed by label name and the
+  `setLabels` affordance; deleting a label detaches its files
+  (`LabelsChanged { detached }`); labels travel with a file across the host's
+  drives; `<p>LabelsChanged` and `<p>RulesetsChanged` subscriptions (the
+  union is `DriveView = DriveFile | DrivePage | DriveLabel | DriveRuleset`,
+  a rule save carries `Saved { unknown_runner_types }` as its cause). The
+  engine's `Erasable` for the library's rows, driven by the engine's erase
+  pipeline in `DriveHost::erase_mode` — `Anonymise` rewrites every id the
+  person left to `REDACTED_PERSON`, `Delete` removes the person's files
+  (cascade, objects purged) and anonymises the rest;
+  a replayed erase is absorbed. Review follow-ups: `ruleset` and `processing`
+  split by responsibility, the last data-path `expect` removed, the catalogue
+  stamps taken from the database clock, `select_ruleset` reads one trigger's
+  defaults. Five more scenarios (58 in all): label catalogue live, a file's
+  label set, anonymise, delete on the second host, the live rule table.
+- The workspace MSRV is Rust 1.94: the floor of the pinned `contract-jobs`
+  0.5.0, ahead of the engine's own 1.89.
 - Reason codes: `DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`,
   `FILE_PROTECTED`, `FILE_NOT_PENDING`, `FILE_NOT_READY`, `FILE_TOO_LARGE`,
   `UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,
@@ -177,7 +205,8 @@ single git tag `v{version}` releases the set. Format follows
   `IMAGE_UPLOAD_PENDING`, `RULESET_NOT_FOUND`, `RULESET_NAME_TAKEN`,
   `INVALID_RULESET`, `DEFAULT_ALREADY_SET`, `RULESET_MISMATCH`,
   `NO_RULESET_MATCHES`, `RUNNER_TYPE_UNAVAILABLE`, `FILE_PROCESSING`,
-  `CATALOGUE_NOT_WATCHED`, plus
+  `CATALOGUE_NOT_WATCHED`, `LABEL_NOT_FOUND`, `LABEL_NAME_TAKEN`,
+  `INVALID_LABEL`, plus
   the engine's `KEY_REUSED` and the host's own codes through the gate and the
   hooks.
 - Example host: `workspaceCreate` / `workspaceDelete` wrap `create_drive` /
