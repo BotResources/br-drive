@@ -409,12 +409,15 @@ dependencies = [
  "async-graphql",
  "br-core-integration",
  "chrono",
+ "contract-jobs",
  "futures-util",
  "serde",
  "serde_json",
  "service-engine",
  "sqlx",
  "thiserror",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -429,6 +432,7 @@ dependencies = [
  "br-core-integration",
  "br-drive",
  "chrono",
+ "contract-jobs",
  "futures-util",
  "reqwest",
  "rusty-s3",
@@ -594,6 +598,18 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "contract-jobs"
+version = "0.5.0"
+source = "git+https://github.com/BotResources/svc-jobs?tag=contract-jobs%2Fv0.5.0#c2d408e6abe687ca09df28083de1117975bdb27d"
+dependencies = [
+ "br-core-integration",
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
 
 [[package]]
 name = "core-foundation"

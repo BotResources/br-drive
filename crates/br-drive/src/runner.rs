@@ -92,7 +92,10 @@ impl<H: DriveHost> Projector for RunnerSources<H> {
             Some(file_id) => BTreeSet::from([file_id]),
             None => {
                 let mut conn = cx.pool().acquire().await.map_err(EngineError::from)?;
-                store::all_ids(&mut conn).await?.into_iter().collect()
+                store::ids_with_live_job(&mut conn)
+                    .await?
+                    .into_iter()
+                    .collect()
             }
         };
         Ok(Population::Keys(keys))
@@ -257,8 +260,6 @@ impl MutationInput for RunnerReport {
     const NAME: &'static str = "drive_runner_report";
 }
 
-pub(crate) fn report_done<H: DriveHost>(_file: &FileRow<H>, _job_id: Uuid) {}
-
 fn validate(input: &RunnerReport) -> Result<(), DriveFault> {
     if input.origin == PageOrigin::Edited {
         return Err(DriveFault::Refused(codes::INVALID_PAGE_ORIGIN));
@@ -370,7 +371,7 @@ pub fn runner_report<'m, H: DriveHost>(
             }
         }
         if input.done {
-            report_done::<H>(&file, input.job_id);
+            crate::processing::finish_active_job(cx, &file)?;
         }
         Ok(())
     })

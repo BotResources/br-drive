@@ -39,6 +39,7 @@ pub(crate) async fn delete_rows<H: DriveHost>(
     let images = store::image_refs_of_files(cx.connection(), &ids).await?;
     store::delete_many(cx.connection(), &ids).await?;
     for file in files {
+        crate::processing::cancel_active_job(cx, file)?;
         for reference in file.blob_refs() {
             cx.release_blob(reference)?;
         }

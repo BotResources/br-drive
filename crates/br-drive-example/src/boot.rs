@@ -20,6 +20,8 @@ pub struct Service {
     readiness: ReadinessHandle,
     stop: Arc<Notify>,
     handle: JoinHandle<Result<(), EngineError>>,
+    #[cfg(feature = "drive")]
+    catalogue: br_drive::CatalogueWatch,
 }
 
 impl Service {
@@ -46,6 +48,8 @@ impl Service {
     }
 
     pub async fn shutdown(self) {
+        #[cfg(feature = "drive")]
+        self.catalogue.stop().await;
         self.stop.notify_one();
         let _ = self.handle.await;
     }
@@ -86,10 +90,19 @@ pub async fn boot(
 ) -> Result<Service, EngineError> {
     let http_addr = config.http_addr;
     let readiness = ReadinessHandle::not_ready("booting");
-    let (engine, app) = assemble(config, pool, nats, readiness.clone(), options.settings).await?;
+    let (engine, app) = assemble(
+        config,
+        pool.clone(),
+        nats,
+        readiness.clone(),
+        options.settings,
+    )
+    .await?;
     let stop = engine.shutdown_handle();
     let settle = engine.settle_handle();
     let blob_reader = engine.blob_reader();
+    #[cfg(feature = "drive")]
+    let catalogue = br_drive::watch_runner_types(engine.nats().clone(), pool);
 
     let listener = TcpListener::bind(http_addr)
         .await
@@ -130,5 +143,7 @@ pub async fn boot(
         readiness,
         stop,
         handle,
+        #[cfg(feature = "drive")]
+        catalogue,
     })
 }

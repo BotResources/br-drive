@@ -27,6 +27,9 @@ type DriveFile {
 	pageCount: Int
 	estimatedTokens: Int
 	images: [DriveImage!]!
+	rulesetId: UUID
+	steps: [DriveStep!]
+	progress: DriveProgress
 	createdBy: UUID!
 	createdAt: DateTime!
 	updatedAt: DateTime!
@@ -42,7 +45,12 @@ type DriveImage {
 
 type DriveMutation {
 	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
-	workspaceCommitUpload(fileId: UUID!): MutationAck!
+	workspaceCommitUpload(fileId: UUID!, rulesetId: UUID): MutationAck!
+	workspaceProcess(fileId: UUID!, rulesetId: UUID): MutationAck!
+	workspaceRegeneratePage(fileId: UUID!, number: Int!, comment: String, rulesetId: UUID): MutationAck!
+	workspaceCreateRuleset(id: UUID!, name: String!, trigger: Trigger!, mediaTypes: [String!]!, steps: [RulesetStepInput!]!, isDefault: Boolean! = false): RulesetSaved!
+	workspaceUpdateRuleset(id: UUID!, name: String, mediaTypes: [String!], steps: [RulesetStepInput!], isDefault: Boolean): RulesetSaved!
+	workspaceDeleteRuleset(id: UUID!): MutationAck!
 	workspaceUpdateFile(fileId: UUID!, name: String, path: String, driveId: UUID): MutationAck!
 	workspaceDeleteFile(fileId: UUID!): MutationAck!
 	workspaceEditPage(fileId: UUID!, number: Int!, markdown: String!): MutationAck!
@@ -62,10 +70,21 @@ type DrivePage {
 	affordances: Affordances!
 }
 
+type DriveProgress {
+	stepIndex: Int!
+	stepCount: Int!
+	runnerType: String!
+	plan: [String!]!
+	currentIndex: Int
+	currentLabel: String
+	at: DateTime
+}
+
 type DriveQuery {
 	workspaceFile(fileId: UUID!): DriveFile
 	workspaceDriveFiles(driveId: UUID!): [DriveFile!]!
 	workspacePages(fileId: UUID!): [DrivePage!]!
+	workspaceRulesets: [DriveRuleset!]!
 	workspaceFileAccess(fileId: UUID!, name: String): String
 	workspaceRunnerContext(fileId: UUID!, jobId: UUID!): RunnerContext!
 }
@@ -80,6 +99,23 @@ type DriveRemove {
 type DriveReset {
 	revision: Int!
 	views: [DriveView!]!
+}
+
+type DriveRuleset {
+	id: UUID!
+	name: String!
+	trigger: Trigger!
+	mediaTypes: [String!]!
+	steps: [DriveStep!]!
+	isDefault: Boolean!
+	createdBy: UUID!
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+type DriveStep {
+	runnerType: String!
+	options: JSON!
 }
 
 type DriveSubscription {
@@ -135,6 +171,16 @@ input ReportedPageInput {
 	markdown: String!
 }
 
+type RulesetSaved {
+	id: UUID!
+	unknownRunnerTypes: [String!]!
+}
+
+input RulesetStepInput {
+	runnerType: String!
+	options: JSON
+}
+
 type RunnerContext {
 	fileId: UUID!
 	mediaType: String!
@@ -151,6 +197,12 @@ type RunnerPage {
 	markdown: String!
 	origin: PageOrigin!
 	updatedAt: DateTime!
+}
+
+enum Trigger {
+	UPLOAD
+	REPROCESS
+	REGENERATE_PAGE
 }
 
 """

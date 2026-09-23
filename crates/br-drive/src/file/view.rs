@@ -21,6 +21,7 @@ use uuid::Uuid;
 use super::aggregate::{File, FileRow, ProcessingState, drive_memberships};
 use super::store::{self, FILE_COLUMNS, row_to_file};
 use crate::host::{DRIVE_DIM, DriveHost};
+use crate::ruleset::DriveStep;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -187,6 +188,17 @@ pub struct DriveImage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject)]
+pub struct DriveProgress {
+    pub step_index: i32,
+    pub step_count: i32,
+    pub runner_type: String,
+    pub plan: Vec<String>,
+    pub current_index: Option<i32>,
+    pub current_label: Option<String>,
+    pub at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject)]
 pub struct DriveFile {
     pub id: Uuid,
     pub drive_id: Uuid,
@@ -203,6 +215,9 @@ pub struct DriveFile {
     pub page_count: Option<i32>,
     pub estimated_tokens: Option<i64>,
     pub images: Vec<DriveImage>,
+    pub ruleset_id: Option<Uuid>,
+    pub steps: Option<Vec<DriveStep>>,
+    pub progress: Option<DriveProgress>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -317,6 +332,25 @@ impl<H: DriveHost> Projector for DriveFiles<H> {
                     source: image.blob_ref,
                 })
                 .collect(),
+            ruleset_id: row.ruleset_id,
+            steps: row
+                .steps
+                .as_ref()
+                .map(|steps| steps.iter().map(DriveStep::from).collect()),
+            progress: match (row.processing_state, row.step_index, row.step_count) {
+                (ProcessingState::Processing, Some(step_index), Some(step_count)) => {
+                    Some(DriveProgress {
+                        step_index,
+                        step_count,
+                        runner_type: row.step_runner_type.clone().unwrap_or_default(),
+                        plan: row.plan.clone().unwrap_or_default(),
+                        current_index: row.progress_index,
+                        current_label: row.progress_label.clone(),
+                        at: row.progress_at,
+                    })
+                }
+                _ => None,
+            },
             created_by: row.created_by,
             created_at: row.created_at,
             updated_at: row.updated_at,

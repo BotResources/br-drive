@@ -14,6 +14,8 @@ use crate::fault::codes;
 use crate::host::{DRIVE_DIM, DriveHost, DriveRequest};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
+use crate::processing::Trigger;
+use crate::ruleset::RulesetStep;
 
 pub struct File;
 
@@ -102,6 +104,10 @@ pub enum FileCause {
     ImageAvailable { name: String },
     ImagesDropped { names: Vec<String> },
     ReportStored { job_id: Uuid, done: bool },
+    ProcessingStarted { job_id: Uuid, step: i32 },
+    ProgressChanged,
+    ProcessingFinished,
+    ProcessingFailed { reason: String },
     Deleted,
     FolderDeleted,
     DriveDeleted,
@@ -123,6 +129,17 @@ pub struct FileRow<H> {
     pub summary: Option<String>,
     pub page_count: Option<i32>,
     pub estimated_tokens: Option<i64>,
+    pub ruleset_id: Option<Uuid>,
+    pub steps: Option<Vec<RulesetStep>>,
+    pub step_index: Option<i32>,
+    pub step_count: Option<i32>,
+    pub step_runner_type: Option<String>,
+    pub job_id: Option<Uuid>,
+    pub plan: Option<Vec<String>>,
+    pub progress_index: Option<i32>,
+    pub progress_label: Option<String>,
+    pub progress_at: Option<DateTime<Utc>>,
+    pub triggered_by: Option<Trigger>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -147,6 +164,17 @@ impl<H> Clone for FileRow<H> {
             summary: self.summary.clone(),
             page_count: self.page_count,
             estimated_tokens: self.estimated_tokens,
+            ruleset_id: self.ruleset_id,
+            steps: self.steps.clone(),
+            step_index: self.step_index,
+            step_count: self.step_count,
+            step_runner_type: self.step_runner_type.clone(),
+            job_id: self.job_id,
+            plan: self.plan.clone(),
+            progress_index: self.progress_index,
+            progress_label: self.progress_label.clone(),
+            progress_at: self.progress_at,
+            triggered_by: self.triggered_by.clone(),
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -179,10 +207,26 @@ fn unprotected<H: DriveHost>(
 }
 
 fn ready<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
-    if file.processing_state != ProcessingState::Ready {
+    match file.processing_state {
+        ProcessingState::Ready => principal.drive_gate(&request),
+        ProcessingState::Processing => Gate::blocked(codes::FILE_PROCESSING),
+        ProcessingState::Pending | ProcessingState::Failed => Gate::blocked(codes::FILE_NOT_READY),
+    }
+}
+
+fn landed<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
+    if file.processing_state == ProcessingState::Pending {
         return Gate::blocked(codes::FILE_NOT_READY);
     }
     principal.drive_gate(&request)
+}
+
+fn settled<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
+    match file.processing_state {
+        ProcessingState::Ready | ProcessingState::Failed => principal.drive_gate(&request),
+        ProcessingState::Processing => Gate::blocked(codes::FILE_PROCESSING),
+        ProcessingState::Pending => Gate::blocked(codes::FILE_NOT_READY),
+    }
 }
 
 service_engine::gated! {
@@ -212,10 +256,13 @@ service_engine::gated! {
         )
     }
     "download" => fn download_gate(this, principal) {
-        ready(this, principal, DriveRequest::ReadFile { file: this })
+        landed(this, principal, DriveRequest::ReadFile { file: this })
     }
     "editPage" => fn edit_page_gate(this, principal) {
         ready(this, principal, DriveRequest::EditPage { file: this })
+    }
+    "process" => fn process_gate(this, principal) {
+        settled(this, principal, DriveRequest::Process { file: this })
     }
 }
 
@@ -253,8 +300,16 @@ impl<H: DriveHost> FileRow<H> {
         principal.drive_gate(&DriveRequest::ReadFile { file: self })
     }
 
+    pub fn regenerate_page_gate(&self, principal: &H, number: i32) -> Gate {
+        ready(
+            self,
+            principal,
+            DriveRequest::RegeneratePage { file: self, number },
+        )
+    }
+
     pub fn require_active_job(&self, job_id: Uuid) -> Result<(), Reason> {
-        if H::active_job(self) == Some(job_id) {
+        if self.processing_state == ProcessingState::Processing && self.job_id == Some(job_id) {
             Ok(())
         } else {
             Err(codes::JOB_NOT_ACTIVE)

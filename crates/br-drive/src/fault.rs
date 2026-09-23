@@ -33,6 +33,14 @@ pub mod codes {
     pub const BATCH_TOO_LARGE: Reason = Reason::new("BATCH_TOO_LARGE");
     pub const IMAGE_UPLOAD_PENDING: Reason = Reason::new("IMAGE_UPLOAD_PENDING");
     pub const KEY_REUSED: Reason = Reason::new("KEY_REUSED");
+    pub const RULESET_NOT_FOUND: Reason = Reason::new("RULESET_NOT_FOUND");
+    pub const RULESET_NAME_TAKEN: Reason = Reason::new("RULESET_NAME_TAKEN");
+    pub const INVALID_RULESET: Reason = Reason::new("INVALID_RULESET");
+    pub const DEFAULT_ALREADY_SET: Reason = Reason::new("DEFAULT_ALREADY_SET");
+    pub const RULESET_MISMATCH: Reason = Reason::new("RULESET_MISMATCH");
+    pub const NO_RULESET_MATCHES: Reason = Reason::new("NO_RULESET_MATCHES");
+    pub const RUNNER_TYPE_UNAVAILABLE: Reason = Reason::new("RUNNER_TYPE_UNAVAILABLE");
+    pub const FILE_PROCESSING: Reason = Reason::new("FILE_PROCESSING");
 }
 
 #[derive(Debug, thiserror::Error)]

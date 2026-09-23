@@ -41,6 +41,17 @@ macro_rules! drive_slice {
                         .await
                 }
 
+                async fn [<$prefix _rulesets>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                ) -> ::async_graphql::Result<::std::vec::Vec<$crate::DriveRuleset>> {
+                    ::service_engine::Query::<$p>::new(ctx)?
+                        .fetch_view_window::<$crate::DriveRulesets<$p>>(
+                            &::core::default::Default::default(),
+                        )
+                        .await
+                }
+
                 async fn [<$prefix _file_access>](
                     &self,
                     ctx: &::async_graphql::Context<'_>,
@@ -165,10 +176,111 @@ macro_rules! drive_slice {
                     &self,
                     ctx: &::async_graphql::Context<'_>,
                     file_id: ::uuid::Uuid,
+                    ruleset_id: ::core::option::Option<::uuid::Uuid>,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
                     ::service_engine::ack::<$p, $crate::CommitUpload>(
                         ctx,
-                        $crate::CommitUpload { file_id },
+                        $crate::CommitUpload { file_id, ruleset_id },
+                    )
+                    .await
+                }
+
+                async fn [<$prefix _process>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    ruleset_id: ::core::option::Option<::uuid::Uuid>,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::Process>(
+                        ctx,
+                        $crate::Process { file_id, ruleset_id },
+                    )
+                    .await
+                }
+
+                async fn [<$prefix _regenerate_page>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    number: i32,
+                    comment: ::core::option::Option<::std::string::String>,
+                    ruleset_id: ::core::option::Option<::uuid::Uuid>,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::RegeneratePage>(
+                        ctx,
+                        $crate::RegeneratePage {
+                            file_id,
+                            number,
+                            comment,
+                            ruleset_id,
+                        },
+                    )
+                    .await
+                }
+
+                #[allow(clippy::too_many_arguments)]
+                async fn [<$prefix _create_ruleset>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    id: ::uuid::Uuid,
+                    name: ::std::string::String,
+                    trigger: $crate::Trigger,
+                    media_types: ::std::vec::Vec<::std::string::String>,
+                    steps: ::std::vec::Vec<$crate::RulesetStepInput>,
+                    #[graphql(default = false)] is_default: bool,
+                ) -> ::async_graphql::Result<$crate::RulesetSaved> {
+                    ::core::result::Result::Ok(
+                        ::service_engine::execute::<$p, $crate::CreateRuleset>(
+                            ctx,
+                            $crate::CreateRuleset {
+                                id,
+                                name,
+                                trigger,
+                                media_types,
+                                steps: steps.into_iter().map(::core::convert::Into::into).collect(),
+                                is_default,
+                            },
+                        )
+                        .await?
+                        .into_inner(),
+                    )
+                }
+
+                async fn [<$prefix _update_ruleset>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    id: ::uuid::Uuid,
+                    name: ::core::option::Option<::std::string::String>,
+                    media_types: ::core::option::Option<::std::vec::Vec<::std::string::String>>,
+                    steps: ::core::option::Option<::std::vec::Vec<$crate::RulesetStepInput>>,
+                    is_default: ::core::option::Option<bool>,
+                ) -> ::async_graphql::Result<$crate::RulesetSaved> {
+                    ::core::result::Result::Ok(
+                        ::service_engine::execute::<$p, $crate::UpdateRuleset>(
+                            ctx,
+                            $crate::UpdateRuleset {
+                                id,
+                                name,
+                                media_types,
+                                steps: steps.map(|steps| {
+                                    steps.into_iter().map(::core::convert::Into::into).collect()
+                                }),
+                                is_default,
+                            },
+                        )
+                        .await?
+                        .into_inner(),
+                    )
+                }
+
+                async fn [<$prefix _delete_ruleset>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    id: ::uuid::Uuid,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::DeleteRuleset>(
+                        ctx,
+                        $crate::DeleteRuleset { id },
                     )
                     .await
                 }
@@ -365,7 +477,7 @@ macro_rules! drive_slice {
             pub fn register(
                 engine: &mut ::service_engine::Engine<$p>,
             ) -> ::core::result::Result<(), ::service_engine::error::EngineError> {
-                $crate::register::<$p>(engine)?;
+                $crate::register::<$p>(engine, ::core::stringify!($prefix))?;
                 engine.register_schema_slice(
                     ::service_engine::graphql::SliceFragment::derive::<
                         DriveQuery,

@@ -66,6 +66,12 @@ impl AppPrincipal {
         self.passport.service_account_id().is_some()
     }
 
+    pub fn holds_scope(&self, scope: &str) -> bool {
+        self.passport
+            .claim::<Vec<String>>(br_drive::SCOPES_CLAIM)
+            .is_some_and(|scopes| scopes.iter().any(|held| held == scope))
+    }
+
     pub fn facts(&self) -> &PrincipalFacts {
         &self.facts
     }
