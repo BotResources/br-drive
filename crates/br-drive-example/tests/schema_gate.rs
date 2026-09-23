@@ -19,12 +19,11 @@ fn fragments() -> Vec<SliceFragment> {
 
     #[cfg(feature = "drive")]
     {
-        use async_graphql::{EmptyMutation, EmptySubscription};
-        use br_drive_example::slices::drive::DriveQuery;
+        use br_drive_example::slices::drive::{DriveMutation, DriveQuery, DriveSubscription};
         fragments.push(SliceFragment::derive::<
             DriveQuery,
-            EmptyMutation,
-            EmptySubscription,
+            DriveMutation,
+            DriveSubscription,
         >("drive"));
     }
 

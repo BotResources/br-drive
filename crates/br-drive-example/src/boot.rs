@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::kernel::AppPrincipal;
+use crate::kernel::{AppPrincipal, HostSettings};
 
 pub struct Service {
     pub base_url: String,
@@ -53,11 +53,15 @@ impl Service {
 
 pub struct BootOptions {
     pub await_ready: bool,
+    pub settings: HostSettings,
 }
 
 impl Default for BootOptions {
     fn default() -> Self {
-        Self { await_ready: true }
+        Self {
+            await_ready: true,
+            settings: HostSettings::default(),
+        }
     }
 }
 
@@ -66,9 +70,10 @@ pub async fn assemble(
     pool: PgPool,
     nats: Nats,
     readiness: ReadinessHandle,
+    settings: HostSettings,
 ) -> Result<(Engine<AppPrincipal>, axum::Router), EngineError> {
     let mut engine = Engine::<AppPrincipal>::boot(config, pool, nats, readiness.clone()).await?;
-    crate::register::all(&mut engine)?;
+    crate::register::all_with(Arc::new(settings))(&mut engine)?;
     let app = crate::graphql::build(&mut engine, readiness);
     Ok((engine, app))
 }
@@ -81,7 +86,7 @@ pub async fn boot(
 ) -> Result<Service, EngineError> {
     let http_addr = config.http_addr;
     let readiness = ReadinessHandle::not_ready("booting");
-    let (engine, app) = assemble(config, pool, nats, readiness.clone()).await?;
+    let (engine, app) = assemble(config, pool, nats, readiness.clone(), options.settings).await?;
     let stop = engine.shutdown_handle();
     let settle = engine.settle_handle();
     let blob_reader = engine.blob_reader();

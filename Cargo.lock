@@ -407,8 +407,15 @@ name = "br-drive"
 version = "0.1.0"
 dependencies = [
  "async-graphql",
+ "br-core-integration",
+ "chrono",
+ "futures-util",
+ "serde",
+ "serde_json",
  "service-engine",
  "sqlx",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

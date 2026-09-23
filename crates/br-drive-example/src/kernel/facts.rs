@@ -1,10 +1,28 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use uuid::Uuid;
 
 pub struct OwnedWorkspaces(pub Vec<Uuid>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostSettings {
+    pub upload_window: Duration,
+}
+
+impl HostSettings {
+    pub const DEFAULT_UPLOAD_WINDOW: Duration = Duration::from_secs(15 * 60);
+}
+
+impl Default for HostSettings {
+    fn default() -> Self {
+        Self {
+            upload_window: Self::DEFAULT_UPLOAD_WINDOW,
+        }
+    }
+}
 
 #[derive(Default, Clone)]
 pub struct PrincipalFacts {

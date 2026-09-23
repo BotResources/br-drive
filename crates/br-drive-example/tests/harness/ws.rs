@@ -12,6 +12,15 @@ pub struct Subscription {
 
 impl Subscription {
     pub async fn open(ws_url: &str, passport: &str, query: &str) -> Subscription {
+        Self::open_with(ws_url, passport, query, serde_json::json!({})).await
+    }
+
+    pub async fn open_with(
+        ws_url: &str,
+        passport: &str,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Subscription {
         let mut request = ws_url
             .into_client_request()
             .expect("a valid websocket request");
@@ -39,13 +48,35 @@ impl Subscription {
         let subscribe = serde_json::json!({
             "id": "1",
             "type": "subscribe",
-            "payload": { "query": query },
+            "payload": { "query": query, "variables": variables },
         });
         socket
             .send(Message::text(subscribe.to_string()))
             .await
             .expect("send subscribe");
         Subscription { socket }
+    }
+
+    pub async fn expect_silence(&mut self, within: Duration) {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match tokio::time::timeout(remaining, self.socket.next()).await {
+                Err(_) | Ok(None) => return,
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&text).expect("a json websocket frame");
+                    assert_ne!(
+                        frame["type"], "next",
+                        "a delta reached a session that must stay silent: {frame}"
+                    );
+                }
+                Ok(Some(_)) => continue,
+            }
+        }
     }
 
     pub async fn next_payload(&mut self, within: Duration) -> serde_json::Value {
