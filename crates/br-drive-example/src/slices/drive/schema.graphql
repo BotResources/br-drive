@@ -26,7 +26,6 @@ type DriveFile {
 	summary: String
 	pageCount: Int
 	estimatedTokens: Int
-	pages: [DrivePage!]!
 	images: [DriveImage!]!
 	createdBy: UUID!
 	createdAt: DateTime!
@@ -34,13 +33,11 @@ type DriveFile {
 	affordances: Affordances!
 }
 
-union DriveFileUnion = DriveFile
-
 type DriveImage {
 	name: String!
 	mediaType: String!
 	sizeBytes: ByteCount!
-	page: Int
+	page: Int!
 }
 
 type DriveMutation {
@@ -56,18 +53,21 @@ type DriveMutation {
 }
 
 type DrivePage {
+	fileId: UUID!
 	number: Int!
 	markdown: String!
 	origin: PageOrigin!
 	updatedBy: UUID!
 	updatedAt: DateTime!
+	affordances: Affordances!
 }
 
 type DriveQuery {
 	workspaceFile(fileId: UUID!): DriveFile
 	workspaceDriveFiles(driveId: UUID!): [DriveFile!]!
+	workspacePages(fileId: UUID!): [DrivePage!]!
 	workspaceFileAccess(fileId: UUID!, name: String): String
-	workspaceRunnerContext(fileId: UUID!): RunnerContext!
+	workspaceRunnerContext(fileId: UUID!, jobId: UUID!): RunnerContext!
 }
 
 type DriveRemove {
@@ -79,18 +79,21 @@ type DriveRemove {
 
 type DriveReset {
 	revision: Int!
-	views: [DriveFileUnion!]!
+	views: [DriveView!]!
 }
 
 type DriveSubscription {
 	workspaceDriveChanged(driveId: UUID!): DriveDelta!
+	workspaceFilePages(fileId: UUID!): DriveDelta!
 }
 
 type DriveUpsert {
 	revision: Int!
-	view: DriveFileUnion!
+	view: DriveView!
 	cause: JSON
 }
+
+union DriveView = DriveFile | DrivePage
 
 """
 A scalar that can represent any JSON value.
@@ -137,9 +140,17 @@ type RunnerContext {
 	mediaType: String!
 	name: String!
 	pageCount: Int
-	pages: [DrivePage!]!
+	summary: String
+	pages: [RunnerPage!]!
 	images: [String!]!
 	sourceUrl: String
+}
+
+type RunnerPage {
+	number: Int!
+	markdown: String!
+	origin: PageOrigin!
+	updatedAt: DateTime!
 }
 
 """

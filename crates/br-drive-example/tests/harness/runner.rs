@@ -17,15 +17,34 @@ pub async fn assign_job(world: &World, owner: &str, file_id: Uuid) -> Uuid {
     job_id
 }
 
-pub async fn context(world: &World, runner: &str, file_id: Uuid) -> serde_json::Value {
+pub async fn context(
+    world: &World,
+    runner: &str,
+    file_id: Uuid,
+    job_id: Uuid,
+) -> serde_json::Value {
     world
         .gql(
             runner,
-            "query($f:UUID!){workspaceRunnerContext(fileId:$f){fileId mediaType name pageCount \
-             sourceUrl images pages{number markdown origin}}}",
-            serde_json::json!({ "f": file_id }),
+            "query($f:UUID!,$j:UUID!){workspaceRunnerContext(fileId:$f,jobId:$j){fileId mediaType \
+             name pageCount summary sourceUrl images pages{number markdown origin}}}",
+            serde_json::json!({ "f": file_id, "j": job_id }),
         )
         .await
+}
+
+pub async fn upload_image(
+    world: &World,
+    runner: &str,
+    file_id: Uuid,
+    job_id: Uuid,
+    name: &str,
+    bytes: &[u8],
+) -> String {
+    let ticket = image_ticket(&request_image(world, runner, file_id, job_id, name, bytes).await);
+    let status = super::upload::post_bytes(world, &ticket, bytes, name).await;
+    assert!((200..300).contains(&status), "{name} lands: {status}");
+    ticket.fields["key"].as_str().unwrap().to_string()
 }
 
 pub async fn request_image(

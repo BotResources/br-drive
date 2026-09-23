@@ -3,11 +3,12 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::harness::runner::{
-    RUNNER_SCOPE, Report, assign_job, context, image_ticket, report, request_image,
+    RUNNER_SCOPE, Report, assign_job, context, image_ticket, report, request_image, upload_image,
 };
 use crate::harness::upload::{UploadRequest, post_bytes, upload};
 use crate::harness::{
-    World, drive_subscription, error_code, next_drive_delta, ok, passport, service_passport,
+    World, WorldOptions, drain_with_a_rename, drive_subscription, error_code, next_drive_delta,
+    next_page_delta, ok, pages_subscription, passport, service_passport,
 };
 use crate::poll_until;
 
@@ -34,7 +35,7 @@ async fn the_runner_context_carries_a_fresh_presigned_get_on_the_source_and_the_
     let (_, file_id, job_id) = file_with_job(&world, &owner).await;
 
     let context_json = poll_until!(Duration::from_secs(15), {
-        let response = context(&world, &runner, file_id).await;
+        let response = context(&world, &runner, file_id, job_id).await;
         (response.get("errors").is_none())
             .then(|| response["data"]["workspaceRunnerContext"].clone())
     });
@@ -72,7 +73,8 @@ async fn the_runner_context_carries_a_fresh_presigned_get_on_the_source_and_the_
         },
     )
     .await);
-    let again = ok(&context(&world, &runner, file_id).await)["workspaceRunnerContext"].clone();
+    let again =
+        ok(&context(&world, &runner, file_id, job_id).await)["workspaceRunnerContext"].clone();
     let pages = again["pages"].as_array().unwrap();
     assert_eq!(
         pages.len(),
@@ -95,8 +97,37 @@ async fn the_runner_context_carries_a_fresh_presigned_get_on_the_source_and_the_
         "the second call's GET is live: {status}"
     );
 
-    let missing = context(&world, &runner, Uuid::now_v7()).await;
+    let missing = context(&world, &runner, Uuid::now_v7(), job_id).await;
     assert_eq!(error_code(&missing), "FILE_NOT_FOUND");
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_runner_context_says_source_not_available_until_the_reaper_promoted_the_source() {
+    let world = World::start_with(
+        "pod-runner-source-pending",
+        WorldOptions {
+            reaper_interval: Duration::from_secs(600),
+            ..WorldOptions::default()
+        },
+    )
+    .await;
+    let owner = passport(Uuid::now_v7());
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    let (_, file_id, job_id) = file_with_job(&world, &owner).await;
+
+    let pending = context(&world, &runner, file_id, job_id).await;
+    assert_eq!(
+        error_code(&pending),
+        "SOURCE_NOT_AVAILABLE",
+        "a verified source is not downloadable before the engine reaper promotes it"
+    );
+    assert_eq!(
+        world.file(&owner, file_id).await["processingState"],
+        "READY",
+        "the commit itself went through"
+    );
 
     world.cleanup().await;
 }
@@ -110,7 +141,7 @@ async fn the_runner_roots_refuse_a_human_and_a_service_without_the_runner_scope(
 
     for principal in [&owner, &unscoped] {
         assert_eq!(
-            error_code(&context(&world, principal, file_id).await),
+            error_code(&context(&world, principal, file_id, job_id).await),
             "RUNNER_SCOPE_REQUIRED"
         );
         assert_eq!(
@@ -138,12 +169,8 @@ async fn the_runner_roots_refuse_a_human_and_a_service_without_the_runner_scope(
             "RUNNER_SCOPE_REQUIRED"
         );
     }
-    assert_eq!(
-        world.file(&owner, file_id).await["pages"]
-            .as_array()
-            .unwrap()
-            .len(),
-        0,
+    assert!(
+        world.file_pages(&owner, file_id).await.is_empty(),
         "nothing was stored"
     );
 
@@ -153,18 +180,25 @@ async fn the_runner_roots_refuse_a_human_and_a_service_without_the_runner_scope(
         "a runner sees nothing through the drive views"
     );
     assert!(world.file(&runner, file_id).await.is_null());
+    assert!(world.file_pages(&runner, file_id).await.is_empty());
 
     world.cleanup().await;
 }
 
 #[tokio::test]
-async fn a_report_or_an_image_on_a_job_that_is_not_the_files_active_job_is_refused() {
+async fn a_runner_holding_the_scope_but_not_the_files_job_is_refused_every_root() {
     let world = World::start("pod-runner-wrong-job").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
     let (_, file_id, _) = file_with_job(&world, &owner).await;
     let stale = Uuid::now_v7();
 
+    let refused = context(&world, &runner, file_id, stale).await;
+    assert_eq!(
+        error_code(&refused),
+        "JOB_NOT_ACTIVE",
+        "the context root is gated on the file's active job like the two write roots"
+    );
     let refused = report(
         &world,
         &runner,
@@ -181,9 +215,14 @@ async fn a_report_or_an_image_on_a_job_that_is_not_the_files_active_job_is_refus
     assert_eq!(error_code(&refused), "JOB_NOT_ACTIVE");
     let refused = request_image(&world, &runner, file_id, stale, "p001-img01.png", IMAGE).await;
     assert_eq!(error_code(&refused), "JOB_NOT_ACTIVE");
-    let file = world.file(&owner, file_id).await;
-    assert_eq!(file["pages"].as_array().unwrap().len(), 0);
-    assert_eq!(file["images"].as_array().unwrap().len(), 0);
+    assert!(world.file_pages(&owner, file_id).await.is_empty());
+    assert_eq!(
+        world.file(&owner, file_id).await["images"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 
     world.cleanup().await;
 }
@@ -234,6 +273,19 @@ async fn an_image_round_trips_through_a_verified_upload_and_a_wrong_checksum_is_
             .is_null(),
         "an unknown image name resolves to nothing"
     );
+    let outsider = passport(Uuid::now_v7());
+    assert!(
+        ok(&world
+            .image_access(&outsider, file_id, "p002-img01.png")
+            .await)["workspaceFileAccess"]
+            .is_null(),
+        "a non-owner cannot mint a GET on the image"
+    );
+    assert!(
+        ok(&world.image_access(&runner, file_id, "p002-img01.png").await)["workspaceFileAccess"]
+            .is_null(),
+        "the runner reads images through its own context, never through the drive view"
+    );
 
     let wrong = image_ticket(
         &world
@@ -269,6 +321,123 @@ async fn an_image_round_trips_through_a_verified_upload_and_a_wrong_checksum_is_
         let refused = request_image(&world, &runner, file_id, job_id, name, IMAGE).await;
         assert_eq!(error_code(&refused), code, "{name}");
     }
+    let oversized = world
+        .gql(
+            &runner,
+            "mutation($f:UUID!,$j:UUID!,$n:String!,$m:String!,$s:ByteCount!,$h:String!){\
+             workspaceRunnerRequestImageUpload(fileId:$f,jobId:$j,name:$n,mediaType:$m,size:$s,sha256:$h)\
+             {fileId url fields}}",
+            serde_json::json!({
+                "f": file_id, "j": job_id, "n": "p002-img03.png", "m": "image/png",
+                "s": 2u64 << 20,
+                "h": crate::harness::upload::sha256_hex(IMAGE),
+            }),
+        )
+        .await;
+    assert_eq!(
+        error_code(&oversized),
+        "FILE_TOO_LARGE",
+        "the host's IMAGE_MAX_BYTES is enforced at request time"
+    );
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn replacing_an_image_keeps_the_old_object_readable_until_the_new_one_lands() {
+    let world = World::start("pod-runner-image-replace").await;
+    let owner = passport(Uuid::now_v7());
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    let (_, file_id, job_id) = file_with_job(&world, &owner).await;
+    let name = "p001-img01.png";
+
+    upload_image(&world, &runner, file_id, job_id, name, IMAGE).await;
+    let (first, _, _) = world.image_row(file_id, name).await.unwrap();
+    poll_until!(Duration::from_secs(15), {
+        world
+            .image_row(file_id, name)
+            .await
+            .filter(|(_, _, landed)| *landed)
+    });
+
+    let replacement = image_ticket(
+        &request_image(&world, &runner, file_id, job_id, name, b"a different image").await,
+    );
+    let (current, pending, _) = world.image_row(file_id, name).await.unwrap();
+    assert_eq!(current, first, "the landed blob stays current");
+    let second = pending.expect("the replacement is pending on the row");
+    assert_ne!(
+        world.blob_state(first).await.as_deref(),
+        Some("orphaned"),
+        "requesting a replacement releases nothing"
+    );
+    let retried = request_image(&world, &runner, file_id, job_id, name, b"a different image").await;
+    assert_eq!(
+        error_code(&retried),
+        "IMAGE_UPLOAD_PENDING",
+        "a re-request while the replacement is in flight is refused; the first ticket stands"
+    );
+    assert_eq!(
+        world.image_row(file_id, name).await.unwrap().1,
+        Some(second),
+        "one pending blob, not two"
+    );
+
+    let status = post_bytes(&world, &replacement, b"not the pinned bytes", name).await;
+    assert!(
+        !(200..300).contains(&status),
+        "the replacement upload fails: {status}"
+    );
+    let url = ok(&world.image_access(&owner, file_id, name).await)["workspaceFileAccess"]
+        .as_str()
+        .expect("the old image is still readable")
+        .to_string();
+    let got = world
+        .http
+        .get(url)
+        .send()
+        .await
+        .expect("GET the old image")
+        .bytes()
+        .await
+        .expect("read the old image");
+    assert_eq!(got.as_ref(), IMAGE);
+
+    let status = post_bytes(&world, &replacement, b"a different image", name).await;
+    assert!(
+        (200..300).contains(&status),
+        "the replacement lands: {status}"
+    );
+    poll_until!(Duration::from_secs(15), {
+        (world.image_row(file_id, name).await.unwrap().0 == second).then_some(())
+    });
+    assert_eq!(
+        world.blob_state(first).await.as_deref(),
+        Some("orphaned"),
+        "the old blob is released when the replacement lands"
+    );
+    assert!(world.image_row(file_id, name).await.unwrap().1.is_none());
+    let url = poll_until!(Duration::from_secs(15), {
+        let url = ok(&world.image_access(&owner, file_id, name).await)["workspaceFileAccess"]
+            .as_str()
+            .map(str::to_string);
+        match url {
+            Some(url) => {
+                let got = world
+                    .http
+                    .get(&url)
+                    .send()
+                    .await
+                    .expect("GET the replacement")
+                    .bytes()
+                    .await
+                    .expect("read the replacement");
+                (got.as_ref() == b"a different image").then_some(url)
+            }
+            None => None,
+        }
+    });
+    assert!(url.contains("response-content-disposition=inline"));
 
     world.cleanup().await;
 }
@@ -279,7 +448,10 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
     let (drive, file_id, job_id) = file_with_job(&world, &owner).await;
-    let mut sub = drive_subscription(&world, &owner, drive).await;
+    world.await_source_promoted(file_id).await;
+    let mut files = drive_subscription(&world, &owner, drive).await;
+    let mut pages = pages_subscription(&world, &owner, file_id).await;
+    drain_with_a_rename(&world, &owner, &mut files, file_id, "source-settled.txt").await;
 
     let first = Report {
         job_id,
@@ -289,13 +461,16 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
         done: false,
     };
     ok(&report(&world, &runner, file_id, first).await);
-    let stored = next_drive_delta(&mut sub, |node| {
-        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ReportStored"
+    let entered = next_page_delta(&mut pages, |node| {
+        node["__typename"] == "DriveUpsert" && node["view"]["number"] == 2
     })
     .await;
-    assert_eq!(stored["cause"]["pages"], 2);
-    assert_eq!(stored["cause"]["done"], false);
-    assert_eq!(stored["view"]["pages"].as_array().unwrap().len(), 2);
+    assert_eq!(entered["view"]["markdown"], "two");
+    assert_eq!(entered["view"]["affordances"]["editPage"]["allowed"], true);
+    assert!(
+        entered["cause"].is_null(),
+        "a page entering the window is delivered by repopulation, without a cause"
+    );
 
     ok(&report(
         &world,
@@ -310,6 +485,14 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
         },
     )
     .await);
+    let revised = next_page_delta(&mut pages, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "Reported"
+    })
+    .await;
+    assert_eq!(revised["view"]["number"], 2);
+    assert_eq!(revised["view"]["markdown"], "two, revised");
+    assert_eq!(revised["cause"]["job_id"], job_id.to_string());
+    assert_eq!(revised["cause"]["origin"], "RUNNER");
     ok(&report(
         &world,
         &runner,
@@ -323,6 +506,7 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
         },
     )
     .await);
+    files.expect_silence(Duration::from_secs(1)).await;
     ok(&report(
         &world,
         &runner,
@@ -336,23 +520,26 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
         },
     )
     .await);
-    let done = next_drive_delta(&mut sub, |node| {
-        node["__typename"] == "DriveUpsert" && node["cause"]["done"] == true
+    let done = next_drive_delta(&mut files, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ReportStored"
     })
     .await;
+    assert_eq!(done["cause"]["done"], true);
     assert_eq!(done["view"]["summary"], "A three-page document.");
     assert_eq!(done["view"]["pageCount"], 3);
     assert_eq!(done["view"]["estimatedTokens"], 420);
 
-    let file = world.file(&owner, file_id).await;
-    let pages = file["pages"].as_array().unwrap();
-    assert_eq!(pages.len(), 3, "a replayed batch upserts, never duplicates");
-    assert_eq!(pages[1]["markdown"], "two, revised");
-    assert_eq!(pages[2]["number"], 3);
-    assert!(pages.iter().all(|page| page["origin"] == "RUNNER"));
-    assert_eq!(file["affordances"]["editPage"]["allowed"], true);
+    let stored = world.file_pages(&owner, file_id).await;
+    assert_eq!(
+        stored.len(),
+        3,
+        "a replayed batch upserts, never duplicates"
+    );
+    assert_eq!(stored[1]["markdown"], "two, revised");
+    assert_eq!(stored[2]["number"], 3);
+    assert!(stored.iter().all(|page| page["origin"] == "RUNNER"));
 
-    let half = report(
+    let empty = report(
         &world,
         &runner,
         file_id,
@@ -365,7 +552,20 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
         },
     )
     .await;
-    ok(&half);
+    assert_eq!(error_code(&empty), "NOTHING_TO_CHANGE");
+    ok(&report(
+        &world,
+        &runner,
+        file_id,
+        Report {
+            job_id,
+            pages: vec![],
+            origin: None,
+            indexer: None,
+            done: true,
+        },
+    )
+    .await);
     let partial = world
         .gql(
             &runner,
@@ -374,6 +574,20 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
         )
         .await;
     assert_eq!(error_code(&partial), "INDEXER_FIELDS_TOGETHER");
+    let negative = report(
+        &world,
+        &runner,
+        file_id,
+        Report {
+            job_id,
+            pages: vec![],
+            origin: None,
+            indexer: Some(("negative", -1, 10)),
+            done: false,
+        },
+    )
+    .await;
+    assert_eq!(error_code(&negative), "INVALID_INDEXER_VALUE");
     let zero = report(
         &world,
         &runner,
@@ -388,6 +602,20 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
     )
     .await;
     assert_eq!(error_code(&zero), "INVALID_PAGE");
+    let twice = report(
+        &world,
+        &runner,
+        file_id,
+        Report {
+            job_id,
+            pages: vec![(4, "four"), (4, "four again")],
+            origin: None,
+            indexer: None,
+            done: false,
+        },
+    )
+    .await;
+    assert_eq!(error_code(&twice), "INVALID_PAGE");
     let edited = report(
         &world,
         &runner,
@@ -402,6 +630,45 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
     )
     .await;
     assert_eq!(error_code(&edited), "INVALID_PAGE_ORIGIN");
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn two_concurrent_report_batches_on_one_file_both_land() {
+    let world = World::start("pod-runner-concurrent-report").await;
+    let owner = passport(Uuid::now_v7());
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    let (_, file_id, job_id) = file_with_job(&world, &owner).await;
+
+    let batch = |pages: Vec<(i32, &'static str)>| {
+        report(
+            &world,
+            &runner,
+            file_id,
+            Report {
+                job_id,
+                pages,
+                origin: None,
+                indexer: None,
+                done: false,
+            },
+        )
+    };
+    let (left, right) = tokio::join!(
+        batch(vec![(1, "one"), (2, "two"), (3, "three")]),
+        batch(vec![(3, "three"), (4, "four"), (5, "five")]),
+    );
+    ok(&left);
+    ok(&right);
+
+    let numbers: Vec<i64> = world
+        .file_pages(&owner, file_id)
+        .await
+        .iter()
+        .map(|page| page["number"].as_i64().unwrap())
+        .collect();
+    assert_eq!(numbers, vec![1, 2, 3, 4, 5]);
 
     world.cleanup().await;
 }
