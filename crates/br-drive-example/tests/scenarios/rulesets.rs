@@ -258,3 +258,79 @@ async fn rulesets_are_managed_by_the_hosts_managers_and_validated_at_save() {
 
     world.cleanup().await;
 }
+
+#[tokio::test]
+async fn two_concurrent_saves_of_one_name_answer_exactly_one_name_taken() {
+    let world = World::start("pod-rules-concurrent").await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    jobs.declare_runner_type(RENDER, RunnerTypeLifecycle::Active)
+        .await;
+    world.await_known_runner_type(RENDER, Some("active")).await;
+
+    let world_ref = &world;
+    let manager_ref = &manager;
+    let save = |media: &'static str| async move {
+        let steps = [(RENDER, serde_json::json!({}))];
+        let media_types = [media];
+        create_ruleset(
+            world_ref,
+            manager_ref,
+            RuleSpec {
+                name: "Same Name",
+                trigger: "UPLOAD",
+                media_types: &media_types,
+                steps: &steps,
+                is_default: true,
+            },
+        )
+        .await
+    };
+    let (left, right) = tokio::join!(save("text/plain"), save("text/markdown"));
+    let mut codes: Vec<String> = [&left, &right]
+        .into_iter()
+        .map(|response| {
+            if response.get("errors").is_none() {
+                ok(response);
+                "OK".to_string()
+            } else {
+                error_code(response)
+            }
+        })
+        .collect();
+    codes.sort();
+    assert_eq!(
+        codes,
+        vec!["OK".to_string(), "RULESET_NAME_TAKEN".to_string()],
+        "the advisory lock serializes the two saves: {left} / {right}"
+    );
+    assert_eq!(world.rulesets(&manager).await.len(), 1);
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_rule_cannot_be_saved_on_a_host_whose_catalogue_was_never_scanned() {
+    let world = World::start("pod-rules-unscanned").await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    sqlx::query("DELETE FROM drive.catalogue_scan")
+        .execute(&world.db.app)
+        .await
+        .expect("forget the boot scan, as a host that never started the watch");
+
+    let refused = create_ruleset(
+        &world,
+        &manager,
+        RuleSpec {
+            name: "blind",
+            trigger: "UPLOAD",
+            media_types: &["*"],
+            steps: &[(RENDER, serde_json::json!({}))],
+            is_default: true,
+        },
+    )
+    .await;
+    assert_eq!(error_code(&refused), "CATALOGUE_NOT_WATCHED");
+
+    world.cleanup().await;
+}

@@ -2,6 +2,7 @@ mod bulk;
 mod cascade;
 mod concurrency;
 mod folders;
+mod hosts;
 mod pages;
 mod processing;
 mod replay;

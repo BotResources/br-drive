@@ -268,6 +268,20 @@ async fn a_variant_is_picked_by_id_the_catch_all_serves_other_media_types_and_mi
         )
         .await,
     );
+    let text_family = ruleset_id(
+        &create_ruleset(
+            &world,
+            &manager,
+            RuleSpec {
+                name: "text family",
+                trigger: "UPLOAD",
+                media_types: &["text/*"],
+                steps: &[(RENDER, serde_json::json!({ "family": true }))],
+                is_default: true,
+            },
+        )
+        .await,
+    );
     let reprocess = reprocess_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
 
@@ -322,34 +336,39 @@ async fn a_variant_is_picked_by_id_the_catch_all_serves_other_media_types_and_mi
         variant.to_string()
     );
 
-    let other = Uuid::now_v7();
-    let other_ticket = ticket(
-        &request(
-            &world,
-            &owner,
-            other,
-            &UploadRequest {
-                drive,
-                path: "",
-                name: "data.csv",
-                media_type: "text/csv",
-                bytes: BYTES,
-            },
-        )
-        .await,
-    );
-    let status = crate::harness::upload::post_bytes(&world, &other_ticket, BYTES, "data.csv").await;
-    assert!((200..300).contains(&status));
-    ok(&crate::harness::upload::commit(&world, &owner, other).await);
-    let create = jobs.await_create(other).await;
-    assert_eq!(
-        create.runner_type, INDEX,
-        "text/csv has no exact rule; the catch-all serves it"
-    );
-    assert_eq!(
-        world.file(&owner, other).await["rulesetId"],
-        catch_all.to_string()
-    );
+    for (name, media_type, expected_rule, expected_runner) in [
+        ("data.csv", "text/csv", text_family, RENDER),
+        ("blob.bin", "application/octet-stream", catch_all, INDEX),
+    ] {
+        let other = Uuid::now_v7();
+        let other_ticket = ticket(
+            &request(
+                &world,
+                &owner,
+                other,
+                &UploadRequest {
+                    drive,
+                    path: "",
+                    name,
+                    media_type,
+                    bytes: BYTES,
+                },
+            )
+            .await,
+        );
+        let status = crate::harness::upload::post_bytes(&world, &other_ticket, BYTES, name).await;
+        assert!((200..300).contains(&status));
+        ok(&crate::harness::upload::commit(&world, &owner, other).await);
+        let create = jobs.await_create(other).await;
+        assert_eq!(
+            create.runner_type, expected_runner,
+            "{media_type}: exact beats the type family, the type family beats the catch-all"
+        );
+        assert_eq!(
+            world.file(&owner, other).await["rulesetId"],
+            expected_rule.to_string()
+        );
+    }
 
     world.cleanup().await;
 }
@@ -434,6 +453,16 @@ async fn an_unknown_or_deprecated_runner_type_fails_the_file_before_any_job_is_c
     );
     jobs.retire_runner_type(RENDER).await;
     world.await_known_runner_type(RENDER, None).await;
+    jobs.publish_catalogue_noise(
+        RENDER,
+        serde_json::json!({ "runner_type": RENDER, "lifecycle": "ACTIVE", "version": 99 }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    world.await_known_runner_type(RENDER, None).await;
+    jobs.declare_runner_type(RENDER, RunnerTypeLifecycle::Active)
+        .await;
+    world.await_known_runner_type(RENDER, Some("active")).await;
 
     world.cleanup().await;
 }
@@ -493,14 +522,37 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
     );
     assert_eq!(world.file_pages(&owner, file_id).await.len(), 1);
 
-    let no_rule = world
+    ok(&world
         .gql(
             &owner,
             "mutation($f:UUID!){workspaceProcess(fileId:$f){success}}",
             serde_json::json!({ "f": file_id }),
         )
+        .await);
+    let replayed = next_drive_delta(&mut files, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingStarted"
+    })
+    .await;
+    assert_eq!(replayed["view"]["processingState"], "PROCESSING");
+    assert!(replayed["view"]["processingError"].is_null());
+    assert_eq!(
+        replayed["view"]["progress"]["stepCount"], 2,
+        "with no reprocess rule the file replays its own snapshot"
+    );
+    assert!(
+        world.file_pages(&owner, file_id).await.is_empty(),
+        "a reprocess wipes the rendition at chain start"
+    );
+    let replay = jobs.await_create(file_id).await;
+    assert_eq!(replay.runner_type, RENDER);
+    jobs.fail(replay.job_id, "runner_error", Some("again"))
         .await;
-    assert_eq!(error_code(&no_rule), "NO_RULESET_MATCHES");
+    world.await_state(&owner, file_id, "FAILED").await;
+    next_drive_delta(&mut files, |node| {
+        node["cause"]["kind"] == "ProcessingFailed"
+    })
+    .await;
+
     reprocess_rule(&world, &manager).await;
     ok(&world
         .gql(
@@ -513,12 +565,9 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
         node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingStarted"
     })
     .await;
-    assert_eq!(restarted["view"]["processingState"], "PROCESSING");
-    assert!(restarted["view"]["processingError"].is_null());
-    assert_eq!(restarted["view"]["progress"]["stepCount"], 1);
-    assert!(
-        world.file_pages(&owner, file_id).await.is_empty(),
-        "a reprocess wipes the rendition at chain start"
+    assert_eq!(
+        restarted["view"]["progress"]["stepCount"], 1,
+        "a default reprocess rule wins over the snapshot"
     );
     let job_b = jobs.await_create(file_id).await.job_id;
     assert_ne!(job_b, job_a);
@@ -706,11 +755,13 @@ async fn every_jobs_fact_replayed_changes_nothing() {
     let run_a = Uuid::now_v7();
     let mut files = drive_subscription(&world, &owner, drive).await;
 
+    let started_at = chrono::Utc::now();
     for _ in 0..2 {
         jobs.queue(job_a, RENDER).await;
         jobs.start(job_a, run_a).await;
         jobs.declare_plan(job_a, run_a, &["render"]).await;
-        jobs.start_step(job_a, run_a, 0, "render").await;
+        jobs.start_step_at(job_a, run_a, 0, "render", started_at)
+            .await;
     }
     let mut progress_deltas = 0;
     let mut last = serde_json::Value::Null;
@@ -727,6 +778,16 @@ async fn every_jobs_fact_replayed_changes_nothing() {
     );
     assert_eq!(last["plan"], serde_json::json!(["render"]));
     assert_eq!(last["currentIndex"], 0);
+    jobs.start_step(job_a, Uuid::now_v7(), 0, "render again")
+        .await;
+    let restarted = next_drive_delta(&mut files, |node| {
+        node["cause"]["kind"] == "ProgressChanged"
+    })
+    .await;
+    assert_eq!(
+        restarted["view"]["progress"]["currentLabel"], "render again",
+        "a retry attempt restarting the plan with a newer start instant moves the cursor"
+    );
     ok(&report(
         &world,
         &runner,
@@ -873,6 +934,135 @@ async fn a_page_edit_during_processing_and_a_report_on_a_pending_file_are_refuse
     assert_eq!(
         page["affordances"]["regeneratePage"]["reason"],
         "FILE_PROCESSING"
+    );
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_completed_fact_that_arrives_before_the_runners_final_report_waits_for_it() {
+    let world = World::start("pod-chain-early-completed").await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let owner = passport(Uuid::now_v7());
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    catalogue(&world, &jobs).await;
+    two_step_rule(&world, &manager).await;
+    let drive = world.create_workspace(&owner, "library").await;
+
+    let file_id = upload(
+        &world,
+        &owner,
+        &UploadRequest::text(drive, "", "early.txt", BYTES),
+    )
+    .await;
+    let job_a = jobs.await_create(file_id).await.job_id;
+    jobs.complete(job_a).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let waiting = world.file(&owner, file_id).await;
+    assert_eq!(waiting["processingState"], "PROCESSING");
+    assert_eq!(
+        waiting["progress"]["stepIndex"], 0,
+        "the chain does not advance on Jobs' word alone"
+    );
+    jobs.expect_no_command(Duration::from_millis(500)).await;
+
+    ok(&report(
+        &world,
+        &runner,
+        file_id,
+        Report {
+            job_id: job_a,
+            pages: vec![(1, "late but complete")],
+            origin: None,
+            indexer: None,
+            done: true,
+        },
+    )
+    .await);
+    let (subject, payload) = jobs
+        .next_command(Duration::from_secs(15))
+        .await
+        .expect("the report advances the chain");
+    assert_eq!(
+        subject,
+        contract_jobs::CMD_JOB_CREATE_V1,
+        "no finish is staged for a job Jobs already completed: {payload}"
+    );
+    let create_b: contract_jobs::command::CreateJob =
+        serde_json::from_value(payload).expect("the next step's job");
+    assert_eq!(create_b.parent_job_id, Some(job_a));
+    assert_eq!(create_b.runner_type, INDEX);
+    assert_eq!(
+        world.file(&owner, file_id).await["progress"]["stepIndex"],
+        1
+    );
+    assert_eq!(world.file_pages(&owner, file_id).await.len(), 1);
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_process_gesture_picks_the_given_rule_and_refuses_when_nothing_at_all_applies() {
+    let world = World::start("pod-chain-process-order").await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let owner = passport(Uuid::now_v7());
+    catalogue(&world, &jobs).await;
+    let drive = world.create_workspace(&owner, "library").await;
+
+    let plain = upload(
+        &world,
+        &owner,
+        &UploadRequest::text(drive, "", "plain.txt", BYTES),
+    )
+    .await;
+    assert_eq!(world.file(&owner, plain).await["processingState"], "READY");
+    let nothing = world
+        .gql(
+            &owner,
+            "mutation($f:UUID!){workspaceProcess(fileId:$f){success}}",
+            serde_json::json!({ "f": plain }),
+        )
+        .await;
+    assert_eq!(
+        error_code(&nothing),
+        "NO_RULESET_MATCHES",
+        "no rule and no snapshot: the file is left as it is"
+    );
+    assert_eq!(world.file(&owner, plain).await["processingState"], "READY");
+
+    let variant = ruleset_id(
+        &create_ruleset(
+            &world,
+            &manager,
+            RuleSpec {
+                name: "index again",
+                trigger: "REPROCESS",
+                media_types: &["text/plain"],
+                steps: &[(INDEX, serde_json::json!({ "variant": true }))],
+                is_default: false,
+            },
+        )
+        .await,
+    );
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$r:UUID){workspaceProcess(fileId:$f,rulesetId:$r){success}}",
+            serde_json::json!({ "f": plain, "r": variant }),
+        )
+        .await);
+    let create = jobs.await_create(plain).await;
+    assert_eq!(create.runner_type, INDEX);
+    assert_eq!(
+        create.config.as_ref().unwrap()["options"],
+        serde_json::json!({ "variant": true })
+    );
+    assert_eq!(
+        world.file(&owner, plain).await["rulesetId"],
+        variant.to_string(),
+        "the given rule is the snapshot the file keeps"
     );
 
     world.cleanup().await;

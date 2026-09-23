@@ -175,6 +175,19 @@ impl JobsStandIn {
     }
 
     pub async fn start_step(&self, job_id: Uuid, run_id: Uuid, index: u32, label: &str) {
+        self.start_step_at(job_id, run_id, index, label, Utc::now())
+            .await;
+    }
+
+    /// The same fact with a pinned instant: publishing it twice is a redelivery.
+    pub async fn start_step_at(
+        &self,
+        job_id: Uuid,
+        run_id: Uuid,
+        index: u32,
+        label: &str,
+        started_at: chrono::DateTime<Utc>,
+    ) {
         self.publish(
             evt_job_step_started_v1_coords().unwrap(),
             EVENT_TYPE_STEP_STARTED,
@@ -183,7 +196,7 @@ impl JobsStandIn {
                 run_id,
                 index,
                 label: label.to_string(),
-                started_at: Utc::now(),
+                started_at,
             },
         )
         .await;

@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod jobs;
 pub mod minio;
 pub mod nats;
@@ -16,6 +17,7 @@ use service_engine::config::EngineConfig;
 use service_engine::name::{ChannelName, PodId};
 use uuid::Uuid;
 
+pub use archive::ArchiveHost;
 pub use jobs::JobsStandIn;
 pub use minio::TestMinio;
 pub use nats::TestNats;
