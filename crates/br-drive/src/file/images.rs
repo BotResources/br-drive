@@ -117,12 +117,8 @@ impl<H> ImageRecord<H> {
     }
 
     pub fn land(&mut self, reference: Uuid, at: DateTime<Utc>) -> Landing {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|facts| facts.blob_ref == reference)
-        {
-            self.current = self.pending.take().expect("checked just above");
+        if let Some(pending) = self.pending.take_if(|facts| facts.blob_ref == reference) {
+            self.current = pending;
             self.landed_at = Some(at);
             return Landing::Swapped;
         }

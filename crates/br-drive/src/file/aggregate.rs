@@ -108,6 +108,8 @@ pub enum FileCause {
     ProgressChanged,
     ProcessingFinished,
     ProcessingFailed { reason: String },
+    LabelsChanged { detached: Option<Uuid> },
+    Erased,
     Deleted,
     FolderDeleted,
     DriveDeleted,
@@ -267,6 +269,9 @@ service_engine::gated! {
     }
     "process" => fn process_gate(this, principal) {
         settled(this, principal, DriveRequest::Process { file: this })
+    }
+    "setLabels" => fn set_labels_gate(this, principal) {
+        principal.drive_gate(&DriveRequest::SetFileLabels { file: this })
     }
 }
 

@@ -1,0 +1,290 @@
+use contract_jobs::command::{CancelJob, CreateJob, FinishJob};
+use service_engine::BlobRef;
+use service_engine::error::EngineError;
+use service_engine::pipeline::Ops;
+use sqlx::PgConnection;
+use uuid::Uuid;
+
+use super::commands::{Initiator, JobCancel, JobCreate, JobFinish};
+use super::roots::roots;
+use super::{CATALOGUE_NOT_WATCHED, RUNNER_TYPE_UNAVAILABLE};
+use crate::catalogue;
+use crate::fault::DriveFault;
+use crate::file::images::drop_images;
+use crate::file::store;
+use crate::file::{File, FileCause, FileRow, ProcessingState};
+use crate::host::DriveHost;
+use crate::ruleset::{RulesetRow, RulesetStep};
+
+fn merge_options(base: &serde_json::Value, extra: &serde_json::Value) -> serde_json::Value {
+    let mut merged = match base {
+        serde_json::Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    if let serde_json::Value::Object(extra) = extra {
+        for (key, value) in extra {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::Value::Object(merged)
+}
+
+/// What a chain runs: the rule it came from (none when a file replays its own
+/// snapshot) and the steps, with the gesture's options merged into the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainPlan {
+    pub ruleset_id: Option<Uuid>,
+    pub steps: Vec<RulesetStep>,
+}
+
+impl ChainPlan {
+    pub fn from_ruleset(ruleset: &RulesetRow, first_options: Option<&serde_json::Value>) -> Self {
+        let mut steps = ruleset.steps.clone();
+        if let (Some(first), Some(extra)) = (steps.first_mut(), first_options) {
+            first.options = merge_options(&first.options, extra);
+        }
+        Self {
+            ruleset_id: Some(ruleset.id),
+            steps,
+        }
+    }
+
+    pub fn replay<H>(file: &FileRow<H>) -> Option<Self> {
+        let steps = file.steps.clone().filter(|steps| !steps.is_empty())?;
+        Some(Self {
+            ruleset_id: file.ruleset_id,
+            steps,
+        })
+    }
+}
+
+fn clear_run<H>(file: &mut FileRow<H>) {
+    file.job_id = None;
+    file.step_index = None;
+    file.step_count = None;
+    file.step_runner_type = None;
+    file.plan = None;
+    file.progress_index = None;
+    file.progress_label = None;
+    file.progress_at = None;
+    file.done_at = None;
+    file.completed_at = None;
+}
+
+pub(super) fn mark_failed<H>(file: &mut FileRow<H>, reason: &str) {
+    clear_run(file);
+    file.processing_state = ProcessingState::Failed;
+    file.processing_error = Some(reason.to_string());
+}
+
+fn mark_ready<H>(file: &mut FileRow<H>) {
+    clear_run(file);
+    file.processing_state = ProcessingState::Ready;
+    file.processing_error = None;
+}
+
+pub async fn wipe_rendition<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    file: &mut FileRow<H>,
+) -> Result<(), DriveFault> {
+    store::delete_pages(cx.connection(), file.id).await?;
+    let names = crate::file::images::image_names_of(cx.connection(), file.id).await?;
+    for reference in drop_images(cx.connection(), file.id, &names).await? {
+        cx.release_blob(BlobRef(reference))?;
+    }
+    file.summary = None;
+    file.page_count = None;
+    file.estimated_tokens = None;
+    Ok(())
+}
+
+/// Launches step `index` of the file's snapshot: `Ok(true)` when a job was
+/// staged, `Ok(false)` when the chain ended instead (READY past the last step,
+/// FAILED when the step cannot run).
+async fn launch_step<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    file: &mut FileRow<H>,
+    index: usize,
+    parent_job_id: Option<Uuid>,
+) -> Result<Option<Uuid>, DriveFault> {
+    let steps = file.steps.clone().unwrap_or_default();
+    let Some(step) = steps.get(index) else {
+        mark_ready(file);
+        return Ok(None);
+    };
+    if !catalogue::scanned(cx.connection()).await? {
+        tracing::error!(
+            file = %file.id,
+            runner_type = %step.runner_type,
+            "no runner-type catalogue watch has ever scanned on this host; start \
+             `br_drive::watch_runner_types` next to the engine"
+        );
+        mark_failed(file, CATALOGUE_NOT_WATCHED);
+        return Ok(None);
+    }
+    if !catalogue::is_active(cx.connection(), &step.runner_type).await? {
+        mark_failed(file, RUNNER_TYPE_UNAVAILABLE);
+        return Ok(None);
+    }
+    let roots = roots::<H>()?;
+    let initiator = file.triggered_by.clone().unwrap_or(Initiator {
+        id: file.created_by,
+        display_name: None,
+    });
+    let job_id = Uuid::now_v7();
+    let config = serde_json::json!({
+        "host": H::SERVICE,
+        "file_id": file.id,
+        "job_id": job_id,
+        "context_root": roots.context_root,
+        "image_upload_root": roots.image_upload_root,
+        "report_root": roots.report_root,
+        "step": index,
+        "options": step.options,
+    });
+    clear_run(file);
+    file.processing_state = ProcessingState::Processing;
+    file.processing_error = None;
+    file.job_id = Some(job_id);
+    file.step_index = Some(index as i32);
+    file.step_count = Some(steps.len() as i32);
+    file.step_runner_type = Some(step.runner_type.clone());
+    cx.command(JobCreate {
+        payload: CreateJob {
+            job_id,
+            runner_type: step.runner_type.clone(),
+            producer: H::SERVICE.to_string(),
+            config: Some(config),
+            parent_job_id,
+            triggered_by: Some(initiator.triggered_by()),
+            source_bc: Some(H::SERVICE.to_string()),
+            source_entity_id: Some(file.id),
+            max_attempts: None,
+        },
+    })?;
+    Ok(Some(job_id))
+}
+
+fn outcome_cause<H>(file: &FileRow<H>, launched: Option<Uuid>, step: usize) -> FileCause {
+    match (launched, file.processing_state) {
+        (Some(job_id), _) => FileCause::ProcessingStarted {
+            job_id,
+            step: step as i32,
+        },
+        (None, ProcessingState::Ready) => FileCause::ProcessingFinished,
+        (None, _) => FileCause::ProcessingFailed {
+            reason: file
+                .processing_error
+                .clone()
+                .unwrap_or_else(|| RUNNER_TYPE_UNAVAILABLE.to_string()),
+        },
+    }
+}
+
+pub async fn start_chain<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    file: &mut FileRow<H>,
+    plan: ChainPlan,
+    initiator: Initiator,
+) -> Result<(), DriveFault> {
+    file.ruleset_id = plan.ruleset_id;
+    file.steps = Some(plan.steps);
+    file.triggered_by = Some(initiator);
+    file.updated_at = cx.now().as_datetime();
+    let launched = launch_step(cx, file, 0, None).await?;
+    cx.save(file).await?;
+    cx.impact_caused::<File, _>(&file.id, outcome_cause(file, launched, 0))?;
+    Ok(())
+}
+
+/// The step whose job `finished` is over and the runner reported `done`: the
+/// next step is launched, or the chain lands READY.
+pub async fn advance<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    file: &mut FileRow<H>,
+    finished: Uuid,
+) -> Result<(), DriveFault> {
+    let next = file.step_index.unwrap_or(0) as usize + 1;
+    let launched = launch_step(cx, file, next, Some(finished)).await?;
+    file.updated_at = cx.now().as_datetime();
+    cx.save(file).await?;
+    cx.impact_caused::<File, _>(&file.id, outcome_cause(file, launched, next))?;
+    Ok(())
+}
+
+pub fn cancel_active_job<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    file: &FileRow<H>,
+) -> Result<(), DriveFault> {
+    if let Some(job_id) = file.job_id {
+        cx.command(JobCancel {
+            payload: CancelJob { job_id },
+        })?;
+    }
+    Ok(())
+}
+
+pub fn finish_active_job<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    file: &FileRow<H>,
+) -> Result<(), DriveFault> {
+    if let Some(job_id) = file.job_id {
+        cx.command(JobFinish {
+            payload: FinishJob { job_id },
+        })?;
+    }
+    Ok(())
+}
+
+pub async fn file_of_job(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+) -> Result<Option<Uuid>, EngineError> {
+    let id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM drive.file WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_optional(conn)
+        .await?;
+    Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ruleset(steps: Vec<RulesetStep>) -> RulesetRow {
+        RulesetRow {
+            id: Uuid::now_v7(),
+            name: "regen".into(),
+            trigger: crate::ruleset::Trigger::RegeneratePage,
+            media_types: vec!["*".into()],
+            steps,
+            is_default: true,
+            created_by: Uuid::now_v7(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn the_first_steps_options_are_merged_with_the_gestures_own() {
+        let ruleset = ruleset(vec![
+            RulesetStep {
+                runner_type: "render".into(),
+                options: serde_json::json!({ "dpi": 300 }),
+            },
+            RulesetStep {
+                runner_type: "index".into(),
+                options: serde_json::json!({}),
+            },
+        ]);
+        let plan =
+            ChainPlan::from_ruleset(&ruleset, Some(&serde_json::json!({ "page": 3, "dpi": 72 })));
+        assert_eq!(plan.ruleset_id, Some(ruleset.id));
+        assert_eq!(
+            plan.steps[0].options,
+            serde_json::json!({ "dpi": 72, "page": 3 }),
+            "the gesture's keys win over the rule's"
+        );
+        assert_eq!(plan.steps[1].options, serde_json::json!({}));
+    }
+}

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use contract_jobs::catalog::{RUNNER_TYPE_PREFIX, RunnerType, RunnerTypeLifecycle};
 use contract_jobs::runner::WIRE_VERSION;
 use service_engine::error::EngineError;
@@ -60,10 +59,9 @@ pub async fn inactive_among(
 
 async fn mark_scanned(conn: &mut PgConnection) -> Result<(), EngineError> {
     sqlx::query(
-        "INSERT INTO drive.catalogue_scan (singleton, scanned_at) VALUES (true, $1) \
+        "INSERT INTO drive.catalogue_scan (singleton, scanned_at) VALUES (true, now()) \
          ON CONFLICT (singleton) DO UPDATE SET scanned_at = EXCLUDED.scanned_at",
     )
-    .bind(Utc::now())
     .execute(conn)
     .await?;
     Ok(())
@@ -72,14 +70,13 @@ async fn mark_scanned(conn: &mut PgConnection) -> Result<(), EngineError> {
 async fn upsert(conn: &mut PgConnection, entry: &RunnerType) -> Result<(), EngineError> {
     sqlx::query(
         "INSERT INTO drive.known_runner_type (runner_type, lifecycle, version, seen_at) \
-         VALUES ($1, $2, $3, $4) \
+         VALUES ($1, $2, $3, now()) \
          ON CONFLICT (runner_type) DO UPDATE SET lifecycle = EXCLUDED.lifecycle, \
            version = EXCLUDED.version, seen_at = EXCLUDED.seen_at",
     )
     .bind(&entry.runner_type)
     .bind(lifecycle_str(entry.lifecycle))
     .bind(i32::from(entry.version))
-    .bind(Utc::now())
     .execute(conn)
     .await?;
     Ok(())

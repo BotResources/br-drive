@@ -27,6 +27,7 @@ type DriveFile {
 	pageCount: Int
 	estimatedTokens: Int
 	images: [DriveImage!]!
+	labelIds: [UUID!]!
 	rulesetId: UUID
 	steps: [DriveStep!]
 	progress: DriveProgress
@@ -43,6 +44,16 @@ type DriveImage {
 	page: Int!
 }
 
+type DriveLabel {
+	id: UUID!
+	name: String!
+	color: String!
+	description: String!
+	createdBy: UUID!
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
 type DriveMutation {
 	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
 	workspaceCommitUpload(fileId: UUID!, rulesetId: UUID): MutationAck!
@@ -50,6 +61,10 @@ type DriveMutation {
 	workspaceRegeneratePage(fileId: UUID!, number: Int!, comment: String, rulesetId: UUID): MutationAck!
 	workspaceCreateRuleset(id: UUID!, name: String!, trigger: Trigger!, mediaTypes: [String!]!, steps: [RulesetStepInput!]!, isDefault: Boolean! = false): RulesetSaved!
 	workspaceUpdateRuleset(id: UUID!, name: String, mediaTypes: [String!], steps: [RulesetStepInput!], isDefault: Boolean): RulesetSaved!
+	workspaceCreateLabel(id: UUID!, name: String!, color: String!, description: String): MutationAck!
+	workspaceUpdateLabel(id: UUID!, name: String, color: String, description: String): MutationAck!
+	workspaceDeleteLabel(id: UUID!): MutationAck!
+	workspaceSetFileLabels(fileId: UUID!, labelIds: [UUID!]!): MutationAck!
 	workspaceDeleteRuleset(id: UUID!): MutationAck!
 	workspaceUpdateFile(fileId: UUID!, name: String, path: String, driveId: UUID): MutationAck!
 	workspaceDeleteFile(fileId: UUID!): MutationAck!
@@ -85,6 +100,7 @@ type DriveQuery {
 	workspaceDriveFiles(driveId: UUID!): [DriveFile!]!
 	workspacePages(fileId: UUID!): [DrivePage!]!
 	workspaceRulesets: [DriveRuleset!]!
+	workspaceLabels: [DriveLabel!]!
 	workspaceFileAccess(fileId: UUID!, name: String): String
 	workspaceRunnerContext(fileId: UUID!, jobId: UUID!): RunnerContext!
 }
@@ -121,6 +137,8 @@ type DriveStep {
 type DriveSubscription {
 	workspaceDriveChanged(driveId: UUID!): DriveDelta!
 	workspaceFilePages(fileId: UUID!): DriveDelta!
+	workspaceLabelsChanged: DriveDelta!
+	workspaceRulesetsChanged: DriveDelta!
 }
 
 type DriveUpsert {
@@ -129,7 +147,7 @@ type DriveUpsert {
 	cause: JSON
 }
 
-union DriveView = DriveFile | DrivePage
+union DriveView = DriveFile | DrivePage | DriveLabel | DriveRuleset
 
 """
 A scalar that can represent any JSON value.

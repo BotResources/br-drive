@@ -42,6 +42,9 @@ pub mod codes {
     pub const RUNNER_TYPE_UNAVAILABLE: Reason = Reason::new("RUNNER_TYPE_UNAVAILABLE");
     pub const FILE_PROCESSING: Reason = Reason::new("FILE_PROCESSING");
     pub const CATALOGUE_NOT_WATCHED: Reason = Reason::new("CATALOGUE_NOT_WATCHED");
+    pub const LABEL_NOT_FOUND: Reason = Reason::new("LABEL_NOT_FOUND");
+    pub const LABEL_NAME_TAKEN: Reason = Reason::new("LABEL_NAME_TAKEN");
+    pub const INVALID_LABEL: Reason = Reason::new("INVALID_LABEL");
 }
 
 #[derive(Debug, thiserror::Error)]
