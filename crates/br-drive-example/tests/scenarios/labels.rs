@@ -80,6 +80,18 @@ async fn labels_are_a_host_catalogue_managed_by_its_managers_and_read_live_by_ev
         )
         .await;
     assert_eq!(error_code(&long_description), "INVALID_LABEL");
+    let long_rename = world
+        .gql(
+            &manager,
+            "mutation($id:UUID!,$d:String){workspaceUpdateLabel(id:$id,description:$d){success}}",
+            serde_json::json!({ "id": urgent, "d": "é".repeat(600) }),
+        )
+        .await;
+    assert_eq!(
+        error_code(&long_rename),
+        "INVALID_LABEL",
+        "an update is bounded like a create, not by the database check"
+    );
     for (name, color, code) in [
         ("urgent", "#00ff00", "LABEL_NAME_TAKEN"),
         ("", "#00ff00", "INVALID_LABEL"),

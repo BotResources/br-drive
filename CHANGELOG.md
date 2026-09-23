@@ -175,7 +175,8 @@ The first release: milestones 1 to 5 on engine `v0.3.0`.
   is read as absent rather than breaking the file's view.
 - Labels and erase (milestone 5). `drive.label` (`name` ≤ 100 characters,
   trimmed, unique per host case-insensitive; `color` `#rrggbb` lowercase hex;
-  `description` default `''`) and `drive.file_label`; roots `<p>Labels`,
+  `description` default `''`, at most 1 KiB) and `drive.file_label`; roots
+  `<p>Labels`,
   `<p>CreateLabel` / `<p>UpdateLabel` / `<p>DeleteLabel` (gate `ManageLabels`)
   and `<p>SetFileLabels(fileId, labelIds)` (gate `SetFileLabels { file }`,
   target set, idempotent); `DriveFile.labelIds` computed by label name and the

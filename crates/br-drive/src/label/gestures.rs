@@ -99,9 +99,8 @@ pub fn update_label<'m, H: DriveHost>(
             Some(color) => validate_color(color)?,
             None => label.color.clone(),
         };
-        let description = input
-            .description
-            .unwrap_or_else(|| label.description.clone());
+        let description =
+            validate_description(input.description.as_deref().unwrap_or(&label.description))?;
         if name == label.name && color == label.color && description == label.description {
             return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
         }
