@@ -493,11 +493,13 @@ pub fn passport(user: Uuid) -> String {
 }
 
 pub fn manager_passport(user: Uuid, display_name: &str) -> String {
+    manager_passport_with_scopes(user, display_name, &["workspace:manage"])
+}
+
+/// A person holding `scopes`, named `display_name`.
+pub fn manager_passport_with_scopes(user: Uuid, display_name: &str, scopes: &[&str]) -> String {
     let mut map = serde_json::Map::new();
-    map.insert(
-        "scopes".to_string(),
-        serde_json::json!(["workspace:manage"]),
-    );
+    map.insert("scopes".to_string(), serde_json::json!(scopes));
     map.insert("name".to_string(), serde_json::json!(display_name));
     Passport::human(
         user,

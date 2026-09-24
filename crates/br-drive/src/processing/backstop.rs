@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::TIMED_OUT;
 use super::chain::{Launched, cancel_active_job, mark_failed, outcome_cause, stage_job};
 use crate::fault::DriveReactionFault;
-use crate::file::{File, FileCause, FileRow, ProcessingState};
+use crate::file::{FileCause, FileRow, ProcessingState};
 use crate::host::DriveHost;
 use crate::upload::UPLOAD_DEADLINE_AGGREGATE;
 
@@ -201,8 +201,9 @@ pub fn step_deadline<'r, H: DriveHost>(
         mark_failed(&mut file, TIMED_OUT);
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
-        cx.impact_caused::<File, _>(
-            &file.id,
+        crate::file::file_changed::<H>(
+            cx,
+            &file,
             FileCause::ProcessingFailed {
                 reason: TIMED_OUT.to_string(),
             },
@@ -232,7 +233,7 @@ pub fn launch_retry<'r, H: DriveHost>(
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
         let step = usize::try_from(message.step).unwrap_or(0);
-        cx.impact_caused::<File, _>(&file.id, outcome_cause(&file, launched, step))?;
+        crate::file::file_changed::<H>(cx, &file, outcome_cause(&file, launched, step))?;
         Ok(())
     })
 }

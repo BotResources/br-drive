@@ -370,6 +370,17 @@ pub async fn ids_in_drive(conn: &mut PgConnection, drive: Uuid) -> Result<Vec<Uu
     ids_in_drives(conn, &[drive]).await
 }
 
+pub async fn drives_of(conn: &mut PgConnection, files: &[Uuid]) -> Result<Vec<Uuid>, EngineError> {
+    let rows = sqlx::query("SELECT DISTINCT drive_id FROM drive.file WHERE id = ANY($1)")
+        .bind(files)
+        .fetch_all(conn)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<Uuid, _>("drive_id"))
+        .collect())
+}
+
 pub async fn drive_of(conn: &mut PgConnection, file: Uuid) -> Result<Option<Uuid>, EngineError> {
     let row = sqlx::query("SELECT drive_id FROM drive.file WHERE id = $1")
         .bind(file)

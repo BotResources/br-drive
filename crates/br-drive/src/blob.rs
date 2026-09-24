@@ -35,17 +35,21 @@ pub fn image_available<'a, H: DriveHost>(
     })
 }
 
-pub fn source_available<'a>(
+pub fn source_available<'a, H: DriveHost>(
     uploaded: Uploaded<'a>,
     ps: &'a mut PostSave<'_, '_>,
 ) -> BoxFuture<'a, Result<(), PostUpload>> {
     Box::pin(async move {
-        let row = sqlx::query("SELECT id FROM drive.file WHERE blob_ref = $1")
+        let row = sqlx::query("SELECT id, drive_id FROM drive.file WHERE blob_ref = $1")
             .bind(uploaded.reference.as_uuid())
             .fetch_optional(ps.connection())
             .await?;
         if let Some(row) = row {
             let id: Uuid = row.get("id");
+            if crate::owner::refreshes::<H>() {
+                let drive: Uuid = row.get("drive_id");
+                ps.impact::<H::DriveOwner>(&drive, service_engine::impact::Dims::ALL)?;
+            }
             ps.impact_caused::<File, _>(&id, FileCause::SourceAvailable)?;
         }
         Ok(())
@@ -59,7 +63,7 @@ pub fn register<P: DriveHost>(
         max_bytes: P::SOURCE_MAX_BYTES,
         orphan_after: P::SOURCE_ORPHAN_AFTER,
     })?;
-    engine.register_post_upload_policy::<DriveSource, _>(source_available)?;
+    engine.register_post_upload_policy::<DriveSource, _>(source_available::<P>)?;
     engine.require_post_upload_policy::<DriveSource>()?;
     engine.register_blobs::<DriveImage>(service_engine::BlobPolicy {
         max_bytes: P::IMAGE_MAX_BYTES,

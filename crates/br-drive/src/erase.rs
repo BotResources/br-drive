@@ -113,6 +113,11 @@ impl<H: DriveHost> Erasable for DriveErasure<H> {
                     // The erase pipeline runs without the blob handle, so the
                     // objects go through the manifest's purge, not a release.
                     let sources = source_refs(cx.connection(), &files).await?;
+                    let drives = if crate::owner::refreshes::<H>() {
+                        store::drives_of(cx.connection(), &files).await?
+                    } else {
+                        Vec::new()
+                    };
                     let images = store::image_refs_of_files(cx.connection(), &files).await?;
                     // The erase pipeline has no outbound identity either, so a
                     // running job cannot be cancelled from here: the deleted
@@ -130,6 +135,9 @@ impl<H: DriveHost> Erasable for DriveErasure<H> {
                     // threshold and catch up on their next reset past it.
                     for file in files.iter().take(H::BULK_RESET_THRESHOLD) {
                         cx.impact_caused::<File, _>(file, FileCause::Erased)?;
+                    }
+                    for drive in drives {
+                        crate::owner::touch::<H>(cx, drive)?;
                     }
                 }
             }

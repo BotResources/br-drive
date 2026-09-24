@@ -14,7 +14,7 @@ use super::backstop::schedule_retry;
 use super::chain::{advance, file_of_job, mark_failed};
 use super::commands::JobCancel;
 use crate::fault::DriveReactionFault;
-use crate::file::{File, FileCause, FileRow, ProcessingState};
+use crate::file::{FileCause, FileRow, ProcessingState};
 use crate::host::DriveHost;
 
 async fn active_file<H: DriveHost>(
@@ -112,8 +112,9 @@ async fn fail_file<H: DriveHost>(
     mark_failed(&mut file, reason);
     file.updated_at = cx.now().as_datetime();
     cx.save(&file).await?;
-    cx.impact_caused::<File, _>(
-        &file.id,
+    crate::file::file_changed::<H>(
+        cx,
+        &file,
         FileCause::ProcessingFailed {
             reason: reason.to_string(),
         },
@@ -178,7 +179,7 @@ pub fn on_creation_rejected<'r, H: DriveHost>(
                     file.updated_at = cx.now().as_datetime();
                     cx.save(&file).await?;
                     let step = file.step_index.unwrap_or(0);
-                    cx.impact_caused::<File, _>(&file.id, FileCause::LaunchDeferred { step })?;
+                    crate::file::file_changed::<H>(cx, &file, FileCause::LaunchDeferred { step })?;
                     return Ok(());
                 }
                 file.stray_job_id = Some(stray);
@@ -228,7 +229,7 @@ pub fn on_plan_declared<'r, H: DriveHost>(
         file.step_alive_at = Some(cx.now().as_datetime());
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
-        cx.impact_caused::<File, _>(&file.id, FileCause::ProgressChanged)?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::ProgressChanged)?;
         Ok(())
     })
 }
@@ -261,7 +262,7 @@ pub fn on_step_started<'r, H: DriveHost>(
         file.step_alive_at = Some(cx.now().as_datetime());
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
-        cx.impact_caused::<File, _>(&file.id, FileCause::ProgressChanged)?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::ProgressChanged)?;
         Ok(())
     })
 }

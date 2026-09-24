@@ -83,6 +83,30 @@ single git tag `v{version}` releases the set. Format follows
 
 ### Added
 
+- A host-privileged **import** of an existing rendition:
+  `<p>ImportPages(fileId, pages, summary?, pageCount?, estimatedTokens?)` and
+  `<p>ImportImage(fileId, name, mediaType, size, sha256)`, gated by the new
+  `DriveRequest::Import { file }` behind the library's own `IMPORT_SCOPE`
+  opt-in, and allowed on a `READY` file only, with no job and no runner
+  scope. Pages keep their origin (`RUNNER` or `EDITED`; `REGENERATED` is
+  refused) and go
+  through the same upsert and the same impacts as a runner report
+  (`Imported { origin }` on the pages, `RenditionImported` on the file); the
+  image reuses the verified runner image path. The runner's image staging
+  and rendition validation are shared with it.
+- `DriveHost::DriveOwner`: a host names its own noun type, keyed by the
+  drive id (`impl br_drive::DriveOwnerNoun for Its {}`), or
+  `br_drive::NoDriveOwner`; every file change the library stages also
+  impacts that key, without a cause, so the host's views bound to its own
+  noun — an object carrying file counts — recompute and republish while files
+  land, fail, move and go. No host callback; the noun and its key are
+  compiler-checked. `br_drive::file_counts` reads the file and READY counts
+  of several drives in one statement, served by the new index of migration
+  `9121000008`. The example host's `WorkspaceView` gains `fileCount` and
+  `readyFileCount`, live.
+- `DriveHost::IMPORT_SCOPE` (default `None`: no import): the scope a service
+  account must hold to import, checked by the library before the host's gate
+  (`IMPORT_SCOPE_REQUIRED`), the way the runner scope is.
 - A file's **title**: `drive.file.title` (migration `9121000007`, at most 255
   characters, existing files backfilled with their name without its
   extension), projected as `DriveFile.title`. `RequestUpload` takes an
@@ -123,9 +147,18 @@ single git tag `v{version}` releases the set. Format follows
 - `FileCause` is `#[non_exhaustive]`; new variant `LaunchDeferred { step }`.
 - A chain step never names a `parent_job_id` (see Fixed).
 - Image names accept wider page and index numbers (see Fixed).
+- Engine pin `v0.3.0` → `v0.3.4`: authenticated bodies are bounded (0.3.3),
+  and subscriptions are served over graphql-sse on `POST /graphql`, the
+  transport the gateway uses (0.3.4). The e2e harness's owner role is
+  `BYPASSRLS`, as `migrate` now asserts (0.3.1).
 
 ### Upgrading from 0.1
 
+- Pin `br-service-engine` `v0.3.4`, the same tag as `br-drive`. The
+  owner role `migrate` runs as must be `BYPASSRLS` (engine 0.3.1 refuses
+  otherwise with `OwnerSubjectToRls`). Bodies are bounded at 16 MiB by
+  default (engine 0.3.3): a host that imports or accepts runner reports
+  larger than that raises `MultipartConfig::max_body_bytes`.
 - Migration `9121000006` adds nullable columns only. Files already
   `PROCESSING` when it is applied carry no step clock and get no deadline:
   let them finish or delete them.
@@ -148,6 +181,11 @@ single git tag `v{version}` releases the set. Format follows
   `title`.
 - Migration `9121000007` is one-way: once applied, a pre-0.2 binary cannot
   create a file (`title` is `NOT NULL`).
+- `DriveHost` gains a required associated type, `DriveOwner`: write
+  `type DriveOwner = br_drive::NoDriveOwner;` to keep 0.1's behaviour.
+  `DriveRequest::Import { file }` is new; an import additionally needs
+  `IMPORT_SCOPE`, so a host that sets none offers no import whatever its
+  gate answers.
 
 ## 0.1.0 — 2026-09-23
 

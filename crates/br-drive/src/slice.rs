@@ -430,6 +430,53 @@ macro_rules! drive_slice {
                     .await
                 }
 
+                async fn [<$prefix _import_pages>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    pages: ::std::vec::Vec<$crate::ImportedPageInput>,
+                    summary: ::core::option::Option<::std::string::String>,
+                    page_count: ::core::option::Option<i32>,
+                    estimated_tokens: ::core::option::Option<i64>,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::ImportPages>(
+                        ctx,
+                        $crate::ImportPages {
+                            file_id,
+                            pages: pages.into_iter().map(::core::convert::Into::into).collect(),
+                            summary,
+                            page_count,
+                            estimated_tokens,
+                        },
+                    )
+                    .await
+                }
+
+                async fn [<$prefix _import_image>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    name: ::std::string::String,
+                    media_type: ::std::string::String,
+                    size: $crate::ByteCount,
+                    sha256: ::std::string::String,
+                ) -> ::async_graphql::Result<$crate::UploadTicket> {
+                    ::core::result::Result::Ok(
+                        ::service_engine::execute::<$p, $crate::ImportImage>(
+                            ctx,
+                            $crate::ImportImage {
+                                file_id,
+                                name,
+                                media_type,
+                                size: size.0,
+                                sha256_hex: sha256,
+                            },
+                        )
+                        .await?
+                        .into_inner(),
+                    )
+                }
+
                 #[allow(clippy::too_many_arguments)]
                 async fn [<$prefix _runner_request_image_upload>](
                     &self,

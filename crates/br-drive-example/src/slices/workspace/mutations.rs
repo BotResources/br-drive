@@ -36,6 +36,8 @@ pub fn create_workspace<'m>(
             owner_id: owner,
             name: input.name,
             created_at: cx.now().as_datetime(),
+            file_count: 0,
+            ready_file_count: 0,
         };
         cx.create(&workspace).await?;
         #[cfg(feature = "drive")]

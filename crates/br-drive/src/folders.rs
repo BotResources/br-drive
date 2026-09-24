@@ -52,9 +52,11 @@ pub(crate) async fn delete_rows<H: DriveHost>(
 
 pub(crate) fn impact_rows<H: DriveHost>(
     cx: &mut Bulk<'_, H>,
+    drive: Uuid,
     ids: &[Uuid],
     cause: FileCause,
 ) -> Result<(), DriveFault> {
+    crate::owner::touch::<H>(cx, drive)?;
     if ids.len() > H::BULK_RESET_THRESHOLD {
         cx.impact_all_view::<DriveFiles<H>>();
         cx.impact_all_view::<DrivePages<H>>();
@@ -127,7 +129,7 @@ pub fn move_folder<'m, H: DriveHost>(
         let now = cx.now().as_datetime();
         store::rebase_paths(cx.connection(), &ids, &old_prefix, &new_prefix, now).await?;
         H::folder_moved(cx, input.drive_id, &old_prefix, &new_prefix).await?;
-        impact_rows(cx, &ids, FileCause::FolderMoved)
+        impact_rows(cx, input.drive_id, &ids, FileCause::FolderMoved)
     })
 }
 
@@ -165,6 +167,6 @@ pub fn delete_folder<'m, H: DriveHost>(
         delete_rows(cx, &files).await?;
         H::folder_deleted(cx, input.drive_id, &prefix).await?;
         let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
-        impact_rows(cx, &ids, FileCause::FolderDeleted)
+        impact_rows(cx, input.drive_id, &ids, FileCause::FolderDeleted)
     })
 }

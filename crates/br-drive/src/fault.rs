@@ -24,6 +24,7 @@ pub mod codes {
     pub const FOLDER_INTO_ITSELF: Reason = Reason::new("FOLDER_INTO_ITSELF");
     pub const NOTHING_TO_CHANGE: Reason = Reason::new("NOTHING_TO_CHANGE");
     pub const RUNNER_SCOPE_REQUIRED: Reason = Reason::new("RUNNER_SCOPE_REQUIRED");
+    pub const IMPORT_SCOPE_REQUIRED: Reason = Reason::new("IMPORT_SCOPE_REQUIRED");
     pub const JOB_NOT_ACTIVE: Reason = Reason::new("JOB_NOT_ACTIVE");
     pub const SOURCE_NOT_AVAILABLE: Reason = Reason::new("SOURCE_NOT_AVAILABLE");
     pub const INVALID_IMAGE_NAME: Reason = Reason::new("INVALID_IMAGE_NAME");

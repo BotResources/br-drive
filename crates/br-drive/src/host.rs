@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::erase::EraseMode;
 use crate::file::FileRow;
 use crate::media::MediaType;
+use crate::owner::DriveOwnerNoun;
 use crate::path::{DrivePath, FileName};
 
 pub const DRIVE_DIM: &str = "drive";
@@ -68,6 +69,11 @@ pub enum DriveRequest<'a, H> {
     SetFileLabels {
         file: &'a FileRow<H>,
     },
+    /// Writing a rendition or an image into a READY file without a runner or
+    /// a job (`<p>ImportPages`, `<p>ImportImage`): the host decides who may.
+    Import {
+        file: &'a FileRow<H>,
+    },
     /// Reading the host's label catalogue, live included.
     ReadLabels,
     /// Writing a file's free `metadata` through `br_drive::set_metadata`.
@@ -88,6 +94,7 @@ impl<H> DriveRequest<'_, H> {
             | Self::UpdateFile { file, .. }
             | Self::DeleteFile { file }
             | Self::RetitleFile { file }
+            | Self::Import { file }
             | Self::Process { file }
             | Self::EditPage { file }
             | Self::RegeneratePage { file, .. }
@@ -116,6 +123,14 @@ pub trait DriveHost: Principal {
 
     const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
+    /// The host's own noun whose objects are keyed by the drive's id (the
+    /// documented convention: a drive's id is its host object's id), or
+    /// `br_drive::NoDriveOwner`. Every file change the library stages also
+    /// impacts that key, so a host view bound to its own noun — an object
+    /// showing file counts, say — recomputes and republishes. The noun is a
+    /// type: its name and its UUID key are checked by the compiler.
+    type DriveOwner: DriveOwnerNoun;
+
     /// How long a step of a processing chain may stay silent before the
     /// library cancels its job and fails the file with `timed_out`. Silence is
     /// measured from the step's last sign of life: its entry, then each run
@@ -131,6 +146,23 @@ pub trait DriveHost: Principal {
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;
 
     fn visible_drives(&self) -> Vec<Uuid>;
+
+    /// The scope a service account must hold to import a rendition into a
+    /// file (`<p>ImportPages`, `<p>ImportImage`); `None` (the default) means
+    /// the host offers no import. The host's `DriveRequest::Import` gate then
+    /// decides file by file.
+    const IMPORT_SCOPE: Option<&'static str> = None;
+
+    fn is_importer(&self) -> bool {
+        let Some(import_scope) = Self::IMPORT_SCOPE else {
+            return false;
+        };
+        let passport = self.passport();
+        passport.service_account_id().is_some()
+            && passport
+                .claim::<Vec<String>>(SCOPES_CLAIM)
+                .is_some_and(|scopes| scopes.iter().any(|scope| scope == import_scope))
+    }
 
     fn is_runner(&self) -> bool {
         let passport = self.passport();

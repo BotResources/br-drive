@@ -15,7 +15,34 @@ fn row_to_workspace(row: &sqlx::postgres::PgRow) -> WorkspaceRow {
         owner_id: row.get("owner_id"),
         name: row.get("name"),
         created_at: row.get("created_at"),
+        file_count: 0,
+        ready_file_count: 0,
     }
+}
+
+/// Fills the read-side file counts of the drive each workspace owns, in one
+/// statement for the whole batch.
+#[cfg(feature = "drive")]
+async fn with_file_counts(
+    conn: &mut PgConnection,
+    workspaces: &mut [WorkspaceRow],
+) -> Result<(), EngineError> {
+    let ids: Vec<Uuid> = workspaces.iter().map(|workspace| workspace.id).collect();
+    let counts = br_drive::file_counts(conn, &ids).await?;
+    for workspace in workspaces {
+        let counted = counts.get(&workspace.id).copied().unwrap_or_default();
+        workspace.file_count = counted.files;
+        workspace.ready_file_count = counted.ready;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "drive"))]
+async fn with_file_counts(
+    _conn: &mut PgConnection,
+    _workspaces: &mut [WorkspaceRow],
+) -> Result<(), EngineError> {
+    Ok(())
 }
 
 pub struct WorkspaceStore;
@@ -34,9 +61,11 @@ impl Persistence for WorkspaceStore {
         Box::pin(async move {
             let row = sqlx::query(&format!("SELECT {COLUMNS} FROM workspace WHERE id = $1"))
                 .bind(key)
-                .fetch_optional(conn)
+                .fetch_optional(&mut *conn)
                 .await?;
-            Ok(row.as_ref().map(row_to_workspace))
+            let mut found: Vec<WorkspaceRow> = row.as_ref().map(row_to_workspace).into_iter().collect();
+            with_file_counts(conn, &mut found).await?;
+            Ok(found.pop())
         })
     }
 
@@ -56,14 +85,13 @@ impl Persistence for WorkspaceStore {
                 "SELECT {COLUMNS} FROM workspace WHERE id = ANY($1)"
             ))
             .bind(keys)
-            .fetch_all(conn)
+            .fetch_all(&mut *conn)
             .await?;
-            Ok(rows
-                .iter()
-                .map(|row| {
-                    let workspace = row_to_workspace(row);
-                    (workspace.id, workspace)
-                })
+            let mut workspaces: Vec<WorkspaceRow> = rows.iter().map(row_to_workspace).collect();
+            with_file_counts(conn, &mut workspaces).await?;
+            Ok(workspaces
+                .into_iter()
+                .map(|workspace| (workspace.id, workspace))
                 .collect())
         })
     }

@@ -102,6 +102,7 @@ impl DriveHost for ArchivePrincipal {
     const VISIBILITY_DEPS: Deps = Deps::ALL;
     const SOURCE_ORPHAN_AFTER: Duration = Duration::from_secs(8);
     const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(8);
+    type DriveOwner = br_drive::NoDriveOwner;
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate {
         let human = self.passport.user_id().is_some();

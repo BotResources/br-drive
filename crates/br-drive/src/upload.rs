@@ -15,7 +15,7 @@ use crate::blob::DriveSource;
 use crate::drive::DriveRow;
 use crate::fault::{DriveFault, DriveReactionFault, codes};
 use crate::file::store;
-use crate::file::{File, FileCause, FileRow, ProcessingState};
+use crate::file::{FileCause, FileRow, ProcessingState};
 use crate::host::{DriveHost, DriveRequest};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
@@ -151,7 +151,7 @@ pub fn request_upload<'m, H: DriveHost>(
             host: PhantomData,
         };
         cx.create(&file).await?;
-        cx.impact_caused::<File, _>(&file.id, FileCause::UploadRequested)?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::UploadRequested)?;
         let window = TimeDelta::from_std(cx.principal().upload_window()).map_err(|_| {
             DriveFault::Engine(service_engine::error::EngineError::Config(
                 "the host's upload window does not fit a scheduled deadline".into(),
@@ -202,7 +202,7 @@ pub fn commit_upload<'m, H: DriveHost>(
             input.ruleset_id,
         )
         .await?;
-        cx.impact_caused::<File, _>(&file.id, FileCause::UploadCommitted)?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::UploadCommitted)?;
         match ruleset {
             Some(ruleset) => {
                 let initiator = processing::Initiator::of(cx.principal());
@@ -259,7 +259,7 @@ pub fn upload_deadline<'r, H: DriveHost>(
             return Ok(());
         }
         cx.delete(&file).await?;
-        cx.impact_caused::<File, _>(&file.id, FileCause::UploadAbandoned)?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::UploadAbandoned)?;
         Ok(())
     })
 }
