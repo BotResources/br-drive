@@ -8,13 +8,14 @@ use service_engine::impact::Impact;
 use service_engine::name::ProjectorName;
 use service_engine::population::Population;
 use service_engine::projector::Emission;
-use service_engine::view::{Populate, Projector, windowed};
+use service_engine::view::{Populate, Projector};
 use service_engine::visibility::Unrestricted;
 use uuid::Uuid;
 
 use super::store::{RulesetStore, all_ids};
 use super::{DriveStep, Ruleset, RulesetRow, Trigger};
 use crate::host::{DriveHost, DriveRequest};
+use crate::host_window::catalogue_window;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject)]
 pub struct DriveRuleset {
@@ -67,10 +68,10 @@ impl<H: DriveHost> Projector for DriveRulesets<H> {
             .drive_gate(&DriveRequest::ReadRulesets)
             .is_allowed()
         {
-            return Ok(Population::Keys(BTreeSet::new()));
+            return Ok(catalogue_window::<Ruleset>(BTreeSet::new()));
         }
         let mut conn = cx.pool().acquire().await.map_err(EngineError::from)?;
-        Ok(windowed::<Self>(
+        Ok(catalogue_window::<Ruleset>(
             all_ids(&mut conn).await?.into_iter().collect(),
         ))
     }

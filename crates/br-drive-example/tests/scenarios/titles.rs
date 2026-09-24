@@ -4,7 +4,10 @@
 use uuid::Uuid;
 
 use crate::harness::upload::{UploadRequest, request, upload};
-use crate::harness::{World, drive_subscription, error_code, next_drive_delta, ok, passport};
+use crate::harness::{
+    DRIVE_DELTAS, Subscription, World, drive_subscription, error_code, next_drive_delta, ok,
+    passport, quiet,
+};
 
 const BYTES: &[u8] = b"a titled document";
 const RETITLE: &str =
@@ -69,6 +72,14 @@ async fn an_upload_takes_its_title_or_the_name_without_its_extension() {
         .await;
         assert_eq!(error_code(&refused), "INVALID_TITLE", "{title:?}");
     }
+    assert!(
+        !world
+            .drive_files(&owner, drive)
+            .await
+            .iter()
+            .any(|file| file["name"] == "refused.txt"),
+        "a refused title leaves no file behind"
+    );
     let exact = "é".repeat(255);
     ok(&request(
         &world,
@@ -100,11 +111,7 @@ async fn a_retitle_changes_the_title_only_and_a_rename_or_move_never_touches_it(
     .await;
     world.await_source_promoted(file_id).await;
     let mut files = drive_subscription(&world, &owner, drive).await;
-    while files
-        .try_next_payload(std::time::Duration::from_millis(500))
-        .await
-        .is_some()
-    {}
+    quiet(&mut files).await;
     let before = world.file(&owner, file_id).await;
     assert_eq!(before["title"], "scan-0042");
     assert_eq!(before["affordances"]["retitle"]["allowed"], true);
@@ -153,7 +160,11 @@ async fn a_retitle_changes_the_title_only_and_a_rename_or_move_never_touches_it(
             serde_json::json!({ "f": file_id, "t": "Mine now" }),
         )
         .await;
-    assert_eq!(error_code(&foreign), "NOT_THE_WORKSPACE_OWNER");
+    assert_eq!(
+        error_code(&foreign),
+        "FILE_NOT_FOUND",
+        "to a stranger the file is not found, as an unknown id is"
+    );
     let unknown = world
         .gql(
             &owner,
@@ -192,6 +203,88 @@ async fn a_retitle_changes_the_title_only_and_a_rename_or_move_never_touches_it(
     let moved = world.file(&owner, file_id).await;
     assert_eq!(moved["driveId"], other.to_string());
     assert_eq!(moved["title"], "Lease agreement");
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_protected_file_keeps_its_name_and_place_but_can_be_retitled() {
+    // Given: a file its host protected, watched by its owner
+    let world = World::start("pod-title-protected").await;
+    let owner = passport(Uuid::now_v7());
+    let drive = world.create_workspace(&owner, "library").await;
+    let file_id = upload(
+        &world,
+        &owner,
+        &UploadRequest::text(drive, "", "contract.txt", BYTES),
+    )
+    .await;
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$p:Boolean!){workspaceProtectFile(fileId:$f,protected:$p){success}}",
+            serde_json::json!({ "f": file_id, "p": true }),
+        )
+        .await);
+    world.await_source_promoted(file_id).await;
+    let mut files = drive_subscription(&world, &owner, drive).await;
+    quiet(&mut files).await;
+
+    // Then: rename and move are blocked by the protection, retitle is not
+    let file = world.file(&owner, file_id).await;
+    assert_eq!(file["affordances"]["rename"]["reason"], "FILE_PROTECTED");
+    assert_eq!(file["affordances"]["move"]["reason"], "FILE_PROTECTED");
+    assert_eq!(file["affordances"]["retitle"]["allowed"], true);
+
+    // When: the owner retitles it
+    ok(&world
+        .gql(
+            &owner,
+            RETITLE,
+            serde_json::json!({ "f": file_id, "t": "Signed contract" }),
+        )
+        .await);
+    // Then: the title changes, live
+    let retitled = next_drive_delta(&mut files, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "Retitled"
+    })
+    .await;
+    assert_eq!(retitled["view"]["title"], "Signed contract");
+    assert_eq!(retitled["view"]["name"], "contract.txt");
+
+    // When: the owner tries to rename it
+    let renamed = world
+        .gql(
+            &owner,
+            "mutation($f:UUID!){workspaceUpdateFile(fileId:$f,name:\"other.txt\"){success}}",
+            serde_json::json!({ "f": file_id }),
+        )
+        .await;
+    // Then: the protection holds, and nothing moves
+    assert_eq!(error_code(&renamed), "FILE_PROTECTED");
+    files
+        .expect_silence(std::time::Duration::from_millis(600))
+        .await;
+
+    // And: a fresh session's snapshot carries the new title
+    let mut fresh = Subscription::open_with(
+        &world.subscription_url(),
+        &owner,
+        DRIVE_DELTAS,
+        serde_json::json!({ "d": drive }),
+    )
+    .await;
+    let reset = fresh.next_payload(std::time::Duration::from_secs(10)).await;
+    let views = reset["workspaceDriveChanged"]["views"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        views
+            .iter()
+            .any(|view| view["id"] == file_id.to_string() && view["title"] == "Signed contract"),
+        "{reset}"
+    );
 
     world.cleanup().await;
 }

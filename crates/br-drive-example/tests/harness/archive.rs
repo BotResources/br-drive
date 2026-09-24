@@ -106,7 +106,9 @@ impl DriveHost for ArchivePrincipal {
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate {
         let human = self.passport.user_id().is_some();
         let allowed = match request {
-            DriveRequest::ManageRulesets | DriveRequest::ReadRulesets => human,
+            DriveRequest::ManageRulesets
+            | DriveRequest::ReadRulesets
+            | DriveRequest::ReadLabels => human,
             other => other
                 .drive()
                 .is_some_and(|drive| self.drives.contains(&drive)),

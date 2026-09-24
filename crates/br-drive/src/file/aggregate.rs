@@ -91,6 +91,7 @@ pub struct UnknownDbValue(pub &'static str, pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+#[non_exhaustive]
 pub enum FileCause {
     UploadRequested,
     UploadCommitted,
@@ -107,7 +108,6 @@ pub enum FileCause {
     ImagesDropped { names: Vec<String> },
     ReportStored { job_id: Uuid, done: bool },
     ProcessingStarted { job_id: Uuid, step: i32 },
-    LaunchDeferred { step: i32 },
     ProgressChanged,
     ProcessingFinished,
     ProcessingFailed { reason: String },
@@ -116,6 +116,7 @@ pub enum FileCause {
     Deleted,
     FolderDeleted,
     DriveDeleted,
+    LaunchDeferred { step: i32 },
 }
 
 pub struct FileRow<H> {
@@ -149,6 +150,7 @@ pub struct FileRow<H> {
     pub done_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub step_entered_at: Option<DateTime<Utc>>,
+    pub step_alive_at: Option<DateTime<Utc>>,
     pub stray_job_id: Option<Uuid>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
@@ -189,6 +191,7 @@ impl<H> Clone for FileRow<H> {
             done_at: self.done_at,
             completed_at: self.completed_at,
             step_entered_at: self.step_entered_at,
+            step_alive_at: self.step_alive_at,
             stray_job_id: self.stray_job_id,
             created_by: self.created_by,
             created_at: self.created_at,
@@ -210,16 +213,34 @@ impl<H> std::fmt::Debug for FileRow<H> {
     }
 }
 
-// Every gate asks the host first and the file's state second: a principal the
-// host refuses learns the host's code, never the state of a file it may not
-// see (a host reports an invisible file as not found, never as forbidden).
+// Every gate asks the host first and the file's state second, and a refusal
+// about a file the principal cannot see is `FILE_NOT_FOUND` — exactly what an
+// unknown id answers. A principal the host refuses therefore learns neither
+// the state nor the existence of a file it may not see; one who sees the file
+// learns the host's reason, then the state.
+
+/// The host's answer about `file`, told as not found to a principal whose
+/// visible drives do not hold the file.
+pub(crate) fn host_gate<H: DriveHost>(
+    file: &FileRow<H>,
+    principal: &H,
+    request: &DriveRequest<'_, H>,
+) -> Gate {
+    let host = principal.drive_gate(request);
+    if host.is_allowed() || principal.visible_drives().contains(&file.drive_id) {
+        host
+    } else {
+        Gate::blocked(codes::FILE_NOT_FOUND)
+    }
+}
 
 fn host_then<H: DriveHost>(
+    file: &FileRow<H>,
     principal: &H,
     request: DriveRequest<'_, H>,
     state: impl FnOnce() -> Option<Reason>,
 ) -> Gate {
-    let host = principal.drive_gate(&request);
+    let host = host_gate(file, principal, &request);
     if !host.is_allowed() {
         return host;
     }
@@ -234,13 +255,13 @@ fn unprotected<H: DriveHost>(
     principal: &H,
     request: DriveRequest<'_, H>,
 ) -> Gate {
-    host_then(principal, request, || {
+    host_then(file, principal, request, || {
         file.protected.then_some(codes::FILE_PROTECTED)
     })
 }
 
 fn ready<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
-    host_then(principal, request, || match file.processing_state {
+    host_then(file, principal, request, || match file.processing_state {
         ProcessingState::Ready => None,
         ProcessingState::Processing => Some(codes::FILE_PROCESSING),
         ProcessingState::Pending | ProcessingState::Failed => Some(codes::FILE_NOT_READY),
@@ -248,13 +269,13 @@ fn ready<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'
 }
 
 fn landed<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
-    host_then(principal, request, || {
+    host_then(file, principal, request, || {
         (file.processing_state == ProcessingState::Pending).then_some(codes::FILE_NOT_READY)
     })
 }
 
 fn settled<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
-    host_then(principal, request, || match file.processing_state {
+    host_then(file, principal, request, || match file.processing_state {
         ProcessingState::Ready | ProcessingState::Failed => None,
         ProcessingState::Processing => Some(codes::FILE_PROCESSING),
         ProcessingState::Pending => Some(codes::FILE_NOT_READY),
@@ -297,22 +318,22 @@ service_engine::gated! {
         settled(this, principal, DriveRequest::Process { file: this })
     }
     "setLabels" => fn set_labels_gate(this, principal) {
-        principal.drive_gate(&DriveRequest::SetFileLabels { file: this })
+        host_gate(this, principal, &DriveRequest::SetFileLabels { file: this })
+    }
+    "commit" => fn commit_gate(this, principal) {
+        host_then(this, principal, DriveRequest::CommitUpload { file: this }, || {
+            (this.processing_state != ProcessingState::Pending).then_some(codes::FILE_NOT_PENDING)
+        })
+    }
+    "setMetadata" => fn set_metadata_gate(this, principal) {
+        host_gate(this, principal, &DriveRequest::SetMetadata { file: this })
     }
     "retitle" => fn retitle_gate(this, principal) {
-        principal.drive_gate(&DriveRequest::RetitleFile { file: this })
+        host_gate(this, principal, &DriveRequest::RetitleFile { file: this })
     }
 }
 
 impl<H: DriveHost> FileRow<H> {
-    pub fn require_pending(&self) -> Result<(), Reason> {
-        if self.processing_state == ProcessingState::Pending {
-            Ok(())
-        } else {
-            Err(codes::FILE_NOT_PENDING)
-        }
-    }
-
     pub fn move_to_gate(&self, principal: &H, target_drive: Uuid) -> Gate {
         unprotected(
             self,
@@ -324,15 +345,8 @@ impl<H: DriveHost> FileRow<H> {
         )
     }
 
-    /// The host's commit gate, then the pending state.
-    pub fn commit_gate(&self, principal: &H) -> Gate {
-        host_then(principal, DriveRequest::CommitUpload { file: self }, || {
-            (self.processing_state != ProcessingState::Pending).then_some(codes::FILE_NOT_PENDING)
-        })
-    }
-
     pub fn read_gate(&self, principal: &H) -> Gate {
-        principal.drive_gate(&DriveRequest::ReadFile { file: self })
+        host_gate(self, principal, &DriveRequest::ReadFile { file: self })
     }
 
     pub fn regenerate_page_gate(&self, principal: &H, number: i32) -> Gate {

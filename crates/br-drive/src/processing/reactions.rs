@@ -10,11 +10,9 @@ use service_engine::pipeline::Reaction;
 use uuid::Uuid;
 
 use super::CANCELLED;
+use super::backstop::schedule_retry;
 use super::chain::{advance, file_of_job, mark_failed};
 use super::commands::JobCancel;
-
-/// The rejection parameter carrying the job that holds the source entity.
-const ACTIVE_JOB_ID_PARAM: &str = "activeJobId";
 use crate::fault::DriveReactionFault;
 use crate::file::{File, FileCause, FileRow, ProcessingState};
 use crate::host::DriveHost;
@@ -91,6 +89,12 @@ job_fact!(
     contract_jobs::evt_job_cancelled_v1_coords
 );
 
+/// The rejection parameters Jobs sets on `duplicate_active_entity`: the job
+/// holding the source entity, and the source it names.
+const ACTIVE_JOB_ID_PARAM: &str = "activeJobId";
+const SOURCE_ENTITY_PARAM: &str = "sourceEntityId";
+const SOURCE_BC_PARAM: &str = "sourceBc";
+
 pub const DURABLE_QUEUED: &str = "job-queued";
 pub const DURABLE_CREATION_REJECTED: &str = "job-creation-rejected";
 pub const DURABLE_STARTED: &str = "job-started";
@@ -117,26 +121,37 @@ async fn fail_file<H: DriveHost>(
     Ok(())
 }
 
-pub fn on_queued<'r>(
+/// Jobs queued the file's job: a job it still held on the file before (the
+/// stray) is no longer in the way, so the file forgets it.
+pub fn on_queued<'r, H: DriveHost>(
     cx: &'r mut Reaction<'r>,
     fact: QueuedFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        if let Some(file) = file_of_job(cx.connection(), fact.0.job_id).await? {
-            tracing::debug!(%file, job = %fact.0.job_id, runner_type = %fact.0.runner_type, "job queued");
+        let Some(mut file) = active_file::<H>(cx, fact.0.job_id).await? else {
+            return Ok(());
+        };
+        tracing::debug!(file = %file.id, job = %fact.0.job_id, runner_type = %fact.0.runner_type, "job queued");
+        if file.stray_job_id.take().is_some() {
+            cx.save(&file).await?;
         }
         Ok(())
     })
 }
 
-pub fn on_started<'r>(
+/// A run of the file's job started: a sign of life, which pushes the step's
+/// deadline back.
+pub fn on_started<'r, H: DriveHost>(
     cx: &'r mut Reaction<'r>,
     fact: StartedFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        if let Some(file) = file_of_job(cx.connection(), fact.0.job_id).await? {
-            tracing::debug!(%file, job = %fact.0.job_id, run = %fact.0.run_id, "job started");
-        }
+        let Some(mut file) = active_file::<H>(cx, fact.0.job_id).await? else {
+            return Ok(());
+        };
+        tracing::debug!(file = %file.id, job = %fact.0.job_id, run = %fact.0.run_id, "job started");
+        file.step_alive_at = Some(cx.now().as_datetime());
+        cx.save(&file).await?;
         Ok(())
     })
 }
@@ -150,11 +165,22 @@ pub fn on_creation_rejected<'r, H: DriveHost>(
             return Ok(());
         };
         if fact.0.reason_code == REASON_DUPLICATE_ACTIVE_ENTITY {
-            // Jobs still holds a live job on this file that the library lost
-            // track of (a lost `job.finish`, a restored database, …). Its id is
-            // kept and it is cancelled now; the next launch cancels it again
-            // before asking for a new job, so a reprocess always gets through.
-            if let Some(stray) = active_job_of(&fact.0.params) {
+            // Jobs still holds a live job on this file. Either it is one the
+            // file already asked Jobs to cancel, and the cancel and this create
+            // crossed on Jobs' separate consumers: the step waits and asks
+            // again. Or the library had lost track of it (a lost `job.finish`,
+            // a restored database, …): its id is kept, it is cancelled now, and
+            // the next launch cancels it again before asking for a new job.
+            if let Some(stray) = active_job_of::<H>(&fact.0.params, file.id) {
+                if file.stray_job_id == Some(stray) {
+                    file.job_id = None;
+                    schedule_retry(cx, &file, 0)?;
+                    file.updated_at = cx.now().as_datetime();
+                    cx.save(&file).await?;
+                    let step = file.step_index.unwrap_or(0);
+                    cx.impact_caused::<File, _>(&file.id, FileCause::LaunchDeferred { step })?;
+                    return Ok(());
+                }
                 file.stray_job_id = Some(stray);
                 cx.command(JobCancel {
                     payload: CancelJob { job_id: stray },
@@ -171,12 +197,20 @@ pub fn on_creation_rejected<'r, H: DriveHost>(
     })
 }
 
-/// The live job Jobs names on a `duplicate_active_entity` rejection.
-fn active_job_of(params: &serde_json::Value) -> Option<Uuid> {
-    params
-        .get(ACTIVE_JOB_ID_PARAM)
-        .and_then(serde_json::Value::as_str)
-        .and_then(|id| Uuid::parse_str(id).ok())
+/// The live job Jobs names on a `duplicate_active_entity` rejection — only when
+/// the rejection is about this very file of this host, as Jobs states it.
+fn active_job_of<H: DriveHost>(params: &serde_json::Value, file: Uuid) -> Option<Uuid> {
+    active_job_of_service(params, file, H::SERVICE)
+}
+
+fn active_job_of_service(params: &serde_json::Value, file: Uuid, service: &str) -> Option<Uuid> {
+    let text = |key: &str| params.get(key).and_then(serde_json::Value::as_str);
+    let names_elsewhere = text(SOURCE_ENTITY_PARAM).is_some_and(|id| id != file.to_string())
+        || text(SOURCE_BC_PARAM).is_some_and(|bc| bc != service);
+    if names_elsewhere {
+        return None;
+    }
+    text(ACTIVE_JOB_ID_PARAM).and_then(|id| Uuid::parse_str(id).ok())
 }
 
 pub fn on_plan_declared<'r, H: DriveHost>(
@@ -191,6 +225,7 @@ pub fn on_plan_declared<'r, H: DriveHost>(
             return Ok(());
         }
         file.plan = Some(fact.0.steps);
+        file.step_alive_at = Some(cx.now().as_datetime());
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
         cx.impact_caused::<File, _>(&file.id, FileCause::ProgressChanged)?;
@@ -223,6 +258,7 @@ pub fn on_step_started<'r, H: DriveHost>(
         file.progress_index = Some(index);
         file.progress_label = Some(fact.0.label);
         file.progress_at = Some(started_at);
+        file.step_alive_at = Some(cx.now().as_datetime());
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
         cx.impact_caused::<File, _>(&file.id, FileCause::ProgressChanged)?;
@@ -281,4 +317,44 @@ pub fn on_cancelled<'r, H: DriveHost>(
         };
         fail_file(cx, file, CANCELLED).await
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_duplicate_rejection_names_a_job_only_about_this_file_of_this_host() {
+        let file = Uuid::now_v7();
+        let active = Uuid::now_v7();
+        let params = |entity: Uuid, bc: &str, job: serde_json::Value| {
+            serde_json::json!({
+                "activeJobId": job, "sourceEntityId": entity, "sourceBc": bc,
+            })
+        };
+        let named = |value: serde_json::Value| active_job_of_service(&value, file, "host");
+        assert_eq!(
+            named(params(file, "host", serde_json::json!(active))),
+            Some(active)
+        );
+        assert_eq!(
+            named(serde_json::json!({ "activeJobId": active })),
+            Some(active),
+            "without the source keys the job is taken as named"
+        );
+        assert_eq!(
+            named(params(Uuid::now_v7(), "host", serde_json::json!(active))),
+            None
+        );
+        assert_eq!(
+            named(params(file, "another", serde_json::json!(active))),
+            None
+        );
+        assert_eq!(
+            named(params(file, "host", serde_json::json!("not-a-uuid"))),
+            None
+        );
+        assert_eq!(named(params(file, "host", serde_json::json!(42))), None);
+        assert_eq!(named(serde_json::json!({})), None);
+    }
 }

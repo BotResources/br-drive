@@ -627,6 +627,25 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
         reindexed["view"]["estimatedTokens"].is_null(),
         "an indexing without an estimate is accepted and clears the previous one"
     );
+    // The same summary and page count with an estimate, then without it: the
+    // estimate alone decides whether the indexing changed.
+    for (estimate, expected) in [
+        (serde_json::json!(99), serde_json::json!(99)),
+        (serde_json::Value::Null, serde_json::Value::Null),
+    ] {
+        ok(&world
+            .gql(
+                &runner,
+                "mutation($f:UUID!,$j:UUID!,$t:Int){workspaceRunnerReport(fileId:$f,jobId:$j,summary:\"Re-indexed.\",pageCount:3,estimatedTokens:$t){success}}",
+                serde_json::json!({ "f": file_id, "j": job_id, "t": estimate }),
+            )
+            .await);
+        let stored = next_drive_delta(&mut files, |node| {
+            node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ReportStored"
+        })
+        .await;
+        assert_eq!(stored["view"]["estimatedTokens"], expected);
+    }
     let negative = report(
         &world,
         &runner,

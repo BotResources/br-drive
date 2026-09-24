@@ -40,7 +40,7 @@ fn id_of(label: &serde_json::Value) -> Uuid {
 }
 
 #[tokio::test]
-async fn labels_are_a_host_catalogue_managed_by_its_managers_and_read_live_by_everyone() {
+async fn labels_are_a_host_catalogue_managed_by_its_managers_and_read_live_by_its_people() {
     let world = World::start("pod-labels-crud").await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let reader = passport(Uuid::now_v7());
@@ -108,7 +108,7 @@ async fn labels_are_a_host_catalogue_managed_by_its_managers_and_read_live_by_ev
     assert_eq!(
         listed.len(),
         3,
-        "any principal of the host reads the catalogue"
+        "every person of the host reads the catalogue"
     );
     assert_eq!(
         listed[0]["name"], "Urgent",
@@ -284,7 +284,11 @@ async fn a_files_labels_are_a_target_set_that_survives_a_move_and_loses_a_delete
     let mut files = drive_subscription(&world, &owner, from).await;
 
     let foreign = set_labels(&world, &outsider, file_id, &[urgent]).await;
-    assert_eq!(error_code(&foreign), "NOT_THE_WORKSPACE_OWNER");
+    assert_eq!(
+        error_code(&foreign),
+        "FILE_NOT_FOUND",
+        "a file the outsider cannot see is not found, as an unknown id is"
+    );
     let unknown = set_labels(&world, &owner, file_id, &[urgent, Uuid::now_v7()]).await;
     assert_eq!(error_code(&unknown), "LABEL_NOT_FOUND");
     ok(&set_labels(&world, &owner, file_id, &[urgent, reviewed, urgent]).await);

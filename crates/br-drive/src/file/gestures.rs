@@ -105,9 +105,6 @@ pub fn update_file<'m, H: DriveHost>(
         let locked = cx
             .load_many::<DriveRow>(&[current_drive, target_drive])
             .await?;
-        if !locked.iter().any(|drive| drive.id == target_drive) {
-            return Err(DriveFault::Refused(codes::DRIVE_NOT_FOUND));
-        }
         let mut file = cx
             .load::<FileRow<H>>(&input.file_id)
             .await?
@@ -116,7 +113,12 @@ pub fn update_file<'m, H: DriveHost>(
         if from_drive != current_drive {
             cx.load::<DriveRow>(&from_drive).await?;
         }
+        // The host first: an unknown target drive is only told to a principal
+        // the host lets move the file there.
         file.move_to_gate(cx.principal(), target_drive).require()?;
+        if !locked.iter().any(|drive| drive.id == target_drive) {
+            return Err(DriveFault::Refused(codes::DRIVE_NOT_FOUND));
+        }
         let target_path = path.unwrap_or_else(|| file.path.clone());
         let target_name = name.unwrap_or_else(|| file.name.clone());
         let unchanged =
