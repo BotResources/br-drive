@@ -500,8 +500,9 @@ facts, faults, the `DriveHost` impl), one `workspace` slice (the host object a
 drive hangs off, owner-only gate: `workspaceCreate` / `workspaceDelete` /
 `workspaceTransfer` / `workspaceProtectFile`; the `workspace:manage` scope on
 a human passport is its `ManageRulesets` gate, any human reads the rules), the
-embedded `drive` slice, the catalogue watch started at boot,
-`src/bin/service.rs` handing everything to the engine boot kit, and `tests/`
+embedded `drive` slice, the catalogue watch started at boot (or later, for
+the scenarios that model a fresh host), a 30 s `STEP_TIMEOUT` so the timeout
+scenarios run in the suite, `src/bin/service.rs` handing everything to the engine boot kit, and `tests/`
 — the harness spawns real PostgreSQL roles, `nats-server` and `minio`, boots
 the host in process and drives it over GraphQL and a real
 `graphql-transport-ws` socket. Jobs is played by a stand-in that publishes the
