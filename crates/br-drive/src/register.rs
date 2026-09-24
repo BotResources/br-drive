@@ -33,6 +33,7 @@ pub fn register<H: DriveHost>(
     prefix: &'static str,
 ) -> Result<(), EngineError> {
     processing::declare_roots::<H>(prefix)?;
+    processing::step_timeout::<H>()?;
     if !engine.blobs_configured() {
         return Err(EngineError::Config(
             "br-drive needs object storage: configure EngineConfig::with_blob_storage before \
@@ -89,7 +90,7 @@ pub fn register<H: DriveHost>(
     )?;
     engine.register_reaction::<QueuedFact, _, _>(
         &durable(processing::DURABLE_QUEUED),
-        processing::on_queued,
+        processing::on_queued::<H>,
     )?;
     engine.register_reaction::<CreationRejectedFact, _, _>(
         &durable(processing::DURABLE_CREATION_REJECTED),
@@ -97,7 +98,7 @@ pub fn register<H: DriveHost>(
     )?;
     engine.register_reaction::<StartedFact, _, _>(
         &durable(processing::DURABLE_STARTED),
-        processing::on_started,
+        processing::on_started::<H>,
     )?;
     engine.register_reaction::<PlanDeclaredFact, _, _>(
         &durable(processing::DURABLE_PLAN_DECLARED),

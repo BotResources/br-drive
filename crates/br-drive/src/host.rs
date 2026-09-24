@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::erase::EraseMode;
 use crate::file::FileRow;
 use crate::media::MediaType;
+use crate::owner::DriveOwnerNoun;
 use crate::path::{DrivePath, FileName};
 
 pub const DRIVE_DIM: &str = "drive";
@@ -122,24 +123,46 @@ pub trait DriveHost: Principal {
 
     const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
-    /// How long one step of a processing chain may stay unfinished before the
-    /// library cancels its job and fails the file with `timed_out`. Jobs never
-    /// fails a job no live runner has picked up, so without it a file whose
-    /// runner type has no live instance would sit in PROCESSING for good. The
-    /// default matches Jobs' own inactivity timeout; a host whose steps may
-    /// legitimately run longer raises it.
     /// The host's own noun whose objects are keyed by the drive's id (the
-    /// documented convention: a drive's id is its host object's id). When set,
-    /// every file change the library stages also impacts that key, so a host
-    /// view bound to its own noun — an object showing file counts, say —
-    /// recomputes and republishes. `None` (the default) stages nothing.
-    const DRIVE_OWNER_NOUN: Option<&'static str> = None;
+    /// documented convention: a drive's id is its host object's id), or
+    /// `br_drive::NoDriveOwner`. Every file change the library stages also
+    /// impacts that key, so a host view bound to its own noun — an object
+    /// showing file counts, say — recomputes and republishes. The noun is a
+    /// type: its name and its UUID key are checked by the compiler.
+    type DriveOwner: DriveOwnerNoun;
 
-    const STEP_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+    /// How long a step of a processing chain may stay silent before the
+    /// library cancels its job and fails the file with `timed_out`. Silence is
+    /// measured from the step's last sign of life: its entry, then each run
+    /// start, plan, step and runner report — so time spent queued counts until
+    /// the first run starts. Jobs never fails a job no live runner picked up,
+    /// so without it a file whose runner type has no live instance would sit in
+    /// PROCESSING for good. The default is Jobs' own longest run (72 h), so the
+    /// library never gives up on work Jobs still allows; a host that wants its
+    /// users to learn sooner lowers it. Checked at registration: positive and
+    /// within the scheduler's range.
+    const STEP_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;
 
     fn visible_drives(&self) -> Vec<Uuid>;
+
+    /// The scope a service account must hold to import a rendition into a
+    /// file (`<p>ImportPages`, `<p>ImportImage`); `None` (the default) means
+    /// the host offers no import. The host's `DriveRequest::Import` gate then
+    /// decides file by file.
+    const IMPORT_SCOPE: Option<&'static str> = None;
+
+    fn is_importer(&self) -> bool {
+        let Some(import_scope) = Self::IMPORT_SCOPE else {
+            return false;
+        };
+        let passport = self.passport();
+        passport.service_account_id().is_some()
+            && passport
+                .claim::<Vec<String>>(SCOPES_CLAIM)
+                .is_some_and(|scopes| scopes.iter().any(|scope| scope == import_scope))
+    }
 
     fn is_runner(&self) -> bool {
         let passport = self.passport();

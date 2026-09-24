@@ -6,6 +6,7 @@ mod fault;
 mod file;
 mod folders;
 mod host;
+mod host_window;
 mod image;
 mod import;
 mod label;
@@ -47,11 +48,12 @@ pub use label::{
     MAX_LABEL_DESCRIPTION_BYTES, MAX_LABEL_NAME_CHARS, SetFileLabels, UpdateLabel,
 };
 pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
-pub use owner::{DriveOwner, FileCounts, file_counts};
+pub use owner::{DriveOwnerNoun, FileCounts, NoDriveOwner, file_counts};
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
+#[allow(deprecated)]
 pub use processing::{
-    CANCELLED, CATALOGUE_NOT_WATCHED, ChainPlan, Initiator, LAUNCH_RETRY_AFTER,
-    RUNNER_TYPE_UNAVAILABLE, RootNames, TIMED_OUT, durable,
+    CANCELLED, CATALOGUE_NOT_WATCHED, ChainPlan, Initiator, LAUNCH_RETRY_AFTER, LAUNCH_RETRY_CAP,
+    RUNNER_TYPE_UNAVAILABLE, RootNames, TIMED_OUT, durable, retry_delay,
 };
 pub use register::register;
 pub use ruleset::{

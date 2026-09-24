@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use crate::harness::runner::{RUNNER_SCOPE, install_render_rule};
+use crate::harness::runner::{RUNNER_SCOPE, Report, finish_job, install_render_rule, report};
 use crate::harness::upload::{
     UploadRequest, commit, post_bytes, request, sha256_hex, ticket, upload,
 };
 use crate::harness::{
-    JobsStandIn, Subscription, World, drive_subscription, error_code, manager_passport, next_delta,
-    next_drive_delta, next_page_delta, ok, pages_subscription, passport, service_passport,
+    JobsStandIn, Subscription, World, drive_subscription, error_code, manager_passport,
+    manager_passport_with_scopes, next_delta, next_drive_delta, next_page_delta, ok,
+    pages_subscription, passport, quiet, refute_delta, service_passport,
 };
 
 const BYTES: &[u8] = b"a document converted long ago";
@@ -89,20 +90,14 @@ async fn an_importer_writes_a_rendition_and_its_images_into_a_ready_file_without
     )
     .await);
 
-    // Then: every page reaches the live window with its origin kept
+    // Then: every page reaches the live window with its origin kept, page by
+    // page — a reset here would be a faulted session
     let mut seen = Vec::new();
     while seen.len() < 3 {
-        let delta = next_page_delta(&mut pages, |node| {
-            node["__typename"] == "DriveUpsert" || node["__typename"] == "DriveReset"
-        })
-        .await;
-        let views = match delta["__typename"].as_str() {
-            Some("DriveReset") => delta["views"].as_array().cloned().unwrap_or_default(),
-            _ => vec![delta["view"].clone()],
-        };
-        for view in views {
-            seen.push((view["number"].as_i64().unwrap(), view["origin"].clone()));
-        }
+        let delta = next_page_delta(&mut pages, |node| node["__typename"] != "LanesPaused").await;
+        assert_eq!(delta["__typename"], "DriveUpsert", "{delta}");
+        let view = &delta["view"];
+        seen.push((view["number"].as_i64().unwrap(), view["origin"].clone()));
     }
     seen.sort_by_key(|(number, _)| *number);
     seen.dedup_by_key(|(number, _)| *number);
@@ -153,6 +148,27 @@ async fn an_importer_writes_a_rendition_and_its_images_into_a_ready_file_without
             serde_json::json!({ "f": file_id }),
         )
         .await);
+    // And: the same import delivered again leaves the same rendition
+    let before: Vec<serde_json::Value> = world.file_pages(&owner, file_id).await;
+    ok(&import_pages(
+        &world,
+        &importer,
+        file_id,
+        serde_json::json!([
+            { "number": 2, "markdown": "Corrected by hand", "origin": "EDITED" },
+            { "number": 3, "markdown": "![figure](p003-img01.png)", "origin": "RUNNER" },
+        ]),
+        Some(("An old three-page document.", 3)),
+    )
+    .await);
+    let after = world.file_pages(&owner, file_id).await;
+    let content = |pages: &[serde_json::Value]| -> Vec<(serde_json::Value, serde_json::Value, serde_json::Value)> {
+        pages
+            .iter()
+            .map(|page| (page["number"].clone(), page["markdown"].clone(), page["origin"].clone()))
+            .collect()
+    };
+    assert_eq!(content(&after), content(&before));
     // And: Jobs never heard of any of it
     jobs.expect_no_command(Duration::from_millis(800)).await;
 
@@ -197,21 +213,30 @@ async fn an_import_is_the_hosts_privilege_on_a_ready_file_and_obeys_every_rendit
         .await,
     );
     let mut files = drive_subscription(&world, &owner, drive).await;
-    // Let the deltas of the Given reach the fresh session first.
-    while files
-        .try_next_payload(Duration::from_millis(500))
-        .await
-        .is_some()
-    {}
+    quiet(&mut files).await;
     let one = serde_json::json!([{ "number": 1, "markdown": "x" }]);
+    let human_importer = manager_passport_with_scopes(Uuid::now_v7(), "Ada", &[IMPORT_SCOPE]);
 
-    // When / Then: the owner and a runner are not importers — the host's code, first
-    for principal in [&owner, &runner] {
-        let refused = import_pages(&world, principal, ready, one.clone(), None).await;
-        assert_eq!(error_code(&refused), "NOT_AN_IMPORTER");
-        let image = import_image(&world, principal, ready, "p001-img01.png").await;
-        assert_eq!(error_code(&image), "NOT_AN_IMPORTER");
+    // When / Then: the owner, a runner, and even a person holding the scope are
+    // not importers — refused before any file is looked at, whatever its state
+    for principal in [&owner, &runner, &human_importer] {
+        for file in [ready, processing, pending, Uuid::now_v7()] {
+            let refused = import_pages(&world, principal, file, one.clone(), None).await;
+            assert_eq!(error_code(&refused), "IMPORT_SCOPE_REQUIRED");
+            let image = import_image(&world, principal, file, "p001-img01.png").await;
+            assert_eq!(error_code(&image), "IMPORT_SCOPE_REQUIRED");
+        }
     }
+    // And: an import never claims a page was regenerated
+    let regenerated = import_pages(
+        &world,
+        &importer,
+        ready,
+        serde_json::json!([{ "number": 1, "markdown": "x", "origin": "REGENERATED" }]),
+        None,
+    )
+    .await;
+    assert_eq!(error_code(&regenerated), "INVALID_PAGE_ORIGIN");
     // And: the importer meets the state: never during a chain, never before the commit
     assert_eq!(
         error_code(&import_pages(&world, &importer, processing, one.clone(), None).await),
@@ -353,6 +378,101 @@ async fn the_hosts_own_object_republishes_as_the_files_of_its_drive_land_fail_mo
         .await);
     // Then: its workspace is empty again
     counts_reach(&mut workspaces, library, 0, 0).await;
+
+    // When: a file's chain finishes
+    let finished = upload(
+        &world,
+        &owner,
+        &UploadRequest::text(library, "", "finished.txt", BYTES),
+    )
+    .await;
+    counts_reach(&mut workspaces, library, 1, 0).await;
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    let job = jobs.await_create(finished).await.job_id;
+    ok(&report(
+        &world,
+        &runner,
+        finished,
+        Report {
+            job_id: job,
+            pages: vec![(1, "done")],
+            origin: None,
+            indexer: None,
+            done: true,
+        },
+    )
+    .await);
+    finish_job(&world, &jobs, job).await;
+    // Then: the READY count rises when the chain lands
+    counts_reach(&mut workspaces, library, 1, 1).await;
+
+    // When: a change that moves no count happens (a retitle)
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!){workspaceRetitleFile(fileId:$f,title:\"Done\"){success}}",
+            serde_json::json!({ "f": finished }),
+        )
+        .await);
+    // Then: the host object is recomputed but unchanged, so nothing is sent
+    refute_delta(
+        &mut workspaces,
+        "workspaceDeltas",
+        Duration::from_millis(800),
+        |node| node["__typename"] == "WorkspaceUpsert",
+    )
+    .await;
+
+    // When: a folder of more files than the bulk threshold is deleted
+    for name in ["a.bin", "b.bin", "c.bin", "d.bin"] {
+        upload(
+            &world,
+            &owner,
+            &UploadRequest {
+                media_type: "application/octet-stream",
+                ..UploadRequest::text(archive, "bulk", name, BYTES)
+            },
+        )
+        .await;
+    }
+    counts_reach(&mut workspaces, archive, 5, 5).await;
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($d:UUID!,$p:String!){workspaceDeleteFolder(driveId:$d,prefix:$p){success}}",
+            serde_json::json!({ "d": archive, "p": "bulk" }),
+        )
+        .await);
+    // Then: the bulk path refreshes the host object too
+    counts_reach(&mut workspaces, archive, 1, 1).await;
+
+    // And: a fresh session's snapshot carries the current counts
+    let mut fresh = Subscription::open_with(
+        &world.subscription_url(),
+        &owner,
+        WORKSPACE_DELTAS,
+        serde_json::json!({}),
+    )
+    .await;
+    let reset = fresh.next_payload(Duration::from_secs(10)).await;
+    let views = reset["workspaceDeltas"]["views"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let counts = |id: Uuid| {
+        views
+            .iter()
+            .find(|view| view["id"] == id.to_string())
+            .map(|view| (view["fileCount"].clone(), view["readyFileCount"].clone()))
+    };
+    assert_eq!(
+        counts(library),
+        Some((serde_json::json!(1), serde_json::json!(1)))
+    );
+    assert_eq!(
+        counts(archive),
+        Some((serde_json::json!(1), serde_json::json!(1)))
+    );
 
     world.cleanup().await;
 }

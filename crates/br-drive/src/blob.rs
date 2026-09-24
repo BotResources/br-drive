@@ -46,12 +46,9 @@ pub fn source_available<'a, H: DriveHost>(
             .await?;
         if let Some(row) = row {
             let id: Uuid = row.get("id");
-            if H::DRIVE_OWNER_NOUN.is_some() {
+            if crate::owner::refreshes::<H>() {
                 let drive: Uuid = row.get("drive_id");
-                ps.impact_caused::<crate::owner::DriveOwner<H>, _>(
-                    &drive,
-                    FileCause::SourceAvailable,
-                )?;
+                ps.impact::<H::DriveOwner>(&drive, service_engine::impact::Dims::ALL)?;
             }
             ps.impact_caused::<File, _>(&id, FileCause::SourceAvailable)?;
         }

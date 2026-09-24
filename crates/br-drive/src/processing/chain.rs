@@ -1,4 +1,4 @@
-use chrono::{SubsecRound, TimeDelta};
+use chrono::SubsecRound;
 use contract_jobs::command::{CancelJob, CreateJob, FinishJob};
 use service_engine::BlobRef;
 use service_engine::error::EngineError;
@@ -7,7 +7,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::RUNNER_TYPE_UNAVAILABLE;
-use super::backstop::{LAUNCH_RETRY_AFTER, LaunchRetry, StepDeadline};
+use super::backstop::{schedule_deadline, schedule_retry};
 use super::commands::{Initiator, JobCancel, JobCreate, JobFinish};
 use super::roots::roots;
 use crate::catalogue;
@@ -66,6 +66,7 @@ fn clear_run<H>(file: &mut FileRow<H>) {
     file.step_count = None;
     file.step_runner_type = None;
     file.step_entered_at = None;
+    file.step_alive_at = None;
     file.plan = None;
     file.progress_index = None;
     file.progress_label = None;
@@ -130,20 +131,14 @@ async fn launch_step<H: DriveHost>(
     file.step_index = Some(index as i32);
     file.step_count = Some(steps.len() as i32);
     file.step_runner_type = Some(step.runner_type.clone());
-    // The row keeps microseconds: the step's identity is compared at that precision.
+    // The step's identity is its index and this instant, compared at the
+    // row's microsecond precision (the engine clock already is).
     let entered = cx.now().as_datetime().trunc_subsecs(6);
     file.step_entered_at = Some(entered);
-    let launched = stage_job(cx, file).await?;
+    file.step_alive_at = Some(entered);
+    let launched = stage_job(cx, file, 0).await?;
     if launched != Launched::Ended {
-        let timeout = TimeDelta::from_std(H::STEP_TIMEOUT).map_err(|_| {
-            DriveFault::Engine(EngineError::Config(
-                "the host's step timeout does not fit a scheduled deadline".into(),
-            ))
-        })?;
-        cx.schedule_at(
-            cx.now() + timeout,
-            StepDeadline::<H>::new(file.id, index as i32, entered),
-        )?;
+        schedule_deadline(cx, file)?;
     }
     Ok(launched)
 }
@@ -154,8 +149,9 @@ async fn launch_step<H: DriveHost>(
 pub(super) async fn stage_job<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
+    attempt: u32,
 ) -> Result<Launched, DriveFault> {
-    let (Some(index), Some(entered)) = (file.step_index, file.step_entered_at) else {
+    let (Some(index), Some(_)) = (file.step_index, file.step_entered_at) else {
         return Err(DriveFault::Engine(EngineError::Config(
             "a job is staged only for a file inside a step".into(),
         )));
@@ -166,25 +162,28 @@ pub(super) async fn stage_job<H: DriveHost>(
         return Ok(Launched::Ended);
     };
     if !catalogue::scanned(cx.connection()).await? {
-        tracing::warn!(
-            file = %file.id,
-            runner_type = %step.runner_type,
-            "no runner-type catalogue scan has completed on this host yet; the step's launch is \
-             deferred (start `br_drive::watch_runner_types` next to the engine)"
-        );
-        cx.schedule_at(
-            cx.now() + TimeDelta::from_std(LAUNCH_RETRY_AFTER).unwrap_or(TimeDelta::seconds(5)),
-            LaunchRetry::<H>::new(file.id, index, entered),
-        )?;
+        if attempt == 0 {
+            tracing::warn!(
+                file = %file.id,
+                runner_type = %step.runner_type,
+                "no runner-type catalogue scan has completed on this host yet; the step's \
+                 launch is deferred (start `br_drive::watch_runner_types` next to the engine)"
+            );
+        } else {
+            tracing::debug!(file = %file.id, attempt, "the step's launch is deferred again");
+        }
+        schedule_retry(cx, file, attempt)?;
         return Ok(Launched::Deferred);
     }
     if !catalogue::is_active(cx.connection(), &step.runner_type).await? {
         mark_failed(file, RUNNER_TYPE_UNAVAILABLE);
         return Ok(Launched::Ended);
     }
-    // A job Jobs still holds on this file blocks every create on it
-    // (`duplicate_active_entity`): it is cancelled before the new one is asked for.
-    if let Some(stray) = file.stray_job_id.take() {
+    // A job Jobs may still hold on this file blocks every create on it
+    // (`duplicate_active_entity`): it is cancelled before the new one is asked
+    // for, and stays known until Jobs queues the new one — Jobs consumes the
+    // cancel and the create on separate durables, so they may cross.
+    if let Some(stray) = file.stray_job_id {
         cx.command(JobCancel {
             payload: CancelJob { job_id: stray },
         })?;
@@ -216,7 +215,7 @@ pub(super) async fn stage_job<H: DriveHost>(
             producer: H::SERVICE.to_string(),
             config: Some(config),
             parent_job_id: None,
-            triggered_by: Some(initiator.triggered_by()),
+            triggered_by: initiator.triggered_by(),
             source_bc: Some(H::SERVICE.to_string()),
             source_entity_id: Some(file.id),
             max_attempts: None,
@@ -266,6 +265,9 @@ pub async fn advance<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
 ) -> Result<(), DriveFault> {
+    // Jobs accepted and completed the step's job, so no stray job stood in
+    // its way any more.
+    file.stray_job_id = None;
     let next = file.step_index.unwrap_or(0) as usize + 1;
     let launched = launch_step(cx, file, next).await?;
     file.updated_at = cx.now().as_datetime();

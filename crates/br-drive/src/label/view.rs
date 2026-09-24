@@ -8,13 +8,14 @@ use service_engine::impact::Impact;
 use service_engine::name::ProjectorName;
 use service_engine::population::Population;
 use service_engine::projector::Emission;
-use service_engine::view::{Populate, Projector, windowed};
+use service_engine::view::{Populate, Projector};
 use service_engine::visibility::Unrestricted;
 use uuid::Uuid;
 
 use super::store::{LabelStore, all_ids};
 use super::{Label, LabelRow};
 use crate::host::{DriveHost, DriveRequest};
+use crate::host_window::catalogue_window;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject)]
 pub struct DriveLabel {
@@ -64,11 +65,11 @@ impl<H: DriveHost> Projector for DriveLabels<H> {
             .drive_gate(&DriveRequest::ReadLabels)
             .is_allowed()
         {
-            return Ok(Population::Keys(BTreeSet::new()));
+            return Ok(catalogue_window::<Label>(BTreeSet::new()));
         }
         let mut conn = cx.pool().acquire().await.map_err(EngineError::from)?;
         let keys: BTreeSet<Uuid> = all_ids(&mut conn).await?.into_iter().collect();
-        Ok(windowed::<Self>(keys))
+        Ok(catalogue_window::<Label>(keys))
     }
 
     fn project(row: &LabelRow, _principal: &H) -> Result<DriveLabel, EngineError> {

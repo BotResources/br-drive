@@ -321,6 +321,13 @@ async fn a_rule_saved_before_the_first_catalogue_scan_is_kept_with_its_steps_fla
     )
     .await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let jobs = JobsStandIn::attach(&world).await;
+    // Jobs already publishes both types ACTIVE: only the missing scan explains
+    // the warning below.
+    for runner_type in [RENDER, INDEX] {
+        jobs.declare_runner_type(runner_type, RunnerTypeLifecycle::Active)
+            .await;
+    }
 
     let saved = create_ruleset(
         &world,
@@ -329,14 +336,17 @@ async fn a_rule_saved_before_the_first_catalogue_scan_is_kept_with_its_steps_fla
             name: "early",
             trigger: "UPLOAD",
             media_types: &["*"],
-            steps: &[(RENDER, serde_json::json!({}))],
+            steps: &[
+                (RENDER, serde_json::json!({})),
+                (INDEX, serde_json::json!({})),
+            ],
             is_default: true,
         },
     )
     .await;
     assert_eq!(
         ok(&saved)["workspaceCreateRuleset"]["unknownRunnerTypes"],
-        serde_json::json!([RENDER]),
+        serde_json::json!([INDEX, RENDER]),
         "a host that has not scanned yet cannot vouch for any runner type: a warning, not a refusal"
     );
     assert_eq!(world.rulesets(&manager).await.len(), 1);

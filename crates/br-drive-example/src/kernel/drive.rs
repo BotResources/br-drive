@@ -41,9 +41,14 @@ impl DriveHost for AppPrincipal {
 
     const BULK_RESET_THRESHOLD: usize = 3;
 
-    const STEP_TIMEOUT: Duration = Duration::from_secs(20);
+    const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
-    const DRIVE_OWNER_NOUN: Option<&'static str> = Some("workspace");
+    #[cfg(feature = "workspace")]
+    type DriveOwner = crate::slices::workspace::Workspace;
+    #[cfg(not(feature = "workspace"))]
+    type DriveOwner = br_drive::NoDriveOwner;
+
+    const IMPORT_SCOPE: Option<&'static str> = Some(IMPORT_SCOPE);
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate {
         if let DriveRequest::CreateFile { media_type, .. } = request

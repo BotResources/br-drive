@@ -20,6 +20,11 @@ impl Noun for Workspace {
     const NAME: NounName = NounName::from_static("workspace");
 }
 
+/// A workspace is the object its drive hangs off (same id): it refreshes when
+/// the drive's files change.
+#[cfg(feature = "drive")]
+impl br_drive::DriveOwnerNoun for Workspace {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum WorkspaceCause {
@@ -36,7 +41,7 @@ pub struct WorkspaceRow {
     pub created_at: DateTime<Utc>,
     /// Read-side only, never written: the files of the workspace's drive, and
     /// how many are READY — refreshed live because the kernel names this noun
-    /// as `DriveHost::DRIVE_OWNER_NOUN`.
+    /// as `DriveHost::DriveOwner`.
     #[serde(default)]
     pub file_count: i64,
     #[serde(default)]

@@ -580,14 +580,14 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
     );
     let job_b = jobs.await_create(file_id).await.job_id;
     assert_ne!(job_b, job_a);
-    jobs.reject_creation(job_b, "duplicate_active_entity").await;
+    jobs.reject_creation(job_b, "runner_type_retired").await;
     let rejected = next_drive_delta(&mut files, |node| {
         node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingFailed"
     })
     .await;
     assert_eq!(
-        rejected["view"]["processingError"],
-        "duplicate_active_entity"
+        rejected["view"]["processingError"], "runner_type_retired",
+        "a creation Jobs rejects fails the file with Jobs' own code"
     );
 
     world.cleanup().await;

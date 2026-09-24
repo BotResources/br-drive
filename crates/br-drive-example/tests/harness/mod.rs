@@ -132,7 +132,7 @@ impl World {
         let response = self
             .gql(
                 passport,
-                "query($id:UUID!){workspaceFile(fileId:$id){id driveId path name title protected \
+                "query($id:UUID!){workspaceFile(fileId:$id){id driveId path name title protected metadata \
                  mediaType sizeBytes sha256 processingState processingError summary pageCount \
                  estimatedTokens images{name mediaType sizeBytes page} labelIds rulesetId \
                  steps{runnerType options} progress{stepIndex stepCount runnerType plan \
@@ -357,6 +357,52 @@ impl World {
             .expect("read the blob row")
     }
 
+    /// Delivers a `drive_file.{verb}` command to the host as its scheduler or
+    /// the broker would — a redelivery, or a message outliving its step.
+    pub async fn send_file_command(&self, verb: &str, payload: serde_json::Value) {
+        use br_core_integration::{Actor, EventMetadata, IntegrationCommand, ServiceAccountId};
+        let command = IntegrationCommand::new(
+            Uuid::now_v7(),
+            format!("drive_file.{verb}"),
+            1,
+            chrono::Utc::now(),
+            EventMetadata::new(
+                Actor::Service(ServiceAccountId::from(Uuid::now_v7())),
+                Uuid::now_v7(),
+            ),
+            payload,
+        );
+        let bytes = serde_json::to_vec(&command).expect("the command encodes");
+        let client = async_nats::connect(self.nats_server.url())
+            .await
+            .expect("dial the ephemeral broker");
+        let js = async_nats::jetstream::new(client);
+        js.publish(
+            format!(
+                "integration.cmd.{}.drive_file.{verb}.v1",
+                br_drive_example::SERVICE
+            ),
+            bytes.into(),
+        )
+        .await
+        .expect("publish the command")
+        .await
+        .expect("the stream acks the command");
+    }
+
+    /// The step a file is in and the instant it was entered — what a step
+    /// message names.
+    pub async fn step_clock(
+        &self,
+        file_id: Uuid,
+    ) -> (Option<i32>, Option<chrono::DateTime<chrono::Utc>>) {
+        sqlx::query_as("SELECT step_index, step_entered_at FROM drive.file WHERE id = $1")
+            .bind(file_id)
+            .fetch_one(&self.db.app)
+            .await
+            .expect("the file row carries its step clock")
+    }
+
     pub async fn send_upload_deadline(&self, file_id: Uuid) {
         use br_core_integration::{Actor, EventMetadata, IntegrationCommand, ServiceAccountId};
         let command = IntegrationCommand::new(
@@ -447,11 +493,13 @@ pub fn passport(user: Uuid) -> String {
 }
 
 pub fn manager_passport(user: Uuid, display_name: &str) -> String {
+    manager_passport_with_scopes(user, display_name, &["workspace:manage"])
+}
+
+/// A person holding `scopes`, named `display_name`.
+pub fn manager_passport_with_scopes(user: Uuid, display_name: &str, scopes: &[&str]) -> String {
     let mut map = serde_json::Map::new();
-    map.insert(
-        "scopes".to_string(),
-        serde_json::json!(["workspace:manage"]),
-    );
+    map.insert("scopes".to_string(), serde_json::json!(scopes));
     map.insert("name".to_string(), serde_json::json!(display_name));
     Passport::human(
         user,
@@ -499,8 +547,8 @@ pub fn error_code(response: &serde_json::Value) -> String {
 
 pub const DRIVE_DELTAS: &str = "subscription($d:UUID!){workspaceDriveChanged(driveId:$d){\
     __typename \
-    ... on DriveReset{revision views{... on DriveFile{id path name processingState labelIds}}} \
-    ... on DriveUpsert{revision cause view{... on DriveFile{id path name title processingState processingError affordances summary pageCount estimatedTokens images{name page} labelIds rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
+    ... on DriveReset{revision views{... on DriveFile{id path name title processingState labelIds}}} \
+    ... on DriveUpsert{revision cause view{... on DriveFile{id path name title protected metadata processingState processingError affordances summary pageCount estimatedTokens images{name page} labelIds rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
     ... on DriveRemove{revision projector key cause}}}";
 
 pub const LABEL_DELTAS: &str = "subscription{workspaceLabelsChanged{\
@@ -623,6 +671,45 @@ pub async fn next_page_delta(
     matches: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
     next_delta(sub, "workspaceFilePages", matches).await
+}
+
+/// Reads the session for `within` and fails on any delta `forbidden` matches —
+/// an absence stated by what must not happen, so a late delta of the Given
+/// (a source promoted, a commit delivered) does not make it flaky.
+pub async fn refute_delta(
+    sub: &mut Subscription,
+    root: &str,
+    within: Duration,
+    forbidden: impl Fn(&serde_json::Value) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let Some(delta) = sub.try_next_payload(remaining).await else {
+            return;
+        };
+        assert!(
+            !forbidden(&delta[root]),
+            "a forbidden delta arrived: {delta}"
+        );
+    }
+}
+
+/// Lets the deltas of the gestures that built the Given reach a fresh session.
+pub async fn quiet(sub: &mut Subscription) {
+    for _ in 0..50 {
+        if sub
+            .try_next_payload(Duration::from_millis(400))
+            .await
+            .is_none()
+        {
+            return;
+        }
+    }
+    panic!("the session never went quiet");
 }
 
 pub async fn next_delta(

@@ -457,14 +457,10 @@ pub fn image_landed<'r, H: DriveHost>(
             Landing::First => {}
         }
         cx.save(&image).await?;
-        if let Some(drive) = super::store::drive_of(cx.connection(), image.file_id).await? {
-            crate::owner::touch::<H, _>(
-                cx,
-                drive,
-                FileCause::ImageAvailable {
-                    name: image.name.as_str().to_string(),
-                },
-            )?;
+        if crate::owner::refreshes::<H>()
+            && let Some(drive) = super::store::drive_of(cx.connection(), image.file_id).await?
+        {
+            crate::owner::touch::<H>(cx, drive)?;
         }
         cx.impact_caused::<File, _>(
             &image.file_id,

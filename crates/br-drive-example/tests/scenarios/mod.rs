@@ -7,6 +7,7 @@ mod folders;
 mod gates;
 mod hosts;
 mod imports;
+mod jobs_double;
 mod labels;
 mod pages;
 mod processing;

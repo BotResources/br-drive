@@ -14,7 +14,7 @@ use contract_jobs::event::{
     EVENT_TYPE_CANCELLED, EVENT_TYPE_COMPLETED, EVENT_TYPE_CREATION_REJECTED, EVENT_TYPE_FAILED,
     EVENT_TYPE_PLAN_DECLARED, EVENT_TYPE_QUEUED, EVENT_TYPE_STARTED, EVENT_TYPE_STEP_STARTED,
     FailureReport, JobCancelled, JobCompleted, JobCreationRejected, JobFailed, JobPlanDeclared,
-    JobQueued, JobStarted, JobStepStarted, REASON_DUPLICATE_ACTIVE_ENTITY,
+    JobQueued, JobStarted, JobStepStarted, REASON_DUPLICATE_ACTIVE_ENTITY, REASON_ID_REUSE,
 };
 use contract_jobs::{
     CMD_JOB_CANCEL_V2, CMD_JOB_CREATE_V1, CMD_JOB_FINISH_V2, evt_job_cancelled_v1_coords,
@@ -38,6 +38,8 @@ const EVENT_VERSION: u8 = 1;
 /// a second live job on one source entity is refused).
 #[derive(Debug, Clone)]
 struct Held {
+    /// The declaration Jobs recorded; absent for a job the test planted.
+    declared: Option<CreateJob>,
     source: Option<(String, Uuid)>,
     terminal: bool,
     deleted: bool,
@@ -49,66 +51,125 @@ struct Ledger {
     rejections: HashMap<Uuid, JobCreationRejected>,
 }
 
+/// The input checks `svc-jobs` runs before the domain (`app/create.rs::build`
+/// and the value objects of `bc-jobs`): UUIDv7 ids, a source named whole and by
+/// its producer, a display name that is not blank and at most 512 characters.
+fn malformed(create: &CreateJob) -> Option<(&'static str, &'static str)> {
+    let v7 = |id: Uuid| id.get_version_num() == 7;
+    if !v7(create.job_id) {
+        return Some(("not_uuid_v7", "job_id"));
+    }
+    match (&create.source_bc, create.source_entity_id) {
+        (Some(bc), Some(entity)) => {
+            if bc != &create.producer {
+                return Some(("corrupt_state", "source_bc_is_not_the_producer"));
+            }
+            if !v7(entity) {
+                return Some(("not_uuid_v7", "source_entity_id"));
+            }
+        }
+        (None, None) => {}
+        _ => return Some(("blank_value", "source_entity_id")),
+    }
+    if let Some(parent) = create.parent_job_id
+        && !v7(parent)
+    {
+        return Some(("not_uuid_v7", "parent_job_id"));
+    }
+    if let Some(user) = &create.triggered_by {
+        if !v7(user.id()) {
+            return Some(("not_uuid_v7", "triggered_by"));
+        }
+        let display_name = user
+            .display_name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| user.id().to_string());
+        if display_name.trim().is_empty() {
+            return Some(("blank_value", "display_name"));
+        }
+        if display_name.chars().count() > 512 {
+            return Some(("value_too_long", "display_name"));
+        }
+    }
+    None
+}
+
 impl Ledger {
-    /// The verdict Jobs would give: `None` to accept, else the rejection.
+    /// The verdict Jobs would give, in Jobs' order (input, id reuse, source,
+    /// parent): `None` to accept, else the rejection.
     fn judge(&self, create: &CreateJob) -> Option<JobCreationRejected> {
         let reject = |reason_code: &str, mut params: serde_json::Map<String, Value>| {
             params.insert("jobId".into(), Value::String(create.job_id.to_string()));
+            if let (Some(bc), Some(entity)) = (&create.source_bc, create.source_entity_id) {
+                params.insert("sourceEntityId".into(), Value::String(entity.to_string()));
+                params.insert("sourceBc".into(), Value::String(bc.clone()));
+            }
             Some(JobCreationRejected {
                 job_id: create.job_id,
                 reason_code: reason_code.to_string(),
                 params: Value::Object(params),
             })
         };
-        if self.jobs.contains_key(&create.job_id) {
-            return None;
+        let named = |key: &str, value: String| {
+            serde_json::Map::from_iter([(key.to_string(), Value::String(value))])
+        };
+        if let Some((code, field)) = malformed(create) {
+            return reject(code, named("field", field.to_string()));
         }
-        if let Some(parent) = create.parent_job_id {
-            let named = || {
-                serde_json::Map::from_iter([(
-                    "parentJobId".to_string(),
-                    Value::String(parent.to_string()),
-                )])
+        if let Some(existing) = self.jobs.get(&create.job_id) {
+            return match &existing.declared {
+                Some(declared) if declared == create => None,
+                _ => reject(REASON_ID_REUSE, serde_json::Map::new()),
             };
-            match self.jobs.get(&parent) {
-                None => return reject("parent_job_unknown", named()),
-                Some(held) if held.deleted => return reject("parent_job_deleted", named()),
-                Some(held) if held.terminal => return reject("parent_job_terminal", named()),
-                Some(_) => {}
+        }
+        if let Some(source) = source_of(create) {
+            let active = self
+                .jobs
+                .iter()
+                .filter(|(_, held)| !held.terminal && held.source.as_ref() == Some(&source))
+                .map(|(id, _)| *id)
+                .max();
+            if let Some(active) = active {
+                return reject(
+                    REASON_DUPLICATE_ACTIVE_ENTITY,
+                    named("activeJobId", active.to_string()),
+                );
             }
         }
-        let source = source_of(create)?;
-        let active = self
-            .jobs
-            .iter()
-            .find(|(_, held)| !held.terminal && held.source.as_ref() == Some(&source));
-        if let Some((active, _)) = active {
-            return reject(
-                REASON_DUPLICATE_ACTIVE_ENTITY,
-                serde_json::Map::from_iter([
-                    ("activeJobId".to_string(), Value::String(active.to_string())),
-                    (
-                        "sourceEntityId".to_string(),
-                        Value::String(source.1.to_string()),
-                    ),
-                    ("sourceBc".to_string(), Value::String(source.0.clone())),
-                ]),
-            );
+        if let Some(parent) = create.parent_job_id {
+            if parent == create.job_id {
+                return reject("self_reference", named("field", "parent_job_id".into()));
+            }
+            let parent_named = || named("parentJobId", parent.to_string());
+            match self.jobs.get(&parent) {
+                None => return reject("parent_job_unknown", parent_named()),
+                Some(held) if held.deleted => return reject("parent_job_deleted", parent_named()),
+                Some(held) if held.terminal => {
+                    return reject("parent_job_terminal", parent_named());
+                }
+                Some(_) => {}
+            }
         }
         None
     }
 
     fn accept(&mut self, create: &CreateJob) {
         self.jobs.entry(create.job_id).or_insert(Held {
+            declared: Some(create.clone()),
             source: source_of(create),
             terminal: false,
             deleted: false,
         });
     }
 
-    fn settle(&mut self, job_id: Uuid) {
-        if let Some(held) = self.jobs.get_mut(&job_id) {
-            held.terminal = true;
+    /// Marks `job_id` terminal; `true` when it was live.
+    fn settle(&mut self, job_id: Uuid) -> bool {
+        match self.jobs.get_mut(&job_id) {
+            Some(held) if !held.terminal => {
+                held.terminal = true;
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -280,6 +341,7 @@ impl JobsStandIn {
         self.ledger.lock().expect("the ledger lock").jobs.insert(
             job_id,
             Held {
+                declared: None,
                 source: Some((source_bc.to_string(), source_entity_id)),
                 terminal: false,
                 deleted: false,
@@ -288,8 +350,10 @@ impl JobsStandIn {
         job_id
     }
 
-    /// A job an administrator deleted from Jobs' ledger.
+    /// A settled job an administrator deleted from Jobs' ledger (Jobs never
+    /// deletes live work).
     pub fn delete_job(&self, job_id: Uuid) {
+        assert!(!self.is_live(job_id), "Jobs deletes settled jobs only");
         if let Some(held) = self
             .ledger
             .lock()
@@ -368,6 +432,16 @@ impl JobsStandIn {
 
     fn settle(&self, job_id: Uuid) {
         self.ledger.lock().expect("the ledger lock").settle(job_id);
+    }
+
+    /// Whether the double refused `job_id`, at once.
+    fn refused(&self, job_id: Uuid) -> Option<JobCreationRejected> {
+        self.ledger
+            .lock()
+            .expect("the ledger lock")
+            .rejections
+            .get(&job_id)
+            .cloned()
     }
 
     pub async fn declare_runner_type(&self, runner_type: &str, lifecycle: RunnerTypeLifecycle) {
@@ -550,7 +624,12 @@ impl JobsStandIn {
 
     async fn read_command(&self, within: Duration) -> Option<(String, Value)> {
         let mut inbox = self.inbox.lock().await;
-        tokio::time::timeout(within, inbox.recv()).await.ok()?
+        match tokio::time::timeout(within, inbox.recv()).await {
+            Ok(Some(command)) => Some(command),
+            // A closed inbox is a drain that stopped: no absence can be proven.
+            Ok(None) => panic!("the jobs double's drain stopped; see the log above"),
+            Err(_) => None,
+        }
     }
 
     async fn await_command<T: DeserializeOwned>(
@@ -588,7 +667,29 @@ impl JobsStandIn {
         }
     }
 
+    /// The next `job.create` for `file_id`, which the double accepted — a
+    /// refusal nobody expected fails the scenario here, not three steps later.
     pub async fn await_create(&self, file_id: Uuid) -> CreateJob {
+        let create = self.next_create(file_id).await;
+        if let Some(refusal) = self.refused(create.job_id) {
+            panic!(
+                "jobs refused the create of {file_id}: {} {}",
+                refusal.reason_code, refusal.params
+            );
+        }
+        create
+    }
+
+    /// The next `job.create` for `file_id`, which the double refused.
+    pub async fn await_refused_create(&self, file_id: Uuid) -> (CreateJob, JobCreationRejected) {
+        let create = self.next_create(file_id).await;
+        let refusal = self
+            .refused(create.job_id)
+            .unwrap_or_else(|| panic!("jobs accepted the create of {file_id}"));
+        (create, refusal)
+    }
+
+    async fn next_create(&self, file_id: Uuid) -> CreateJob {
         self.await_command::<CreateJob>(CMD_JOB_CREATE_V1, |create| {
             create.source_entity_id == Some(file_id)
         })

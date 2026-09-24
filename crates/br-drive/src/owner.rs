@@ -1,43 +1,53 @@
 //! The host's own objects refresh when a drive's files change. A host names
-//! the noun of the object a drive hangs off (`DriveHost::DRIVE_OWNER_NOUN`),
-//! keyed by the drive's id; every file impact the library stages then also
+//! the noun of the object a drive hangs off (`DriveHost::DriveOwner`), keyed
+//! by the drive's id; every file impact the library stages then also
 //! impacts that key, so the host's views bound to its own noun — an object
 //! carrying file counts, say — recompute and republish. The library never
 //! calls the host.
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 
-use serde::Serialize;
 use service_engine::error::EngineError;
+use service_engine::impact::Dims;
 use service_engine::name::NounName;
 use service_engine::pipeline::Ops;
 use service_engine::wire::Noun;
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
+use crate::file::ProcessingState;
 use crate::host::DriveHost;
 
-/// The host noun named by `DriveHost::DRIVE_OWNER_NOUN`, keyed by drive id.
-pub struct DriveOwner<H>(PhantomData<fn() -> H>);
+/// A host noun whose objects are keyed by a drive's id — the object a drive
+/// hangs off. Named by `DriveHost::DriveOwner`, typed, so the compiler checks
+/// both the noun and its key; the host writes `impl DriveOwnerNoun for Its {}`.
+pub trait DriveOwnerNoun: Noun<Key = Uuid> {
+    /// Whether the library impacts this noun at all; only `NoDriveOwner` says no.
+    const REFRESHED: bool = true;
+}
 
-impl<H: DriveHost> Noun for DriveOwner<H> {
+/// The owner noun of a host whose objects need no refresh from the drives.
+pub struct NoDriveOwner;
+
+impl Noun for NoDriveOwner {
     type Key = Uuid;
-    const NAME: NounName = NounName::from_static(match H::DRIVE_OWNER_NOUN {
-        Some(noun) => noun,
-        // Never staged: `touch` stages nothing when the host names no noun.
-        None => "drive_owner_unbound",
-    });
+    const NAME: NounName = NounName::from_static("drive_no_owner");
+}
+
+impl DriveOwnerNoun for NoDriveOwner {
+    const REFRESHED: bool = false;
+}
+
+/// Whether the host asked for its objects to refresh with their drive's files.
+pub(crate) fn refreshes<H: DriveHost>() -> bool {
+    <H::DriveOwner as DriveOwnerNoun>::REFRESHED
 }
 
 /// Stages an impact on the host object of `drive`, when the host declared one.
-pub(crate) fn touch<H: DriveHost, C: Serialize>(
-    ops: &mut Ops<'_>,
-    drive: Uuid,
-    cause: C,
-) -> Result<(), EngineError> {
-    if H::DRIVE_OWNER_NOUN.is_some() {
-        ops.impact_caused::<DriveOwner<H>, _>(&drive, cause)?;
+/// No cause: the host's deltas keep speaking the host's own causes.
+pub(crate) fn touch<H: DriveHost>(ops: &mut Ops<'_>, drive: Uuid) -> Result<(), EngineError> {
+    if refreshes::<H>() {
+        ops.impact::<H::DriveOwner>(&drive, Dims::ALL)?;
     }
     Ok(())
 }
@@ -57,10 +67,11 @@ pub async fn file_counts(
 ) -> Result<HashMap<Uuid, FileCounts>, EngineError> {
     let rows = sqlx::query(
         "SELECT drive_id, count(*) AS files, \
-                count(*) FILTER (WHERE processing_state = 'ready') AS ready \
+                count(*) FILTER (WHERE processing_state = $2) AS ready \
          FROM drive.file WHERE drive_id = ANY($1) GROUP BY drive_id",
     )
     .bind(drives)
+    .bind(ProcessingState::Ready.as_str())
     .fetch_all(conn)
     .await?;
     Ok(rows

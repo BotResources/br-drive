@@ -56,7 +56,7 @@ pub(crate) fn impact_rows<H: DriveHost>(
     ids: &[Uuid],
     cause: FileCause,
 ) -> Result<(), DriveFault> {
-    crate::owner::touch::<H, _>(cx, drive, &cause)?;
+    crate::owner::touch::<H>(cx, drive)?;
     if ids.len() > H::BULK_RESET_THRESHOLD {
         cx.impact_all_view::<DriveFiles<H>>();
         cx.impact_all_view::<DrivePages<H>>();

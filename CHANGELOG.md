@@ -17,42 +17,63 @@ single git tag `v{version}` releases the set. Format follows
   owned by the parent's runner instead of the host. The chain is a host-side
   sequence correlated by the file id.
 - A `creation_rejected` `duplicate_active_entity` no longer leaves the file
-  unprocessable: the live job Jobs names (`params.activeJobId`) is kept on the
-  file (`drive.file.stray_job_id`) and cancelled at once, and the next launch
-  cancels it again before asking for its own job, so a `Process` gets through.
-  `DeleteFile` and the other deletions cancel it too.
+  unprocessable: the live job Jobs names (`params.activeJobId`, checked
+  against the file and host the rejection names) is kept on the file
+  (`drive.file.stray_job_id`) and cancelled at once, and every later launch
+  cancels it again before asking for its own job, until Jobs queues a job of
+  the file. When the job named is one the library already cancelled (the
+  cancel and the create crossed on Jobs' separate consumers), the step waits
+  and relaunches instead of failing. `DeleteFile`, `DeleteFolder` and
+  `delete_drive` cancel it too; an erase in `Delete` mode cannot (no outbound
+  identity in the erase pipeline).
+- `job.create` carries only what Jobs accepts: `RequestUpload` refuses a file
+  id that is not a UUIDv7 (`INVALID_FILE_ID`) — Jobs refuses a non-v7 source
+  entity, which would fail every chain of the file — and `triggered_by` is
+  trimmed, a blank display name sent as anonymous, a long one cut at 512
+  characters, an erased (nil) initiator not named at all.
 - A chain fired before the host's first runner-type catalogue scan (a fresh
   database) is deferred instead of failing the file `catalogue_not_watched`:
-  the file waits in its step (`LaunchDeferred { step }`) and a `launch-retry`
-  message asks again every `LAUNCH_RETRY_AFTER` (5 s). Saving a rule before
-  that scan is accepted, every step reported in `unknownRunnerTypes`, instead
-  of refused with `CATALOGUE_NOT_WATCHED`. Both codes stay exported, no longer
+  the file waits in its step and a `launch-retry` message asks again after
+  `LAUNCH_RETRY_AFTER` (5 s), backing off to `LAUNCH_RETRY_CAP` (5 min), one
+  warning at the first deferral. Saving a rule before that scan is accepted,
+  every step reported in `unknownRunnerTypes`, instead of refused with
+  `CATALOGUE_NOT_WATCHED`. Both codes stay exported, deprecated, no longer
   raised.
 - The runner source presign is scoped to the one file the job names, while
   that job is the file's active one, instead of enumerating every file with a
-  live job on each `RunnerContext` call (`br_drive::scoped_to_job`).
+  live job on each `RunnerContext` call; the population re-checks the active
+  job with the same rule as the runner roots.
 - Image names are no longer capped at page 999 and image 99: the page and
   index widths of `p{page:03}-img{n:02}.{ext}` are minimums (`p1000-img100.png`
   is accepted), a number is never padded wider than it needs, an index is
   never zero.
 
-- The host's gate is asked before the file's state: `process`, `editPage`,
-  `regeneratePage`, `download`, the protected-file refusals and the commit
-  answer a principal the host refuses with the host's code instead of
-  `FILE_PROCESSING` / `FILE_NOT_READY` / `FILE_NOT_PENDING` /
-  `FILE_PROTECTED`, which disclosed the existence and state of a file the
-  principal may not see.
+- The host's gate is asked before the file's state, and a refusal about a
+  file the principal cannot see answers `FILE_NOT_FOUND`, as an unknown id
+  does: `process`, `editPage`, `regeneratePage`, `download`, the protected
+  refusals, the commit, `setLabels` and the metadata write disclosed the
+  existence (the host's code) or the state (`FILE_PROCESSING` /
+  `FILE_NOT_READY` / `FILE_NOT_PENDING` / `FILE_PROTECTED`) of a file the
+  principal may not see. A move toward an unknown drive answers the host's
+  refusal before `DRIVE_NOT_FOUND`, so a drive id is no oracle either.
 - `CommitUpload` asks the host a request of its own, `CommitUpload { file }`,
   carrying the pending row and its `created_by`, instead of re-asking
   `CreateFile` without the row: in a shared drive any principal allowed to
   create files passed the commit gate for somebody else's pending upload.
-  `FileRow::as_create_request` is gone; `FileRow::commit_gate` replaces it.
+  `FileRow::as_create_request` and `FileRow::require_pending` are gone;
+  `FileRow::commit_gate` replaces them, and the decision is projected as the
+  `commit` affordance.
 - The label catalogue is gated: `<p>Labels` and `<p>LabelsChanged` consult
   the new `DriveRequest::ReadLabels`, mirroring `ReadRulesets`, instead of
   serving every principal of the host, the runner included.
 - `br_drive::set_metadata` asks the host's gate
-  (`DriveRequest::SetMetadata { file }`) for the principal it now takes:
-  `set_metadata(ops, principal, file_id, metadata)`.
+  (`DriveRequest::SetMetadata { file }`) for the principal it now takes —
+  pass the mutation's or reaction's own principal:
+  `set_metadata(ops, principal, file_id, metadata)`; the decision is
+  projected as the `setMetadata` affordance.
+- The label and ruleset live windows follow the principal's facts: a
+  principal who gains or loses `ReadLabels` / `ReadRulesets` sees the window
+  repopulate at once instead of at the next catalogue change.
 
 ### Changed
 
@@ -65,45 +86,97 @@ single git tag `v{version}` releases the set. Format follows
 - A host-privileged **import** of an existing rendition:
   `<p>ImportPages(fileId, pages, summary?, pageCount?, estimatedTokens?)` and
   `<p>ImportImage(fileId, name, mediaType, size, sha256)`, gated by the new
-  `DriveRequest::Import { file }` and allowed on a `READY` file only, with no
-  job and no runner scope. Pages keep their origin (`EDITED` included) and go
+  `DriveRequest::Import { file }` behind the library's own `IMPORT_SCOPE`
+  opt-in, and allowed on a `READY` file only, with no job and no runner
+  scope. Pages keep their origin (`RUNNER` or `EDITED`; `REGENERATED` is
+  refused) and go
   through the same upsert and the same impacts as a runner report
   (`Imported { origin }` on the pages, `RenditionImported` on the file); the
   image reuses the verified runner image path. The runner's image staging
   and rendition validation are shared with it.
-- `DriveHost::DRIVE_OWNER_NOUN` (default `None`): a host names its own noun,
-  keyed by the drive id, and every file change the library stages also
-  impacts that key, so the host's views bound to its own noun — an object
-  carrying file counts — recompute and republish while files land, fail,
-  move and go. No host callback. `br_drive::file_counts` reads the file and
-  READY counts of several drives in one statement. The example host's
-  `WorkspaceView` gains `fileCount` and `readyFileCount`, live.
+- `DriveHost::DriveOwner`: a host names its own noun type, keyed by the
+  drive id (`impl br_drive::DriveOwnerNoun for Its {}`), or
+  `br_drive::NoDriveOwner`; every file change the library stages also
+  impacts that key, without a cause, so the host's views bound to its own
+  noun — an object carrying file counts — recompute and republish while files
+  land, fail, move and go. No host callback; the noun and its key are
+  compiler-checked. `br_drive::file_counts` reads the file and READY counts
+  of several drives in one statement, served by the new index of migration
+  `9121000008`. The example host's `WorkspaceView` gains `fileCount` and
+  `readyFileCount`, live.
+- `DriveHost::IMPORT_SCOPE` (default `None`: no import): the scope a service
+  account must hold to import, checked by the library before the host's gate
+  (`IMPORT_SCOPE_REQUIRED`), the way the runner scope is.
 - A file's **title**: `drive.file.title` (migration `9121000007`, at most 255
   characters, existing files backfilled with their name without its
   extension), projected as `DriveFile.title`. `RequestUpload` takes an
-  optional `title` (the `FileTitle` value object: trimmed, 1–255 characters,
-  no control character, `INVALID_TITLE`); absent, it is the requested name
-  without its extension. `<p>RetitleFile(fileId, title)` changes it through
+  optional `title` (the `FileTitle` value object, built only by parsing:
+  trimmed, 1–255 characters, one line, no control or bidirectional-override
+  character, `INVALID_TITLE`); absent, it is the requested name without its
+  extension. `<p>RetitleFile(fileId, title)` changes it through
   the new `DriveRequest::RetitleFile { file }` gate (affordance `retitle`,
   cause `Retitled`); renaming or moving never touches the title, retitling
   never moves the file.
-- `DriveHost::STEP_TIMEOUT` (default 24 h): a step still running past it has
-  its job cancelled and its file lands `FAILED` `timed_out`
-  (`br_drive::TIMED_OUT`). Jobs never fails a job no live runner picks up, so
-  this is the way out for a runner type with no live instance. Scheduled per
-  step through a `step-deadline` message on a `{service}-drive-step-deadline`
-  durable.
-- Migration `9121000006`: `drive.file.step_entered_at` (when the running step
-  was entered; the deadline and the deferred launch key on it) and
+- `DriveHost::STEP_TIMEOUT` (default 72 h, Jobs' longest run; checked at
+  registration): a step silent that long — measured from its last sign of
+  life: entry, run start, plan, step, runner report — has its job cancelled
+  and its file lands `FAILED` `timed_out` (`br_drive::TIMED_OUT`). Jobs never
+  fails a job no live runner picks up, so this is the way out for a runner
+  type with no live instance. One `step-deadline` message per step on a
+  `{service}-drive-step-deadline` durable, rescheduled when the step showed
+  life since.
+- Migration `9121000006`: `drive.file.step_entered_at` (the running step's
+  identity; the deadline and the deferred launch key on it),
+  `drive.file.step_alive_at` (its last sign of life) and
   `drive.file.stray_job_id`.
 - The example host's Jobs stand-in judges every `job.create` the way Jobs
-  does — terminal, deleted or unknown parent, second live job on a source
-  entity — and answers `creation_rejected` itself, with a regression scenario
-  for the double; new scenarios for the step timeout, the duplicate-job trap
+  does, in Jobs' order — the inputs `svc-jobs` refuses before the domain
+  (non-v7 ids, a blank or over-long display name, a source not named by its
+  producer), a reused id, a second live job on a source entity, a
+  self-named, terminal, deleted or unknown parent — and answers
+  `creation_rejected` itself; it publishes `cancelled` for a live job it
+  cancels, and a create a scenario awaits fails the scenario when refused.
+  Regression scenarios for the double; new scenarios for the step timeout, the duplicate-job trap
   and the deferred launch. The example host can boot without its catalogue
   watch (`BootOptions::watch_catalogue`) and start it later; its gate reserves
   a commit to the uploader, keeps service principals out of the label
   catalogue, and its metadata mutation relies on the library's gate.
+
+### Changed
+
+- `FileCause` is `#[non_exhaustive]`; new variant `LaunchDeferred { step }`.
+- A chain step never names a `parent_job_id` (see Fixed).
+- Image names accept wider page and index numbers (see Fixed).
+
+### Upgrading from 0.1
+
+- Migration `9121000006` adds nullable columns only. Files already
+  `PROCESSING` when it is applied carry no step clock and get no deadline:
+  let them finish or delete them.
+- `DriveHost::STEP_TIMEOUT` is new with a 72 h default; a host that wants its
+  users to learn sooner that no runner picked a file up lowers it.
+- A host that matched `CATALOGUE_NOT_WATCHED` keeps compiling (deprecated);
+  nothing raises it any more.
+- `DriveRequest` gains `CommitUpload { file }`, `ReadLabels` and
+  `SetMetadata { file }`: decide each explicitly — a wildcard arm in
+  `drive_gate` now answers them silently. A 0.1 host whose `CreateFile` rule
+  checked the path, name, media type or size relied on it being re-asked at
+  commit: re-apply it on `CommitUpload { file }` (`file.path`, `file.name`,
+  `file.media_type`, `file.size_bytes`). `ReadLabels` was implicitly allowed
+  to every principal; `SetMetadata` was not asked at all.
+- A host that mapped refusals to its own "not found" can drop that: the
+  library answers `FILE_NOT_FOUND` for a file outside `visible_drives`.
+- `DriveRequest::RetitleFile { file }` is new: decide it explicitly (a
+  wildcard arm answers it), including for a `protected` file — the library
+  does not refuse a retitle on protection. `RequestUpload` takes an optional
+  `title`.
+- Migration `9121000007` is one-way: once applied, a pre-0.2 binary cannot
+  create a file (`title` is `NOT NULL`).
+- `DriveHost` gains a required associated type, `DriveOwner`: write
+  `type DriveOwner = br_drive::NoDriveOwner;` to keep 0.1's behaviour.
+  `DriveRequest::Import { file }` is new; an import additionally needs
+  `IMPORT_SCOPE`, so a host that sets none offers no import whatever its
+  gate answers.
 
 ## 0.1.0 — 2026-09-23
 

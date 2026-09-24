@@ -142,14 +142,10 @@ pub fn delete_label<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::LABEL_NOT_FOUND))?;
         let detached = files_with_label(cx.connection(), label.id).await?;
-        for drive in crate::file::store::drives_of(cx.connection(), &detached).await? {
-            crate::owner::touch::<H, _>(
-                cx,
-                drive,
-                FileCause::LabelsChanged {
-                    detached: Some(label.id),
-                },
-            )?;
+        if crate::owner::refreshes::<H>() {
+            for drive in crate::file::store::drives_of(cx.connection(), &detached).await? {
+                crate::owner::touch::<H>(cx, drive)?;
+            }
         }
         cx.delete(&label).await?;
         cx.impact_caused::<Label, _>(&label.id, LabelCause::Deleted)?;

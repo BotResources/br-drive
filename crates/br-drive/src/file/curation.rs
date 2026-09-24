@@ -4,7 +4,7 @@ use uuid::Uuid;
 use super::aggregate::{FileCause, FileRow};
 use super::store;
 use crate::fault::{DriveFault, codes};
-use crate::host::{DriveHost, DriveRequest};
+use crate::host::DriveHost;
 
 pub async fn drive_of(ops: &mut Ops<'_>, file_id: Uuid) -> Result<Option<Uuid>, DriveFault> {
     Ok(store::drive_of(ops.connection(), file_id).await?)
@@ -41,9 +41,7 @@ pub async fn set_metadata<H: DriveHost>(
         .load::<FileRow<H>>(&file_id)
         .await?
         .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
-    principal
-        .drive_gate(&DriveRequest::SetMetadata { file: &file })
-        .require()?;
+    file.set_metadata_gate(principal).require()?;
     if file.metadata == metadata {
         return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
     }

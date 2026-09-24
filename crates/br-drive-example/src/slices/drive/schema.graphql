@@ -156,7 +156,8 @@ input ImportedPageInput {
 	number: Int!
 	markdown: String!
 	"""
-	`RUNNER` when absent; `EDITED` keeps a page a person had corrected.
+	`RUNNER` when absent; `EDITED` keeps a page a person had corrected;
+	`REGENERATED` is refused (`INVALID_PAGE_ORIGIN`).
 	"""
 	origin: PageOrigin
 }

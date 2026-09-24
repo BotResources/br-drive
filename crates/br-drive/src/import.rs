@@ -12,13 +12,25 @@ use service_engine::pipeline::{Mutation, MutationInput, OneShot};
 use uuid::Uuid;
 
 use crate::fault::{DriveFault, codes};
+use crate::file::rendition::{apply_indexing, validate_rendition};
 use crate::file::store::{self, PageWrite};
 use crate::file::{FileCause, FileRow, Page, PageCause, PageKey, PageOrigin};
 use crate::host::DriveHost;
 use crate::image::ImageName;
 use crate::media::MediaType;
-use crate::runner::{apply_indexing, stage_image, validate_rendition};
+use crate::runner::stage_image;
 use crate::upload::UploadTicket;
+
+/// The library's own opt-in, before the host's per-file decision: only a
+/// service account holding the host's `IMPORT_SCOPE` imports, and a host that
+/// declares no scope has no import at all.
+fn importer_only<H: DriveHost>(principal: &H) -> Result<(), DriveFault> {
+    if principal.is_importer() {
+        Ok(())
+    } else {
+        Err(DriveFault::Refused(codes::IMPORT_SCOPE_REQUIRED))
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImportedPage {
@@ -31,7 +43,8 @@ pub struct ImportedPage {
 pub struct ImportedPageInput {
     pub number: i32,
     pub markdown: String,
-    /// `RUNNER` when absent; `EDITED` keeps a page a person had corrected.
+    /// `RUNNER` when absent; `EDITED` keeps a page a person had corrected;
+    /// `REGENERATED` is refused (`INVALID_PAGE_ORIGIN`).
     pub origin: Option<PageOrigin>,
 }
 
@@ -68,6 +81,16 @@ pub fn import_pages<'m, H: DriveHost>(
     input: ImportPages,
 ) -> BoxFuture<'m, Result<(), DriveFault>> {
     Box::pin(async move {
+        importer_only(cx.principal())?;
+        // An import writes what a runner or a person wrote before; a page
+        // regenerated from its runner never comes from elsewhere.
+        if input
+            .pages
+            .iter()
+            .any(|page| page.origin == PageOrigin::Regenerated)
+        {
+            return Err(DriveFault::Refused(codes::INVALID_PAGE_ORIGIN));
+        }
         let numbers: Vec<i32> = input.pages.iter().map(|page| page.number).collect();
         let indexed = validate_rendition(
             &numbers,
@@ -139,6 +162,7 @@ pub fn import_image<'m, H: DriveHost>(
     input: ImportImage,
 ) -> BoxFuture<'m, Result<OneShot<UploadTicket>, DriveFault>> {
     Box::pin(async move {
+        importer_only(cx.principal())?;
         let name = ImageName::parse(&input.name)
             .map_err(|_| DriveFault::Refused(codes::INVALID_IMAGE_NAME))?;
         let media_type = MediaType::parse(&input.media_type)
