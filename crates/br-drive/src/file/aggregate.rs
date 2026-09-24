@@ -209,16 +209,34 @@ impl<H> std::fmt::Debug for FileRow<H> {
     }
 }
 
-// Every gate asks the host first and the file's state second: a principal the
-// host refuses learns the host's code, never the state of a file it may not
-// see (a host reports an invisible file as not found, never as forbidden).
+// Every gate asks the host first and the file's state second, and a refusal
+// about a file the principal cannot see is `FILE_NOT_FOUND` — exactly what an
+// unknown id answers. A principal the host refuses therefore learns neither
+// the state nor the existence of a file it may not see; one who sees the file
+// learns the host's reason, then the state.
+
+/// The host's answer about `file`, told as not found to a principal whose
+/// visible drives do not hold the file.
+pub(crate) fn host_gate<H: DriveHost>(
+    file: &FileRow<H>,
+    principal: &H,
+    request: &DriveRequest<'_, H>,
+) -> Gate {
+    let host = principal.drive_gate(request);
+    if host.is_allowed() || principal.visible_drives().contains(&file.drive_id) {
+        host
+    } else {
+        Gate::blocked(codes::FILE_NOT_FOUND)
+    }
+}
 
 fn host_then<H: DriveHost>(
+    file: &FileRow<H>,
     principal: &H,
     request: DriveRequest<'_, H>,
     state: impl FnOnce() -> Option<Reason>,
 ) -> Gate {
-    let host = principal.drive_gate(&request);
+    let host = host_gate(file, principal, &request);
     if !host.is_allowed() {
         return host;
     }
@@ -233,13 +251,13 @@ fn unprotected<H: DriveHost>(
     principal: &H,
     request: DriveRequest<'_, H>,
 ) -> Gate {
-    host_then(principal, request, || {
+    host_then(file, principal, request, || {
         file.protected.then_some(codes::FILE_PROTECTED)
     })
 }
 
 fn ready<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
-    host_then(principal, request, || match file.processing_state {
+    host_then(file, principal, request, || match file.processing_state {
         ProcessingState::Ready => None,
         ProcessingState::Processing => Some(codes::FILE_PROCESSING),
         ProcessingState::Pending | ProcessingState::Failed => Some(codes::FILE_NOT_READY),
@@ -247,13 +265,13 @@ fn ready<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'
 }
 
 fn landed<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
-    host_then(principal, request, || {
+    host_then(file, principal, request, || {
         (file.processing_state == ProcessingState::Pending).then_some(codes::FILE_NOT_READY)
     })
 }
 
 fn settled<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
-    host_then(principal, request, || match file.processing_state {
+    host_then(file, principal, request, || match file.processing_state {
         ProcessingState::Ready | ProcessingState::Failed => None,
         ProcessingState::Processing => Some(codes::FILE_PROCESSING),
         ProcessingState::Pending => Some(codes::FILE_NOT_READY),
@@ -296,19 +314,19 @@ service_engine::gated! {
         settled(this, principal, DriveRequest::Process { file: this })
     }
     "setLabels" => fn set_labels_gate(this, principal) {
-        principal.drive_gate(&DriveRequest::SetFileLabels { file: this })
+        host_gate(this, principal, &DriveRequest::SetFileLabels { file: this })
+    }
+    "commit" => fn commit_gate(this, principal) {
+        host_then(this, principal, DriveRequest::CommitUpload { file: this }, || {
+            (this.processing_state != ProcessingState::Pending).then_some(codes::FILE_NOT_PENDING)
+        })
+    }
+    "setMetadata" => fn set_metadata_gate(this, principal) {
+        host_gate(this, principal, &DriveRequest::SetMetadata { file: this })
     }
 }
 
 impl<H: DriveHost> FileRow<H> {
-    pub fn require_pending(&self) -> Result<(), Reason> {
-        if self.processing_state == ProcessingState::Pending {
-            Ok(())
-        } else {
-            Err(codes::FILE_NOT_PENDING)
-        }
-    }
-
     pub fn move_to_gate(&self, principal: &H, target_drive: Uuid) -> Gate {
         unprotected(
             self,
@@ -320,15 +338,8 @@ impl<H: DriveHost> FileRow<H> {
         )
     }
 
-    /// The host's commit gate, then the pending state.
-    pub fn commit_gate(&self, principal: &H) -> Gate {
-        host_then(principal, DriveRequest::CommitUpload { file: self }, || {
-            (self.processing_state != ProcessingState::Pending).then_some(codes::FILE_NOT_PENDING)
-        })
-    }
-
     pub fn read_gate(&self, principal: &H) -> Gate {
-        principal.drive_gate(&DriveRequest::ReadFile { file: self })
+        host_gate(self, principal, &DriveRequest::ReadFile { file: self })
     }
 
     pub fn regenerate_page_gate(&self, principal: &H, number: i32) -> Gate {

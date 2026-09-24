@@ -48,23 +48,32 @@ single git tag `v{version}` releases the set. Format follows
   is accepted), a number is never padded wider than it needs, an index is
   never zero.
 
-- The host's gate is asked before the file's state: `process`, `editPage`,
-  `regeneratePage`, `download`, the protected-file refusals and the commit
-  answer a principal the host refuses with the host's code instead of
-  `FILE_PROCESSING` / `FILE_NOT_READY` / `FILE_NOT_PENDING` /
-  `FILE_PROTECTED`, which disclosed the existence and state of a file the
-  principal may not see.
+- The host's gate is asked before the file's state, and a refusal about a
+  file the principal cannot see answers `FILE_NOT_FOUND`, as an unknown id
+  does: `process`, `editPage`, `regeneratePage`, `download`, the protected
+  refusals, the commit, `setLabels` and the metadata write disclosed the
+  existence (the host's code) or the state (`FILE_PROCESSING` /
+  `FILE_NOT_READY` / `FILE_NOT_PENDING` / `FILE_PROTECTED`) of a file the
+  principal may not see. A move toward an unknown drive answers the host's
+  refusal before `DRIVE_NOT_FOUND`, so a drive id is no oracle either.
 - `CommitUpload` asks the host a request of its own, `CommitUpload { file }`,
   carrying the pending row and its `created_by`, instead of re-asking
   `CreateFile` without the row: in a shared drive any principal allowed to
   create files passed the commit gate for somebody else's pending upload.
-  `FileRow::as_create_request` is gone; `FileRow::commit_gate` replaces it.
+  `FileRow::as_create_request` and `FileRow::require_pending` are gone;
+  `FileRow::commit_gate` replaces them, and the decision is projected as the
+  `commit` affordance.
 - The label catalogue is gated: `<p>Labels` and `<p>LabelsChanged` consult
   the new `DriveRequest::ReadLabels`, mirroring `ReadRulesets`, instead of
   serving every principal of the host, the runner included.
 - `br_drive::set_metadata` asks the host's gate
-  (`DriveRequest::SetMetadata { file }`) for the principal it now takes:
-  `set_metadata(ops, principal, file_id, metadata)`.
+  (`DriveRequest::SetMetadata { file }`) for the principal it now takes —
+  pass the mutation's or reaction's own principal:
+  `set_metadata(ops, principal, file_id, metadata)`; the decision is
+  projected as the `setMetadata` affordance.
+- The label and ruleset live windows follow the principal's facts: a
+  principal who gains or loses `ReadLabels` / `ReadRulesets` sees the window
+  repopulate at once instead of at the next catalogue change.
 
 ### Changed
 
@@ -114,6 +123,15 @@ single git tag `v{version}` releases the set. Format follows
   users to learn sooner that no runner picked a file up lowers it.
 - A host that matched `CATALOGUE_NOT_WATCHED` keeps compiling (deprecated);
   nothing raises it any more.
+- `DriveRequest` gains `CommitUpload { file }`, `ReadLabels` and
+  `SetMetadata { file }`: decide each explicitly — a wildcard arm in
+  `drive_gate` now answers them silently. A 0.1 host whose `CreateFile` rule
+  checked the path, name, media type or size relied on it being re-asked at
+  commit: re-apply it on `CommitUpload { file }` (`file.path`, `file.name`,
+  `file.media_type`, `file.size_bytes`). `ReadLabels` was implicitly allowed
+  to every principal; `SetMetadata` was not asked at all.
+- A host that mapped refusals to its own "not found" can drop that: the
+  library answers `FILE_NOT_FOUND` for a file outside `visible_drives`.
 
 ## 0.1.0 — 2026-09-23
 

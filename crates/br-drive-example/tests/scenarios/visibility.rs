@@ -117,7 +117,13 @@ async fn an_outsider_sees_nothing_and_every_gesture_is_refused_by_the_host_gate(
         &UploadRequest::text(drive, "", "intruder.txt", BYTES),
     )
     .await;
-    assert_eq!(error_code(&uploading), "NOT_THE_WORKSPACE_OWNER");
+    assert_eq!(
+        error_code(&uploading),
+        "NOT_THE_WORKSPACE_OWNER",
+        "a gesture addressed to a drive answers the host's code"
+    );
+    // A gesture addressed to a file the outsider cannot see answers exactly
+    // what an unknown id answers.
     let deleting = world
         .gql(
             &outsider,
@@ -125,7 +131,7 @@ async fn an_outsider_sees_nothing_and_every_gesture_is_refused_by_the_host_gate(
             serde_json::json!({ "f": file_id }),
         )
         .await;
-    assert_eq!(error_code(&deleting), "NOT_THE_WORKSPACE_OWNER");
+    assert_eq!(error_code(&deleting), "FILE_NOT_FOUND");
     let renaming = world
         .gql(
             &outsider,
@@ -133,7 +139,7 @@ async fn an_outsider_sees_nothing_and_every_gesture_is_refused_by_the_host_gate(
             serde_json::json!({ "f": file_id, "n": "stolen.txt" }),
         )
         .await;
-    assert_eq!(error_code(&renaming), "NOT_THE_WORKSPACE_OWNER");
+    assert_eq!(error_code(&renaming), "FILE_NOT_FOUND");
     let moving = world
         .gql(
             &outsider,
@@ -149,7 +155,15 @@ async fn an_outsider_sees_nothing_and_every_gesture_is_refused_by_the_host_gate(
             serde_json::json!({ "f": file_id }),
         )
         .await;
-    assert_eq!(error_code(&committing), "NOT_THE_WORKSPACE_OWNER");
+    assert_eq!(error_code(&committing), "FILE_NOT_FOUND");
+    let unknown_file = world
+        .gql(
+            &outsider,
+            "mutation($f:UUID!){workspaceDeleteFile(fileId:$f){success}}",
+            serde_json::json!({ "f": Uuid::now_v7() }),
+        )
+        .await;
+    assert_eq!(error_code(&unknown_file), error_code(&deleting));
     let deleting_folder = world
         .gql(
             &outsider,

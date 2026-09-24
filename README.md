@@ -125,14 +125,25 @@ every `RequestUpload`.
   `SetMetadata { file }`. The host answers `Gate::allowed()`
   or `Gate::blocked(<its own reason code>)` — to refuse a media type it cannot
   render, or to restrict curation to the uploader (`file.created_by`). The
-  host is asked **first**, the file's state second: a principal the host
-  refuses gets the host's code, never `FILE_PROCESSING`, `FILE_NOT_READY`,
-  `FILE_NOT_PENDING` or `FILE_PROTECTED`, so the state of a file it may not
-  touch is never disclosed (an unknown id stays `FILE_NOT_FOUND`); a principal
-  the host allows then meets the state refusals. The same decision feeds the mutation guard and the `affordances`
-  on `DriveFile` (`delete`, `rename`, `move`, `download`, `editPage`,
-  `process`, `setLabels`) and on `DrivePage` (`editPage`, `regeneratePage`),
-  so the front renders and never decides.
+  host is asked **first**, the file's state second. A refusal about a file
+  the principal cannot see (its drive is not in `visible_drives`) is
+  answered `FILE_NOT_FOUND` — exactly what an unknown id answers, so neither
+  the existence nor the state of an invisible file is ever disclosed. A
+  principal who sees the file gets the host's own code, then the state
+  refusals (`FILE_PROCESSING`, `FILE_NOT_READY`, `FILE_NOT_PENDING`,
+  `FILE_PROTECTED`). A gesture addressed to a drive (`CreateFile`,
+  `MoveFolder`, `DeleteFolder`) keeps the host's code, and a move toward an
+  unknown drive answers the host's refusal before `DRIVE_NOT_FOUND`. The
+  same decision feeds the mutation guard and the `affordances` on
+  `DriveFile` (`delete`, `rename`, `move`, `download`, `editPage`,
+  `process`, `setLabels`, `commit`, `setMetadata`) and on `DrivePage`
+  (`editPage`, `regeneratePage`), so the front renders and never decides.
+  The gate decides on the principal as the request found it: an engine
+  principal's facts are loaded when the request arrives, so a host whose
+  rule depends on a fact that may change concurrently (an ownership
+  transfer, say) re-checks it under its own lock when that matters.
+  `MoveFolder` / `DeleteFolder` are drive-level decisions: the host is asked
+  about the folder, not about each file under it.
 - `visible_drives` is the cohort membership of the reactive views (dimension
   `drive`, `Cohort::uuid("drive", drive_id)`): a principal sees the files of the
   drives it lists. When that answer changes, the host stages
@@ -179,10 +190,10 @@ renders it, is committed at
 | `<p>DriveFiles(driveId): [DriveFile!]!` | the drive's files as the caller sees them (the tree is a path prefix; empty folders do not exist). |
 | `<p>Pages(fileId): [DrivePage!]!` | the file's rendition, page by page (milestone 3); empty when the caller cannot read the file. |
 | `<p>Rulesets: [DriveRuleset!]!`, `<p>CreateRuleset(…)`, `<p>UpdateRuleset(…)`, `<p>DeleteRuleset(id)` | the host's processing rules (milestone 4, "Processing rules" below). |
-| `<p>Labels: [DriveLabel!]!` | the host's label catalogue: `DriveLabel { id, name, color, description, createdAt, updatedAt }` in id order (UUIDv7: creation order); gated by the host's `ReadLabels` — a refused principal (a runner, typically) gets an empty list and an empty live window, exactly as `ReadRulesets` does for the rules (the creator's id stays on the row, off the wire). |
+| `<p>Labels: [DriveLabel!]!` | the host's label catalogue: `DriveLabel { id, name, color, description, createdAt, updatedAt }` in id order (UUIDv7: creation order); gated by the host's `ReadLabels` — a refused principal (a runner, typically) gets an empty list and an empty live window, exactly as `ReadRulesets` does for the rules; both live windows repopulate when the principal's facts change, so gaining or losing the gate shows at once (the creator's id stays on the row, off the wire). |
 | `<p>CreateLabel(id, name, color, description?)`, `<p>UpdateLabel(id, name?, color?, description?)`, `<p>DeleteLabel(id): MutationAck!` | gate `ManageLabels`; `name` trimmed, 1–100 characters, unique per host case-insensitive (`LABEL_NAME_TAKEN`); `color` `#rrggbb` lowercase hex (an uppercase input is lowercased; anything else `INVALID_LABEL`); `description` defaults to `""`, at most 1 KiB; the name check and the write are serialized, so two concurrent saves of one name answer exactly one `LABEL_NAME_TAKEN`; `NOTHING_TO_CHANGE` on an unchanged update. `DeleteLabel` runs on the bulk pipeline: it detaches the label from every file it was on — `LabelsChanged { detached }` per file up to `BULK_RESET_THRESHOLD`, a `DriveFiles` reset beyond — so a label on any number of files can go. |
 | `<p>SetFileLabels(fileId, labelIds): MutationAck!` | gate `SetFileLabels { file }`; the target set, idempotent — the same set is `NOTHING_TO_CHANGE`, an unknown id `LABEL_NOT_FOUND`; `labelIds` on `DriveFile` follows (`LabelsChanged`), and a file keeps its labels across the host's drives. |
-| `<p>FileAccess(fileId, name: String): String` | a short-lived presigned GET on the source (attachment); `null` when the caller cannot see the file, a coded refusal when the `download` affordance is denied (`FILE_NOT_READY` before the commit, then the host's code), and `null` between the commit and the engine reaper's promotion (a verified blob is never downloadable in the pending window; the `SourceAvailable` cause says when to retry). With `name`, a presigned GET on that extracted image (inline; `null` for an unknown name and until the object landed). |
+| `<p>FileAccess(fileId, name: String): String` | a short-lived presigned GET on the source (attachment); `null` when the caller cannot see the file, a coded refusal when the `download` affordance is denied (the host's code first, then `FILE_NOT_READY` before the commit), and `null` between the commit and the engine reaper's promotion (a verified blob is never downloadable in the pending window; the `SourceAvailable` cause says when to retry). With `name`, a presigned GET on that extracted image (inline; `null` for an unknown name and until the object landed). |
 | `<p>DriveChanged(driveId): DriveDelta!` | the file list: the engine snapshot on connect (`DriveReset` of `DriveFile`s), then `DriveUpsert` / `DriveRemove` on the contiguous revision. |
 | `<p>LabelsChanged: DriveDelta!` | the label catalogue live: a `DriveReset` of `DriveLabel`s, then an upsert (`Created`, `Updated`) or a remove per label. |
 | `<p>RulesetsChanged: DriveDelta!` | the rule table live, for the manager's screen: an upsert per save with `Saved { unknown_runner_types }` as its cause (the same warning the save answers), a remove per delete. |
