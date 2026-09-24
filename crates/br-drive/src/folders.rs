@@ -19,14 +19,8 @@ use crate::path::DrivePath;
 /// decision the per-file gesture asks (`gate`: `UpdateFile` for a move,
 /// `DeleteFile` for a delete, protection included) — all or nothing, so a
 /// folder gesture never reaches a file its principal could not move or delete
-/// one by one. The first refusal in path order answers for the whole gesture:
-/// the host's code, or `FILE_PROTECTED`. A file refused as not found (its
-/// drive is not among the principal's visible drives) answers
-/// `FOLDER_NOT_FOUND`, what a prefix holding nothing answers, so an invisible
-/// file is neither named nor told apart from an empty folder. Visibility is per
-/// drive and every file here shares one, so the first refusal already says
-/// which case applies; the loop is one in-memory decision per file, whatever
-/// the folder's size.
+/// one by one (`folder_verdict`). The decisions are in memory over the rows
+/// the gesture loads anyway: they add no statement, whatever the folder's size.
 pub(crate) async fn folder_members<H: DriveHost>(
     cx: &mut Bulk<'_, H>,
     drive: Uuid,
@@ -35,20 +29,42 @@ pub(crate) async fn folder_members<H: DriveHost>(
 ) -> Result<Vec<FileRow<H>>, DriveFault> {
     let ids = store::ids_under_prefix(cx.connection(), drive, prefix).await?;
     let mut files = cx.load_many::<FileRow<H>>(&ids).await?;
-    if files.is_empty() {
-        return Err(DriveFault::Refused(codes::FOLDER_NOT_FOUND));
-    }
     files.sort_by(|a, b| {
         (a.path.as_str(), a.name.as_str()).cmp(&(b.path.as_str(), b.name.as_str()))
     });
     let principal = cx.principal();
-    let refusal = files.iter().find_map(|file| gate(file, principal).reason());
-    match refusal {
-        None => Ok(files),
-        Some(reason) if reason == codes::FILE_NOT_FOUND => {
-            Err(DriveFault::Refused(codes::FOLDER_NOT_FOUND))
+    folder_verdict(files.iter().map(|file| gate(file, principal).reason()))
+        .map_err(DriveFault::Refused)?;
+    Ok(files)
+}
+
+/// The verdict of a folder gesture from the per-file refusals, in path order.
+/// An empty folder is `FOLDER_NOT_FOUND`. A file refused as not found (the
+/// principal cannot see it) makes the whole folder `FOLDER_NOT_FOUND` too,
+/// wherever it sorts, so neither an invisible file nor its place is ever
+/// disclosed. Otherwise the first refusal answers: the host's code, or
+/// `FILE_PROTECTED`.
+pub(crate) fn folder_verdict(
+    refusals: impl IntoIterator<Item = Option<Reason>>,
+) -> Result<(), Reason> {
+    let mut any = false;
+    let mut first = None;
+    for refusal in refusals {
+        any = true;
+        match refusal {
+            Some(reason) if reason == codes::FILE_NOT_FOUND => {
+                return Err(codes::FOLDER_NOT_FOUND);
+            }
+            Some(reason) => {
+                first.get_or_insert(reason);
+            }
+            None => {}
         }
-        Some(reason) => Err(DriveFault::Refused(reason)),
+    }
+    match (any, first) {
+        (false, _) => Err(codes::FOLDER_NOT_FOUND),
+        (true, Some(reason)) => Err(reason),
+        (true, None) => Ok(()),
     }
 }
 
@@ -196,4 +212,42 @@ pub fn delete_folder<'m, H: DriveHost>(
         let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
         impact_rows(cx, input.drive_id, &ids, FileCause::FolderDeleted)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HELD: Reason = Reason::new("FILE_ON_HOLD");
+
+    #[test]
+    fn an_empty_folder_is_not_found() {
+        assert_eq!(folder_verdict([]), Err(codes::FOLDER_NOT_FOUND));
+    }
+
+    #[test]
+    fn every_file_allowed_lets_the_folder_through() {
+        assert_eq!(folder_verdict([None, None, None]), Ok(()));
+    }
+
+    #[test]
+    fn the_first_refusal_in_path_order_answers_for_the_folder() {
+        assert_eq!(
+            folder_verdict([None, Some(codes::FILE_PROTECTED), Some(HELD)]),
+            Err(codes::FILE_PROTECTED)
+        );
+        assert_eq!(
+            folder_verdict([Some(HELD), Some(codes::FILE_PROTECTED)]),
+            Err(HELD)
+        );
+    }
+
+    #[test]
+    fn an_invisible_file_anywhere_makes_the_folder_not_found() {
+        assert_eq!(
+            folder_verdict([Some(HELD), None, Some(codes::FILE_NOT_FOUND)]),
+            Err(codes::FOLDER_NOT_FOUND),
+            "the order of a hidden file never changes the answer"
+        );
+    }
 }

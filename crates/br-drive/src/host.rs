@@ -70,10 +70,14 @@ pub enum DriveRequest<'a, H> {
         file: &'a FileRow<H>,
     },
     /// Writing a rendition or an image into a READY file without a runner or
-    /// a job (`<p>ImportPages`, `<p>ImportImage`), or committing a PENDING
-    /// upload without processing it (`<p>ImportCommit`): the host decides who
-    /// may. The file's state is in the row.
+    /// a job (`<p>ImportPages`, `<p>ImportImage`): the host decides who may.
     Import {
+        file: &'a FileRow<H>,
+    },
+    /// Committing a PENDING upload without processing it (`<p>ImportCommit`),
+    /// by a principal holding `IMPORT_SCOPE`: the pending row carries its
+    /// uploader, so a host can reserve it to the uploads its migration made.
+    ImportCommit {
         file: &'a FileRow<H>,
     },
     /// Reading the host's label catalogue, live included.
@@ -97,6 +101,7 @@ impl<H> DriveRequest<'_, H> {
             | Self::DeleteFile { file }
             | Self::RetitleFile { file }
             | Self::Import { file }
+            | Self::ImportCommit { file }
             | Self::Process { file }
             | Self::EditPage { file }
             | Self::RegeneratePage { file, .. }
@@ -125,8 +130,8 @@ pub trait DriveHost: Principal {
 
     const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
-    /// The host's own noun whose objects are keyed by the drive's id (the
-    /// documented convention: a drive's id is its host object's id), or
+    /// The host's own noun whose objects are keyed by the drive's id (a drive
+    /// is created from its `DriveOwnerNoun::Object` and takes its key), or
     /// `br_drive::NoDriveOwner`. Every file change the library stages also
     /// impacts that key, so a host view bound to its own noun — an object
     /// showing file counts, say — recomputes and republishes. The noun is a
@@ -140,6 +145,11 @@ pub trait DriveHost: Principal {
     /// FAILED `timed_out`, open to a reprocess. Default 1 h; a host whose
     /// fleet may queue work longer than that raises it. Checked at
     /// registration: positive and within the scheduler's range.
+    /// Not above `STEP_TIMEOUT` (refused at registration). The clock starts
+    /// when the step's first job is staged, not when Jobs queues it, so a Jobs
+    /// or broker outage longer than this fails the steps entered during it;
+    /// and Jobs reports only a job's first run as started, so a retry waiting
+    /// for a runner after a failed attempt is bounded by `STEP_TIMEOUT`.
     const PICKUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
     /// How long a started run may stay silent before the library cancels its

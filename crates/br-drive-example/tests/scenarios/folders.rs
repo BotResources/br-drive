@@ -400,7 +400,11 @@ async fn a_folder_gesture_asks_every_file_the_per_file_rule_and_is_refused_whole
         ids.insert(name, id);
     }
     let held = ids["b.txt"];
-    let held_source = world.source_of(held).await;
+    let mut sources = BTreeMap::new();
+    for (name, id) in &ids {
+        sources.insert(*name, world.source_of(*id).await);
+    }
+    let held_source = sources["b.txt"];
     let mut sub = drive_subscription(&world, &owner, drive).await;
     ok(&world
         .gql(
@@ -415,11 +419,44 @@ async fn a_folder_gesture_asks_every_file_the_per_file_rule_and_is_refused_whole
     .await;
     for action in ["delete", "move", "rename"] {
         assert_eq!(
-            on_hold["view"]["affordances"][action]["reason"], "FILE_ON_HOLD",
+            on_hold["view"]["affordances"][action]["allowed"], false,
             "the file itself cannot be {action}d"
+        );
+        assert_eq!(
+            on_hold["view"]["affordances"][action]["reason"],
+            "FILE_ON_HOLD"
         );
     }
     let before = paths(&world.drive_files(&owner, drive).await);
+    quiet(&mut sub).await;
+
+    // When: another file of the folder, earlier in path order than the held
+    // one (docs/d.txt before docs/sub/b.txt) but later by id, is protected too
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$p:Boolean!){workspaceProtectFile(fileId:$f,protected:$p){success}}",
+            serde_json::json!({ "f": ids["d.txt"], "p": true }),
+        )
+        .await);
+    quiet(&mut sub).await;
+
+    // Then: the folder gestures answer the first refusal in path order
+    assert_eq!(
+        error_code(&move_folder(&world, &owner, drive, "docs", "archive").await),
+        "FILE_PROTECTED"
+    );
+    assert_eq!(
+        error_code(&delete_folder(&world, &owner, drive, "docs").await),
+        "FILE_PROTECTED"
+    );
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$p:Boolean!){workspaceProtectFile(fileId:$f,protected:$p){success}}",
+            serde_json::json!({ "f": ids["d.txt"], "p": false }),
+        )
+        .await);
     quiet(&mut sub).await;
 
     // When: the owner, whom the host lets act on the folder, moves or deletes it
@@ -441,10 +478,13 @@ async fn a_folder_gesture_asks_every_file_the_per_file_rule_and_is_refused_whole
     // And: nothing moved, nothing was released, the host hook never ran, no one heard a thing
     sub.expect_silence(Duration::from_millis(800)).await;
     assert_eq!(paths(&world.drive_files(&owner, drive).await), before);
-    assert_ne!(
-        world.blob_state(held_source).await.as_deref(),
-        Some("orphaned")
-    );
+    for (name, source) in &sources {
+        assert_ne!(
+            world.blob_state(*source).await.as_deref(),
+            Some("orphaned"),
+            "{name} keeps its source"
+        );
+    }
     assert!(world.folder_gestures(drive).await.is_empty());
 
     // When: a clean-up account the host lets ask for folder gestures in any

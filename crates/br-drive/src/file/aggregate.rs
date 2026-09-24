@@ -367,12 +367,18 @@ impl<H: DriveHost> FileRow<H> {
         ready(self, principal, DriveRequest::Import { file: self })
     }
 
-    /// The host's `Import` gate, then a PENDING file: committing an upload
-    /// without processing is an import's privilege (`<p>ImportCommit`).
+    /// The host's `ImportCommit` gate, then a PENDING file: committing an
+    /// upload without processing is an import's privilege (`<p>ImportCommit`).
     pub fn import_commit_gate(&self, principal: &H) -> Gate {
-        host_then(self, principal, DriveRequest::Import { file: self }, || {
-            (self.processing_state != ProcessingState::Pending).then_some(codes::FILE_NOT_PENDING)
-        })
+        host_then(
+            self,
+            principal,
+            DriveRequest::ImportCommit { file: self },
+            || {
+                (self.processing_state != ProcessingState::Pending)
+                    .then_some(codes::FILE_NOT_PENDING)
+            },
+        )
     }
 
     pub fn read_gate(&self, principal: &H) -> Gate {

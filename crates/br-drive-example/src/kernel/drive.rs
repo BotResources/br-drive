@@ -84,12 +84,27 @@ impl DriveHost for AppPrincipal {
                     Gate::allowed()
                 };
             }
-            // A migration account uploads into any workspace, then imports.
-            DriveRequest::CreateFile { .. } if self.holds_scope(IMPORT_SCOPE) => {
+            // A migration account (a service account holding the import
+            // scope, never a person) uploads into any workspace, then imports.
+            DriveRequest::CreateFile { .. } if self.is_importer() => {
                 return Gate::allowed();
             }
+            // It commits only the uploads it made itself — the normal way,
+            // or without processing.
+            DriveRequest::CommitUpload { file }
+                if self.is_importer() && file.created_by == self.id().as_uuid() =>
+            {
+                return Gate::allowed();
+            }
+            DriveRequest::ImportCommit { file } => {
+                return if self.is_importer() && file.created_by == self.id().as_uuid() {
+                    Gate::allowed()
+                } else {
+                    Gate::blocked(NOT_THE_UPLOADER)
+                };
+            }
             DriveRequest::MoveFolder { .. } | DriveRequest::DeleteFolder { .. }
-                if self.holds_scope(SWEEP_SCOPE) =>
+                if self.is_service() && self.holds_scope(SWEEP_SCOPE) =>
             {
                 return Gate::allowed();
             }

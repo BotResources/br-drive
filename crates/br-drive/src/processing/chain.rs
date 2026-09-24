@@ -206,10 +206,7 @@ pub(super) async fn stage_job<H: DriveHost>(
         "options": step.options,
     });
     file.job_id = Some(job_id);
-    // The pickup deadline runs from this job's creation until Jobs reports its
-    // run started: a deferral or a relaunch before it does not eat into it.
-    file.step_alive_at = Some(cx.now().as_datetime());
-    file.run_started_at = None;
+    super::backstop::job_created(file, cx.now().as_datetime());
     // The chain is a host-side sequence correlated by the file id: no step names
     // a parent. Jobs refuses a terminal parent, and a live one would make the
     // step the parent runner's work instead of the host's.

@@ -133,7 +133,7 @@ every `RequestUpload`.
   `UpdateFile { file, target_drive }` (a cross-drive move names both drives),
   `DeleteFile { file }`, `MoveFolder { drive, old_prefix, new_prefix }`,
   `DeleteFolder { drive, prefix }`, `Process { file }`, `EditPage { file }`,
-  `RegeneratePage { file, number }`, `RetitleFile { file }`, `Import { file }`, `ManageRulesets`, `ReadRulesets`,
+  `RegeneratePage { file, number }`, `RetitleFile { file }`, `Import { file }`, `ImportCommit { file }`, `ManageRulesets`, `ReadRulesets`,
   `ManageLabels`, `ReadLabels`, `SetFileLabels { file }`,
   `SetMetadata { file }`. The host answers `Gate::allowed()`
   or `Gate::blocked(<its own reason code>)` — to refuse a media type it cannot
@@ -161,16 +161,21 @@ every `RequestUpload`.
   for a delete, `FILE_PROTECTED` included — so a principal cannot move or
   delete through a folder a file it could not move or delete on its own. All
   or nothing: the first refusal in path order refuses the whole gesture with
-  that code (the host's, or `FILE_PROTECTED`); a file the principal cannot see
-  counts as refused and answers `FOLDER_NOT_FOUND`, what a prefix holding
-  nothing answers, so an invisible file is neither named nor told apart from
-  an empty folder. The per-file decisions are in memory over the rows the
-  gesture already locks, so the bulk path keeps its one-statement cost.
+  that code (the host's, or `FILE_PROTECTED`); a refusal about a file the
+  principal cannot see (`FILE_NOT_FOUND`, above) anywhere in the folder
+  answers `FOLDER_NOT_FOUND` for the whole gesture, what a prefix holding
+  nothing answers — so an invisible file is neither named, nor placed, nor
+  told apart from an empty folder. This holds as long as the host refuses a
+  principal every file of a drive it does not see; a host that lets such a
+  principal act on some files (an uploader rule, say) lets a folder gesture
+  tell which case applied. The per-file decisions are in memory over the rows
+  the gesture already loads: they add no statement.
 - `type DriveOwner` — the host's own noun whose objects are keyed by the
   drive's id, marked `impl br_drive::DriveOwnerNoun for Its { type Object =
   ItsRow; }` (`ItsRow` the host aggregate, keyed by a UUID, that
-  `create_drive` takes — so a drive's id is its host object's id, enforced by
-  the library rather than by convention); or
+  `create_drive` takes — so a drive's id is the key of the object the host
+  declares, by construction rather than by convention; `DriveOwnerObject` is
+  sealed); or
   `br_drive::NoDriveOwner` for a host with nothing to refresh. The noun is a
   type, so its name and its UUID key are checked by the compiler. Every file
   change the library stages — a file requested, committed, processed,
@@ -317,7 +322,7 @@ runner reports and never interprets a media type.
 | `<p>RunnerRequestImageUpload(fileId, jobId, name, mediaType, size: ByteCount, sha256): UploadTicket!` | a verified presigned POST for a `drive_image` blob (the runner hashes first; `FILE_TOO_LARGE` past `DriveHost::IMAGE_MAX_BYTES`) and the `file_image` row, unique per file by name. An existing name is **replaced only when the new object lands**: until then the old image stays readable and a failed replacement upload changes nothing; when it lands, the row swaps and the old object is released in the same transaction. A re-request for a name whose upload is still in flight is refused with `IMAGE_UPLOAD_PENDING` (the first ticket stands, one blob per request — the same posture as the source's `KEY_REUSED`); past the host's `upload_window` a re-request replaces the abandoned blob. |
 | `<p>ImportPages(fileId, pages: [ImportedPageInput!]!, summary, pageCount, estimatedTokens): MutationAck!` | the host-privileged import of an existing rendition: a service account holding the host's `IMPORT_SCOPE` (`IMPORT_SCOPE_REQUIRED` otherwise, before anything else), then the gate `Import { file }`, then a `READY` file (`FILE_PROCESSING`, `FILE_NOT_READY` otherwise) — no job, no runner scope. Pages `{ number, markdown, origin? }` (`RUNNER` by default; `EDITED` keeps a page a person had corrected; `REGENERATED` is refused, `INVALID_PAGE_ORIGIN`; an imported page records the importer and the import time as its `updatedBy` / `updatedAt`) are upserted by number under the same rules as a report (≤ 512 per call, numbers ≥ 1 and distinct, the indexing pair together, the estimate optional); each reaches `<p>FilePages` (`Imported { origin }`), an indexing reaches the file (`RenditionImported`); the file stays `READY`; `NOTHING_TO_CHANGE` for an empty import. For a downstream project moving an existing corpus in without re-running its conversions. |
 | `<p>ImportImage(fileId, name, mediaType, size: ByteCount, sha256): UploadTicket!` | same scope, gate and state; the runner's verified image path (page-scoped name, replacement on landing) without its job. |
-| `<p>ImportCommit(fileId): MutationAck!` | commits a pending upload **without processing**: the same scope (`IMPORT_SCOPE_REQUIRED` first) and the same gate `Import { file }` (on the pending row), then `FILE_NOT_PENDING`, then the same live storage HEAD as `CommitUpload` (`UPLOAD_NOT_LANDED`); the file lands `READY` (`UploadCommitted`) and no rule runs, even when an `upload` rule matches — no chain, no `job.create`. For a host that declared its processing rules before migrating its corpus: upload, `ImportCommit`, then `ImportPages` / `ImportImage`. A normal `CommitUpload` is unchanged. |
+| `<p>ImportCommit(fileId): MutationAck!` | commits a pending upload **without processing**: the same scope as an import (`IMPORT_SCOPE_REQUIRED` first, before any file is looked at), then the host's own gate `ImportCommit { file }` on the pending row (its uploader included — the example host reserves it to the migration account's own uploads), then `FILE_NOT_PENDING`, then the same live storage HEAD as `CommitUpload` (`UPLOAD_NOT_LANDED`); the file lands `READY` (`UploadCommitted`) and no rule runs, even when an `upload` rule matches — no chain, no `job.create`. For a host that declared its processing rules before migrating its corpus: upload, `ImportCommit`, then `ImportPages` / `ImportImage`. A normal `CommitUpload` is unchanged. |
 | `<p>RunnerReport(fileId, jobId, pages: [ReportedPageInput!], origin: PageOrigin, summary, pageCount, estimatedTokens, done): MutationAck!` | pages in one or several batches of at most `MAX_REPORT_PAGES` (512, `BATCH_TOO_LARGE`), **upserted by number** (a replayed batch changes nothing; a number twice in one batch is `INVALID_PAGE`); each page reaches `<p>FilePages` on its own key (`Reported { job_id, origin }`) and the file row is touched only by the indexer's triple. `origin` `RUNNER` (default) or `REGENERATED` — on a regenerated page the images of that page that its new markdown no longer references (matched on the whole name, `![…](p001-img01.png)`, never as a substring) are dropped and released (`ImagesDropped { names }` on the file); `summary` and `pageCount` are the indexer's pair and move together, `estimatedTokens` is optional and only rides along with them (`INDEXER_FIELDS_TOGETHER` otherwise, `INVALID_INDEXER_VALUE` when negative; an indexing without an estimate clears a previous one; `ReportStored { job_id, done }` on the file when any of the three changes); an empty report is `NOTHING_TO_CHANGE` unless `done`; `done: true` records `done_at` and stages `job.finish.v2` (see "Processing rules"). |
 
 The job. Every runner root validates `jobId` against the File's own `job_id`
@@ -409,8 +414,14 @@ The chain, one step at a time, in the library's own transactions:
    reprocess. Jobs never fails a job no live runner picks up — its backstops
    need a started run — so without it that file would sit in `PROCESSING` for
    good. A host whose fleet may keep work queued longer than an hour raises
-   `PICKUP_TIMEOUT`. Both are checked at registration (positive, within the
-   scheduler's range);
+   `PICKUP_TIMEOUT`. The pickup clock starts at the step's **first** job: a
+   launch deferred until the first catalogue scan does not eat into it, a
+   relaunch after a crossed cancel does not restart it. It starts when the job
+   is staged, so a Jobs or broker outage longer than `PICKUP_TIMEOUT` fails
+   the steps entered during it; and Jobs reports only a job's first run as
+   started, so a retry after a failed attempt waits under `STEP_TIMEOUT`.
+   Both are checked at registration (positive, within the scheduler's range,
+   and `PICKUP_TIMEOUT` ≤ `STEP_TIMEOUT`);
 2. the step's runner type must be `ACTIVE` in the mirrored catalogue, else
    `FAILED` with `processingError = runner_type_unavailable` before any job
    (Jobs would not refuse an unknown type — it would wait). On a host whose
@@ -419,7 +430,7 @@ The chain, one step at a time, in the library's own transactions:
    `launch-retry` message asks again after `LAUNCH_RETRY_AFTER` (5 s), then
    twice as long each time up to `LAUNCH_RETRY_CAP` (5 min), until the scan
    lands — one warning at the first deferral — the pickup deadline bounding
-   the wait (it restarts when the job is finally created);
+   the wait (it starts over when the step's first job is finally created);
 3. a `job_id` is minted on the File and `integration.cmd.jobs.job.create.v1`
    is staged through the engine outbox: `producer`, `source_bc` and
    `config.host` are the host service, `source_entity_id` is the file (so Jobs

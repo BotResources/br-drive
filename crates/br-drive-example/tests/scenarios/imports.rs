@@ -314,19 +314,52 @@ async fn a_migration_commits_an_upload_without_processing_under_an_upload_rule_t
     let mut files = drive_subscription(&world, &owner, drive).await;
     quiet(&mut files).await;
 
+    // And: the owner's own upload, still pending (bytes not sent)
+    let owners_pending = Uuid::now_v7();
+    ticket(
+        &request(
+            &world,
+            &owner,
+            owners_pending,
+            &UploadRequest::text(drive, "", "draft.txt", BYTES),
+        )
+        .await,
+    );
+
+    // When: a person holding the import scope tries to upload into the workspace
+    let planted = request(
+        &world,
+        &human_importer,
+        Uuid::now_v7(),
+        &UploadRequest::text(drive, "", "planted.txt", BYTES),
+    )
+    .await;
+
+    // Then: only a service account is a migration account — refused as any stranger
+    assert_eq!(error_code(&planted), "NOT_THE_WORKSPACE_OWNER");
+
     // When: the migration account uploads a legacy text file
     let file_id = Uuid::now_v7();
     let legacy = UploadRequest::text(drive, "legacy", "minutes.txt", BYTES);
     let upload_ticket = ticket(&request(&world, &importer, file_id, &legacy).await);
 
-    // Then: committing it without processing needs the import right, and the
-    // bytes — refused before anything moves
+    // Then: committing without processing needs the import right, asked before
+    // any file is looked at
     for principal in [&owner, &runner, &human_importer] {
-        assert_eq!(
-            error_code(&import_commit(&world, principal, file_id).await),
-            "IMPORT_SCOPE_REQUIRED"
-        );
+        for file in [file_id, owners_pending, Uuid::now_v7()] {
+            assert_eq!(
+                error_code(&import_commit(&world, principal, file).await),
+                "IMPORT_SCOPE_REQUIRED"
+            );
+        }
     }
+    // And: the host reserves it to the uploads the migration made itself — the
+    // owner's pending upload is not the importer's to confirm (and, outside
+    // its visible drives, answered as not found), before any storage check
+    assert_eq!(
+        error_code(&import_commit(&world, &importer, owners_pending).await),
+        "FILE_NOT_FOUND"
+    );
     assert_eq!(
         error_code(&import_commit(&world, &importer, file_id).await),
         "UPLOAD_NOT_LANDED"
@@ -379,6 +412,11 @@ async fn a_migration_commits_an_upload_without_processing_under_an_upload_rule_t
         error_code(&import_commit(&world, &importer, file_id).await),
         "FILE_NOT_PENDING"
     );
+    // And: the owner's upload is still pending, untouched
+    assert_eq!(
+        world.file(&owner, owners_pending).await["processingState"],
+        "PENDING"
+    );
 
     // When: the importer writes the rendition it already holds
     ok(&import_pages(
@@ -400,15 +438,32 @@ async fn a_migration_commits_an_upload_without_processing_under_an_upload_rule_t
     assert_eq!(world.file_pages(&owner, file_id).await.len(), 1);
     jobs.expect_no_command(Duration::from_secs(1)).await;
 
-    // And: a normal commit is unchanged — the owner's own upload runs the rule
-    let fresh = upload(
-        &world,
-        &owner,
-        &UploadRequest::text(drive, "", "fresh.txt", BYTES),
-    )
-    .await;
-    jobs.await_create(fresh).await;
+    // And: a normal commit is unchanged — an upload of the migration account
+    // committed the normal way runs the rule
+    let fresh = Uuid::now_v7();
+    let fresh_request = UploadRequest::text(drive, "", "fresh.txt", BYTES);
+    let fresh_ticket = ticket(&request(&world, &importer, fresh, &fresh_request).await);
+    post_bytes(&world, &fresh_ticket, BYTES, fresh_request.name).await;
+    ok(&commit(&world, &importer, fresh).await);
+    let fresh_job = jobs.await_create(fresh).await.job_id;
     world.await_state(&owner, fresh, "PROCESSING").await;
+
+    // And: a file of the importer's that is PROCESSING, then FAILED, is not
+    // pending: refused, and left as it is
+    assert_eq!(
+        error_code(&import_commit(&world, &importer, fresh).await),
+        "FILE_NOT_PENDING"
+    );
+    jobs.fail(fresh_job, "runner_error", Some("unreadable"))
+        .await;
+    world.await_state(&owner, fresh, "FAILED").await;
+    assert_eq!(
+        error_code(&import_commit(&world, &importer, fresh).await),
+        "FILE_NOT_PENDING"
+    );
+    let failed = world.file(&owner, fresh).await;
+    assert_eq!(failed["processingState"], "FAILED");
+    assert_eq!(failed["processingError"], "unreadable");
 
     world.cleanup().await;
 }

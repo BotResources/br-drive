@@ -15,8 +15,8 @@ use crate::harness::runner::{
 };
 use crate::harness::upload::{UploadRequest, commit, post_bytes, request, ticket, upload};
 use crate::harness::{
-    JobsStandIn, World, WorldOptions, drive_subscription, error_code, manager_passport,
-    next_delta_within, next_drive_delta, ok, passport, service_passport,
+    JobsStandIn, Subscription, World, WorldOptions, drive_subscription, error_code,
+    manager_passport, next_delta_within, next_drive_delta, ok, passport, service_passport,
 };
 
 const BYTES: &[u8] = b"a document the runners never pick up";
@@ -68,6 +68,19 @@ async fn cancel_then_create(jobs: &JobsStandIn, stray: Uuid, file_id: Uuid) -> U
 const PICKUP_TIMEOUT: Duration = <AppPrincipal as DriveHost>::PICKUP_TIMEOUT;
 const STEP_TIMEOUT: Duration = <AppPrincipal as DriveHost>::STEP_TIMEOUT;
 
+/// Halfway between two deadlines: a failure before it is the first one's.
+fn between(first: Duration, second: Duration) -> Duration {
+    first + (second - first) / 2
+}
+
+/// The next failure of the owner's file list.
+async fn next_failure(files: &mut Subscription, within: Duration) -> serde_json::Value {
+    next_delta_within(files, "workspaceDriveChanged", within, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingFailed"
+    })
+    .await
+}
+
 #[tokio::test]
 async fn a_job_no_runner_picks_up_times_out_at_the_pickup_deadline_and_can_be_reprocessed() {
     // Given: a render rule and a runner type that is ACTIVE but has no live instance
@@ -80,7 +93,9 @@ async fn a_job_no_runner_picks_up_times_out_at_the_pickup_deadline_and_can_be_re
     let drive = world.create_workspace(&owner, "library").await;
     let mut files = drive_subscription(&world, &owner, drive).await;
 
-    // When: a file is uploaded and Jobs never dispatches its job
+    // When: a file is uploaded, Jobs queues its job — as it always does at
+    // creation — and never dispatches it
+    let before = Instant::now();
     let file_id = upload(
         &world,
         &owner,
@@ -88,7 +103,7 @@ async fn a_job_no_runner_picks_up_times_out_at_the_pickup_deadline_and_can_be_re
     )
     .await;
     let stuck = jobs.await_create(file_id).await.job_id;
-    let created = Instant::now();
+    jobs.queue(stuck, RENDER).await;
 
     // Then: past the pickup deadline — well before the run-silence one — the
     // job is cancelled and the file fails `timed_out`
@@ -99,9 +114,9 @@ async fn a_job_no_runner_picks_up_times_out_at_the_pickup_deadline_and_can_be_re
         |node| node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingFailed",
     )
     .await;
-    let waited = created.elapsed();
+    let waited = before.elapsed();
     assert!(
-        waited + Duration::from_secs(1) >= PICKUP_TIMEOUT && waited < STEP_TIMEOUT,
+        waited >= PICKUP_TIMEOUT && waited < between(PICKUP_TIMEOUT, STEP_TIMEOUT),
         "the pickup deadline ({PICKUP_TIMEOUT:?}) fired, not the run-silence one: {waited:?}"
     );
     assert_eq!(timed_out["cause"]["reason"], "timed_out");
@@ -131,7 +146,7 @@ async fn a_job_no_runner_picks_up_times_out_at_the_pickup_deadline_and_can_be_re
 
 #[tokio::test]
 async fn a_started_run_outlives_the_pickup_deadline_and_times_out_only_once_silent() {
-    // Given: a render rule and a file whose job a runner picked up
+    // Given: a render rule and a file whose job Jobs queued
     let world = World::start("pod-run-silence").await;
     let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
@@ -146,31 +161,138 @@ async fn a_started_run_outlives_the_pickup_deadline_and_times_out_only_once_sile
     )
     .await;
     let job = jobs.await_create(file_id).await.job_id;
+    jobs.queue(job, RENDER).await;
 
-    // When: Jobs reports the run started, and the runner then falls silent
+    // When: a runner picks the job up well after its creation — but inside the
+    // pickup deadline — and then falls silent
+    tokio::time::sleep(PICKUP_TIMEOUT / 2).await;
     jobs.start(job, Uuid::now_v7()).await;
     let started = Instant::now();
 
-    // Then: the pickup deadline passes without failing the file; the
-    // run-silence deadline, measured from the start, cancels the job and
-    // fails it `timed_out`
-    let timed_out = next_delta_within(
-        &mut files,
-        "workspaceDriveChanged",
-        Duration::from_secs(90),
-        |node| node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingFailed",
-    )
-    .await;
+    // Then: the run-silence deadline, measured from the start (not from the
+    // step's entry, not at the pickup deadline), cancels the job and fails it
+    let timed_out = next_failure(&mut files, Duration::from_secs(90)).await;
     let silent = started.elapsed();
     assert!(
-        silent + Duration::from_secs(1) >= STEP_TIMEOUT,
-        "a started run is failed only after {STEP_TIMEOUT:?} of silence, not at the pickup \
-         deadline ({PICKUP_TIMEOUT:?}): {silent:?}"
+        silent + Duration::from_millis(500) >= STEP_TIMEOUT
+            && silent < STEP_TIMEOUT + Duration::from_secs(5),
+        "a started run fails {STEP_TIMEOUT:?} after its start: {silent:?}"
     );
     assert_eq!(timed_out["cause"]["reason"], "timed_out");
     assert_eq!(timed_out["view"]["processingError"], "timed_out");
     jobs.await_cancel(job).await;
     jobs.expect_no_command(Duration::from_secs(1)).await;
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_run_that_reports_before_its_started_fact_is_under_the_silence_deadline() {
+    // Given: a queued job whose `started` fact never reaches the host
+    let world = World::start("pod-late-started").await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let owner = passport(Uuid::now_v7());
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    install_render_rule(&world, &jobs, &manager).await;
+    let drive = world.create_workspace(&owner, "library").await;
+    let mut files = drive_subscription(&world, &owner, drive).await;
+    let file_id = upload(
+        &world,
+        &owner,
+        &UploadRequest::text(drive, "", "chatty.txt", BYTES),
+    )
+    .await;
+    let job = jobs.await_create(file_id).await.job_id;
+    jobs.queue(job, RENDER).await;
+    world.await_source_promoted(file_id).await;
+
+    // When: the runner sends a first page, not done, inside the pickup deadline
+    tokio::time::sleep(PICKUP_TIMEOUT / 2).await;
+    ok(&report(
+        &world,
+        &runner,
+        file_id,
+        Report {
+            job_id: job,
+            pages: vec![(1, "first page")],
+            origin: None,
+            indexer: None,
+            done: false,
+        },
+    )
+    .await);
+    let reported = Instant::now();
+
+    // Then: the pickup deadline passes — the report showed a started run —
+    // and the file fails only once the run fell silent for the whole silence
+    let timed_out = next_failure(&mut files, Duration::from_secs(90)).await;
+    let silent = reported.elapsed();
+    assert!(
+        silent + Duration::from_millis(500) >= STEP_TIMEOUT
+            && silent < STEP_TIMEOUT + Duration::from_secs(5),
+        "a reporting run fails {STEP_TIMEOUT:?} after its last report: {silent:?}"
+    );
+    assert_eq!(timed_out["cause"]["reason"], "timed_out");
+    jobs.await_cancel(job).await;
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_deferred_launch_gets_its_whole_pickup_deadline_from_its_first_job() {
+    // Given: a fresh host whose catalogue watch has not scanned yet, and a rule
+    let world = World::start_with(
+        "pod-deferred-pickup",
+        WorldOptions {
+            watch_catalogue: false,
+            ..WorldOptions::default()
+        },
+    )
+    .await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let owner = passport(Uuid::now_v7());
+    jobs.declare_runner_type(RENDER, contract_jobs::catalog::RunnerTypeLifecycle::Active)
+        .await;
+    ok(&create_ruleset(
+        &world,
+        &manager,
+        RuleSpec {
+            name: "render",
+            trigger: "UPLOAD",
+            media_types: &["text/plain"],
+            steps: &[(RENDER, serde_json::json!({}))],
+            is_default: true,
+        },
+    )
+    .await);
+    let drive = world.create_workspace(&owner, "library").await;
+    let mut files = drive_subscription(&world, &owner, drive).await;
+
+    // When: a file is uploaded, its launch is deferred for several seconds,
+    // then the watch scans and the step's job is created — and never picked up
+    let file_id = upload(
+        &world,
+        &owner,
+        &UploadRequest::text(drive, "", "late.txt", BYTES),
+    )
+    .await;
+    jobs.expect_no_command(Duration::from_secs(6)).await;
+    world.service.start_catalogue_watch().await;
+    let job = jobs.await_create(file_id).await.job_id;
+    let created = Instant::now();
+    jobs.queue(job, RENDER).await;
+
+    // Then: the pickup deadline runs from that job, not from the step's entry
+    let timed_out = next_failure(&mut files, Duration::from_secs(75)).await;
+    let waited = created.elapsed();
+    assert!(
+        waited + Duration::from_secs(2) >= PICKUP_TIMEOUT,
+        "the deferral did not eat into the pickup deadline: {waited:?}"
+    );
+    assert_eq!(timed_out["cause"]["reason"], "timed_out");
+    jobs.await_cancel(job).await;
 
     world.cleanup().await;
 }

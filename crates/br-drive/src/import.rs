@@ -1,8 +1,9 @@
 //! The host-privileged import: a rendition and its images written into a READY
 //! file without a runner and without a job — for a downstream project moving
 //! an existing corpus in, whose pages (human edits included) it already holds.
-//! Every import gesture asks the host's `DriveRequest::Import` gate, so each
-//! host decides who may call them, and they write through the same paths a
+//! Every import gesture asks the host (`DriveRequest::Import`, or
+//! `DriveRequest::ImportCommit` for the commit), so each host decides who may
+//! call them, and they write through the same paths a
 //! commit and a runner report do, so the views learn of every change. A
 //! migrated source is committed without processing (`ImportCommit`), so a host
 //! that declared its upload rules first still gets a READY file to import into.
@@ -50,8 +51,8 @@ impl MutationInput for ImportCommit {
 /// present and is the pinned bytes — and lands the file READY without running
 /// any rule, even when an `upload` rule matches: the file's rendition comes
 /// from `ImportPages` / `ImportImage`, not from a runner. The same right as an
-/// import: the host's `IMPORT_SCOPE`, then its `Import` gate on the pending
-/// row. A normal commit is unchanged.
+/// import: the host's `IMPORT_SCOPE`, then its own `ImportCommit` gate on the
+/// pending row. A normal commit is unchanged.
 pub fn import_commit<'m, H: DriveHost>(
     cx: &'m mut Mutation<'m, H>,
     input: ImportCommit,

@@ -33,8 +33,7 @@ pub fn register<H: DriveHost>(
     prefix: &'static str,
 ) -> Result<(), EngineError> {
     processing::declare_roots::<H>(prefix)?;
-    processing::step_timeout::<H>()?;
-    processing::pickup_timeout::<H>()?;
+    processing::check_timeouts::<H>()?;
     if !engine.blobs_configured() {
         return Err(EngineError::Config(
             "br-drive needs object storage: configure EngineConfig::with_blob_storage before \

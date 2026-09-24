@@ -101,11 +101,13 @@ single git tag `v{version}` releases the set. Format follows
   — the file lands `READY` and no rule runs, even when an `upload` rule
   matches — so a host that declared its processing rules before migrating a
   corpus can still import into it. The same right as an import
-  (`IMPORT_SCOPE`, then the host's `Import { file }` gate on the pending row),
-  then `FILE_NOT_PENDING` and the commit's storage check
+  (`IMPORT_SCOPE`), then a gate of its own, the new
+  `DriveRequest::ImportCommit { file }` on the pending row (its uploader
+  included), then `FILE_NOT_PENDING` and the commit's storage check
   (`UPLOAD_NOT_LANDED`). `CommitUpload` is unchanged.
-- `DriveHost::PICKUP_TIMEOUT` (default 1 h, checked at registration): the
-  pickup stage of the step deadline (see Fixed). Migration `9121000009` adds
+- `DriveHost::PICKUP_TIMEOUT` (default 1 h, checked at registration, not
+  above `STEP_TIMEOUT`): the pickup stage of the step deadline (see Fixed),
+  counted from the step's first job. Migration `9121000009` adds
   `drive.file.run_started_at`, set by the first sign of a started run (a
   `started` fact, a plan, a step, a runner report).
 - `br_drive::create_unowned_drive::<H>(ops, id, created_by)`, for a host whose
@@ -233,10 +235,10 @@ single git tag `v{version}` releases the set. Format follows
   decision of each file under the prefix: a host whose per-file rule is
   stricter than its folder rule sees folder gestures refused with that rule's
   code where they went through before.
-- `<p>ImportCommit` is new: it needs `IMPORT_SCOPE` and the host's
-  `Import { file }` gate, now asked for a PENDING file as well as a READY
-  one; a host whose `Import` rule assumed a READY file checks
-  `file.processing_state` if it cares.
+- `<p>ImportCommit` is new: it needs `IMPORT_SCOPE` and the host's new
+  `DriveRequest::ImportCommit { file }` — decide it explicitly (a wildcard
+  arm answers it); the row carries the uploader. A host that sets
+  `PICKUP_TIMEOUT` above `STEP_TIMEOUT` is refused at registration.
   `DriveRequest::Import { file }` is new; an import additionally needs
   `IMPORT_SCOPE`, so a host that sets none offers no import whatever its
   gate answers.

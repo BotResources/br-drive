@@ -54,6 +54,19 @@ pub fn pickup_timeout<H: DriveHost>() -> Result<TimeDelta, EngineError> {
     schedulable(H::PICKUP_TIMEOUT, "PICKUP_TIMEOUT")
 }
 
+/// Both deadlines, checked together at registration: each schedulable, and
+/// the pickup no longer than the run silence — the one scheduled message
+/// only ever moves later, so a run starting under a longer pickup would keep
+/// the pickup's due date past its silence.
+pub fn check_timeouts<H: DriveHost>() -> Result<(), EngineError> {
+    if pickup_timeout::<H>()? > step_timeout::<H>()? {
+        return Err(EngineError::Config(
+            "DriveHost::PICKUP_TIMEOUT must not exceed DriveHost::STEP_TIMEOUT".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn schedulable(timeout: Duration, name: &str) -> Result<TimeDelta, EngineError> {
     TimeDelta::from_std(timeout)
         .ok()
@@ -93,6 +106,18 @@ fn due_after<H>(
         alive + silence
     } else {
         alive + pickup
+    }
+}
+
+/// The step's job was just created. The pickup deadline runs from the step's
+/// **first** job: a launch deferred until the first catalogue scan does not
+/// eat into it (no job existed yet, `step_alive_at` is still the entry), but a
+/// relaunch after a crossed cancel does not restart it — else a relaunch loop
+/// would never time out.
+pub(super) fn job_created<H>(file: &mut FileRow<H>, now: DateTime<Utc>) {
+    let no_job_yet = file.step_alive_at.is_none() || file.step_alive_at == file.step_entered_at;
+    if no_job_yet && file.run_started_at.is_none() {
+        file.step_alive_at = Some(now);
     }
 }
 
@@ -351,6 +376,30 @@ mod tests {
             "the run started once; later signs of life only move the silence clock"
         );
         assert_eq!(due_after(&file, entered, pickup, silence), later + silence);
+    }
+
+    #[test]
+    fn the_pickup_clock_starts_at_the_first_job_and_ignores_relaunches() {
+        let entered = Utc::now().trunc_subsecs(6);
+        let pickup = TimeDelta::hours(1);
+        let silence = TimeDelta::hours(72);
+        let mut file = crate::file::tests_support::processing_file::<()>(0, entered);
+        // A launch deferred for ten minutes, then its first job.
+        let first = entered + TimeDelta::minutes(10);
+        job_created(&mut file, first);
+        assert_eq!(due_after(&file, entered, pickup, silence), first + pickup);
+        // Two relaunches after crossed commands keep the first job's clock.
+        for minutes in [11, 12] {
+            job_created(&mut file, entered + TimeDelta::minutes(minutes));
+        }
+        assert_eq!(due_after(&file, entered, pickup, silence), first + pickup);
+        // A job created at the very instant the step was entered.
+        let mut fresh = crate::file::tests_support::processing_file::<()>(0, entered);
+        job_created(&mut fresh, entered);
+        assert_eq!(
+            due_after(&fresh, entered, pickup, silence),
+            entered + pickup
+        );
     }
 
     use chrono::SubsecRound;

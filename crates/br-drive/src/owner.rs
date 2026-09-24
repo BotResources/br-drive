@@ -4,7 +4,8 @@
 //! impacts that key, so the host's views bound to its own noun — an object
 //! carrying file counts, say — recompute and republish. The library never
 //! calls the host. A drive is created from its host object and takes its key
-//! (`create_drive`), so the two ids cannot differ.
+//! (`create_drive`): the drive's id is the key of the object the host
+//! declares as its `DriveOwnerNoun::Object`.
 
 use std::collections::HashMap;
 
@@ -35,11 +36,25 @@ pub trait DriveOwnerNoun: Noun<Key = Uuid> {
     const REFRESHED: bool = true;
 }
 
-/// What a drive is created from: the id it takes. Every engine aggregate keyed
-/// by a UUID is one — the drive takes its key.
-pub trait DriveOwnerObject {
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// What a drive is created from: the id it takes. Sealed: every engine
+/// aggregate keyed by a UUID is one — the drive takes its key — and nothing
+/// else is, so the id is the key of the object the host declared.
+pub trait DriveOwnerObject: sealed::Sealed {
     fn drive_id(&self) -> Uuid;
 }
+
+impl<A> sealed::Sealed for A
+where
+    A: Aggregate,
+    A::Store: Persistence<Key = Uuid>,
+{
+}
+
+impl sealed::Sealed for Unowned {}
 
 impl<A> DriveOwnerObject for A
 where

@@ -10,7 +10,7 @@ mod roots;
 pub(crate) use backstop::run_alive;
 pub use backstop::{
     LAUNCH_RETRY_AFTER, LAUNCH_RETRY_CAP, LAUNCH_RETRY_DURABLE, LaunchRetry, STEP_DEADLINE_DURABLE,
-    StepDeadline, launch_retry, pickup_timeout, retry_delay, step_deadline, step_timeout,
+    StepDeadline, check_timeouts, launch_retry, retry_delay, step_deadline,
 };
 pub use chain::{
     ChainPlan, advance, cancel_active_job, finish_active_job, start_chain, wipe_rendition,
