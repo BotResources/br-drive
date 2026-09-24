@@ -6,8 +6,8 @@ use uuid::Uuid;
 use crate::harness::runner::{INDEX, RENDER, RuleSpec, create_ruleset, ruleset_id};
 use crate::harness::upload::{UploadRequest, upload};
 use crate::harness::{
-    JobsStandIn, RULESET_DELTAS, World, catalogue_subscription, error_code, manager_passport,
-    next_delta, ok, passport, service_passport,
+    JobsStandIn, RULESET_DELTAS, World, WorldOptions, catalogue_subscription, error_code,
+    manager_passport, next_delta, ok, passport, service_passport,
 };
 
 const BYTES: &[u8] = b"ruled bytes";
@@ -311,27 +311,45 @@ async fn two_concurrent_saves_of_one_name_answer_exactly_one_name_taken() {
 }
 
 #[tokio::test]
-async fn a_rule_cannot_be_saved_on_a_host_whose_catalogue_was_never_scanned() {
-    let world = World::start("pod-rules-unscanned").await;
+async fn a_rule_saved_before_the_first_catalogue_scan_is_kept_with_its_steps_flagged_unknown() {
+    let world = World::start_with(
+        "pod-rules-unscanned",
+        WorldOptions {
+            watch_catalogue: false,
+            ..WorldOptions::default()
+        },
+    )
+    .await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
-    sqlx::query("DELETE FROM drive.catalogue_scan")
-        .execute(&world.db.app)
-        .await
-        .expect("forget the boot scan, as a host that never started the watch");
+    let jobs = JobsStandIn::attach(&world).await;
+    // Jobs already publishes both types ACTIVE: only the missing scan explains
+    // the warning below.
+    for runner_type in [RENDER, INDEX] {
+        jobs.declare_runner_type(runner_type, RunnerTypeLifecycle::Active)
+            .await;
+    }
 
-    let refused = create_ruleset(
+    let saved = create_ruleset(
         &world,
         &manager,
         RuleSpec {
-            name: "blind",
+            name: "early",
             trigger: "UPLOAD",
             media_types: &["*"],
-            steps: &[(RENDER, serde_json::json!({}))],
+            steps: &[
+                (RENDER, serde_json::json!({})),
+                (INDEX, serde_json::json!({})),
+            ],
             is_default: true,
         },
     )
     .await;
-    assert_eq!(error_code(&refused), "CATALOGUE_NOT_WATCHED");
+    assert_eq!(
+        ok(&saved)["workspaceCreateRuleset"]["unknownRunnerTypes"],
+        serde_json::json!([INDEX, RENDER]),
+        "a host that has not scanned yet cannot vouch for any runner type: a warning, not a refusal"
+    );
+    assert_eq!(world.rulesets(&manager).await.len(), 1);
 
     world.cleanup().await;
 }

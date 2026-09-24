@@ -90,6 +90,7 @@ pub struct UnknownDbValue(pub &'static str, pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+#[non_exhaustive]
 pub enum FileCause {
     UploadRequested,
     UploadCommitted,
@@ -113,6 +114,7 @@ pub enum FileCause {
     Deleted,
     FolderDeleted,
     DriveDeleted,
+    LaunchDeferred { step: i32 },
 }
 
 pub struct FileRow<H> {
@@ -144,6 +146,9 @@ pub struct FileRow<H> {
     pub triggered_by: Option<Initiator>,
     pub done_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub step_entered_at: Option<DateTime<Utc>>,
+    pub step_alive_at: Option<DateTime<Utc>>,
+    pub stray_job_id: Option<Uuid>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -181,6 +186,9 @@ impl<H> Clone for FileRow<H> {
             triggered_by: self.triggered_by.clone(),
             done_at: self.done_at,
             completed_at: self.completed_at,
+            step_entered_at: self.step_entered_at,
+            step_alive_at: self.step_alive_at,
+            stray_job_id: self.stray_job_id,
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,

@@ -114,17 +114,17 @@ fn manage_gate<H: DriveHost>(principal: &H) -> Result<(), DriveFault> {
     Ok(())
 }
 
-/// A rule is only worth saving on a host whose catalogue watch has scanned at
-/// least once: without it every chain would fail before its first job.
-async fn require_catalogue(conn: &mut PgConnection) -> Result<(), DriveFault> {
-    if catalogue::scanned(conn).await? {
-        return Ok(());
+/// A rule saved before the host's first catalogue scan is kept: its steps are
+/// reported as unknown runner types (the save's warning), and a chain that
+/// fires before the scan defers its launch instead of failing.
+async fn note_unscanned_catalogue(conn: &mut PgConnection) -> Result<(), DriveFault> {
+    if !catalogue::scanned(conn).await? {
+        tracing::warn!(
+            "a ruleset was saved on a host where no runner-type catalogue scan has completed \
+             yet; start `br_drive::watch_runner_types` next to the engine"
+        );
     }
-    tracing::error!(
-        "a ruleset was saved on a host where no runner-type catalogue watch has ever scanned; \
-         start `br_drive::watch_runner_types` next to the engine"
-    );
-    Err(DriveFault::Refused(codes::CATALOGUE_NOT_WATCHED))
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,7 +152,7 @@ pub fn create_ruleset<'m, H: DriveHost>(
         let name = validate_name(&input.name)?;
         let media_types = validate_media_types(&input.media_types)?;
         validate_steps(&input.steps)?;
-        require_catalogue(cx.connection()).await?;
+        note_unscanned_catalogue(cx.connection()).await?;
         serialize_rulesets(cx.connection()).await?;
         require_free_name(cx.connection(), &name, None).await?;
         if input.is_default {
@@ -207,7 +207,7 @@ pub fn update_ruleset<'m, H: DriveHost>(
 ) -> BoxFuture<'m, Result<OneShot<RulesetSaved>, DriveFault>> {
     Box::pin(async move {
         manage_gate(cx.principal())?;
-        require_catalogue(cx.connection()).await?;
+        note_unscanned_catalogue(cx.connection()).await?;
         serialize_rulesets(cx.connection()).await?;
         let mut ruleset = cx
             .load::<RulesetRow>(&input.id)

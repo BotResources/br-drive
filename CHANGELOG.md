@@ -7,7 +7,87 @@ single git tag `v{version}` releases the set. Format follows
 
 ## Unreleased
 
-Nothing yet.
+### Fixed
+
+- A processing chain of more than one step reaches `READY` against the real
+  Jobs service: no step names the previous step's job as `parent_job_id` any
+  more. Jobs refuses a terminal parent (`parent_job_terminal`), and the chain
+  only advances once the previous job completed, so every second step was
+  rejected and its file failed; with a live parent the step would have been
+  owned by the parent's runner instead of the host. The chain is a host-side
+  sequence correlated by the file id.
+- A `creation_rejected` `duplicate_active_entity` no longer leaves the file
+  unprocessable: the live job Jobs names (`params.activeJobId`, checked
+  against the file and host the rejection names) is kept on the file
+  (`drive.file.stray_job_id`) and cancelled at once, and every later launch
+  cancels it again before asking for its own job, until Jobs queues a job of
+  the file. When the job named is one the library already cancelled (the
+  cancel and the create crossed on Jobs' separate consumers), the step waits
+  and relaunches instead of failing. `DeleteFile`, `DeleteFolder` and
+  `delete_drive` cancel it too; an erase in `Delete` mode cannot (no outbound
+  identity in the erase pipeline).
+- `job.create` carries only what Jobs accepts: `RequestUpload` refuses a file
+  id that is not a UUIDv7 (`INVALID_FILE_ID`) — Jobs refuses a non-v7 source
+  entity, which would fail every chain of the file — and `triggered_by` is
+  trimmed, a blank display name sent as anonymous, a long one cut at 512
+  characters, an erased (nil) initiator not named at all.
+- A chain fired before the host's first runner-type catalogue scan (a fresh
+  database) is deferred instead of failing the file `catalogue_not_watched`:
+  the file waits in its step and a `launch-retry` message asks again after
+  `LAUNCH_RETRY_AFTER` (5 s), backing off to `LAUNCH_RETRY_CAP` (5 min), one
+  warning at the first deferral. Saving a rule before that scan is accepted,
+  every step reported in `unknownRunnerTypes`, instead of refused with
+  `CATALOGUE_NOT_WATCHED`. Both codes stay exported, deprecated, no longer
+  raised.
+- The runner source presign is scoped to the one file the job names, while
+  that job is the file's active one, instead of enumerating every file with a
+  live job on each `RunnerContext` call; the population re-checks the active
+  job with the same rule as the runner roots.
+- Image names are no longer capped at page 999 and image 99: the page and
+  index widths of `p{page:03}-img{n:02}.{ext}` are minimums (`p1000-img100.png`
+  is accepted), a number is never padded wider than it needs, an index is
+  never zero.
+
+### Added
+
+- `DriveHost::STEP_TIMEOUT` (default 72 h, Jobs' longest run; checked at
+  registration): a step silent that long — measured from its last sign of
+  life: entry, run start, plan, step, runner report — has its job cancelled
+  and its file lands `FAILED` `timed_out` (`br_drive::TIMED_OUT`). Jobs never
+  fails a job no live runner picks up, so this is the way out for a runner
+  type with no live instance. One `step-deadline` message per step on a
+  `{service}-drive-step-deadline` durable, rescheduled when the step showed
+  life since.
+- Migration `9121000006`: `drive.file.step_entered_at` (the running step's
+  identity; the deadline and the deferred launch key on it),
+  `drive.file.step_alive_at` (its last sign of life) and
+  `drive.file.stray_job_id`.
+- The example host's Jobs stand-in judges every `job.create` the way Jobs
+  does, in Jobs' order — the inputs `svc-jobs` refuses before the domain
+  (non-v7 ids, a blank or over-long display name, a source not named by its
+  producer), a reused id, a second live job on a source entity, a
+  self-named, terminal, deleted or unknown parent — and answers
+  `creation_rejected` itself; it publishes `cancelled` for a live job it
+  cancels, and a create a scenario awaits fails the scenario when refused.
+  Regression scenarios for the double; new scenarios for the step timeout, the duplicate-job trap
+  and the deferred launch. The example host can boot without its catalogue
+  watch (`BootOptions::watch_catalogue`) and start it later.
+
+### Changed
+
+- `FileCause` is `#[non_exhaustive]`; new variant `LaunchDeferred { step }`.
+- A chain step never names a `parent_job_id` (see Fixed).
+- Image names accept wider page and index numbers (see Fixed).
+
+### Upgrading from 0.1
+
+- Migration `9121000006` adds nullable columns only. Files already
+  `PROCESSING` when it is applied carry no step clock and get no deadline:
+  let them finish or delete them.
+- `DriveHost::STEP_TIMEOUT` is new with a 72 h default; a host that wants its
+  users to learn sooner that no runner picked a file up lowers it.
+- A host that matched `CATALOGUE_NOT_WATCHED` keeps compiling (deprecated);
+  nothing raises it any more.
 
 ## 0.1.0 — 2026-09-23
 

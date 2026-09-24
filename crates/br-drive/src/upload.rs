@@ -70,6 +70,12 @@ pub fn request_upload<'m, H: DriveHost>(
     input: RequestUpload,
 ) -> BoxFuture<'m, Result<OneShot<UploadTicket>, DriveFault>> {
     Box::pin(async move {
+        // The file id is the source entity every job of the file names, and
+        // Jobs accepts only a UUIDv7 there: anything else would fail every
+        // chain of the file for good.
+        if input.file_id.get_version_num() != 7 {
+            return Err(DriveFault::Refused(codes::INVALID_FILE_ID));
+        }
         let path = DrivePath::parse(&input.path).map_err(Reason::from)?;
         let name = FileName::parse(&input.name).map_err(Reason::from)?;
         let media_type = MediaType::parse(&input.media_type)
@@ -126,6 +132,9 @@ pub fn request_upload<'m, H: DriveHost>(
             triggered_by: None,
             done_at: None,
             completed_at: None,
+            step_entered_at: None,
+            step_alive_at: None,
+            stray_job_id: None,
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,

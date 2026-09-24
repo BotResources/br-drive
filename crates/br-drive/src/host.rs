@@ -96,6 +96,18 @@ pub trait DriveHost: Principal {
 
     const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
+    /// How long a step of a processing chain may stay silent before the
+    /// library cancels its job and fails the file with `timed_out`. Silence is
+    /// measured from the step's last sign of life: its entry, then each run
+    /// start, plan, step and runner report — so time spent queued counts until
+    /// the first run starts. Jobs never fails a job no live runner picked up,
+    /// so without it a file whose runner type has no live instance would sit in
+    /// PROCESSING for good. The default is Jobs' own longest run (72 h), so the
+    /// library never gives up on work Jobs still allows; a host that wants its
+    /// users to learn sooner lowers it. Checked at registration: positive and
+    /// within the scheduler's range.
+    const STEP_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
+
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;
 
     fn visible_drives(&self) -> Vec<Uuid>;
