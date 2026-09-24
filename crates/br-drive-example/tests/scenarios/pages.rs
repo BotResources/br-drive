@@ -119,7 +119,7 @@ async fn a_user_edits_a_page_of_a_ready_file_and_only_that_page_travels() {
             serde_json::json!({ "f": file_id, "n": 1, "m": "vandalism" }),
         )
         .await;
-    assert_eq!(error_code(&foreign), "NOT_THE_WORKSPACE_OWNER");
+    assert_eq!(error_code(&foreign), "FILE_NOT_FOUND");
     assert!(
         pages_reset(&world, &outsider, file_id).await.is_empty(),
         "an outsider's FilePages window is empty"

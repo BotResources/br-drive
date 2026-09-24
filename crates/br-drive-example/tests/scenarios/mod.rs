@@ -4,6 +4,7 @@ mod cascade;
 mod concurrency;
 mod erase;
 mod folders;
+mod gates;
 mod hosts;
 mod jobs_double;
 mod labels;

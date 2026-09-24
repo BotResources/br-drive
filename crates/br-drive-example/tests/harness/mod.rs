@@ -132,7 +132,7 @@ impl World {
         let response = self
             .gql(
                 passport,
-                "query($id:UUID!){workspaceFile(fileId:$id){id driveId path name protected \
+                "query($id:UUID!){workspaceFile(fileId:$id){id driveId path name protected metadata \
                  mediaType sizeBytes sha256 processingState processingError summary pageCount \
                  estimatedTokens images{name mediaType sizeBytes page} labelIds rulesetId \
                  steps{runnerType options} progress{stepIndex stepCount runnerType plan \
@@ -546,7 +546,7 @@ pub fn error_code(response: &serde_json::Value) -> String {
 pub const DRIVE_DELTAS: &str = "subscription($d:UUID!){workspaceDriveChanged(driveId:$d){\
     __typename \
     ... on DriveReset{revision views{... on DriveFile{id path name processingState labelIds}}} \
-    ... on DriveUpsert{revision cause view{... on DriveFile{id path name processingState processingError affordances summary pageCount estimatedTokens images{name page} labelIds rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
+    ... on DriveUpsert{revision cause view{... on DriveFile{id path name protected metadata processingState processingError affordances summary pageCount estimatedTokens images{name page} labelIds rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
     ... on DriveRemove{revision projector key cause}}}";
 
 pub const LABEL_DELTAS: &str = "subscription{workspaceLabelsChanged{\
@@ -669,6 +669,45 @@ pub async fn next_page_delta(
     matches: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
     next_delta(sub, "workspaceFilePages", matches).await
+}
+
+/// Reads the session for `within` and fails on any delta `forbidden` matches —
+/// an absence stated by what must not happen, so a late delta of the Given
+/// (a source promoted, a commit delivered) does not make it flaky.
+pub async fn refute_delta(
+    sub: &mut Subscription,
+    root: &str,
+    within: Duration,
+    forbidden: impl Fn(&serde_json::Value) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let Some(delta) = sub.try_next_payload(remaining).await else {
+            return;
+        };
+        assert!(
+            !forbidden(&delta[root]),
+            "a forbidden delta arrived: {delta}"
+        );
+    }
+}
+
+/// Lets the deltas of the gestures that built the Given reach a fresh session.
+pub async fn quiet(sub: &mut Subscription) {
+    for _ in 0..50 {
+        if sub
+            .try_next_payload(Duration::from_millis(400))
+            .await
+            .is_none()
+        {
+            return;
+        }
+    }
+    panic!("the session never went quiet");
 }
 
 pub async fn next_delta(

@@ -160,15 +160,11 @@ pub fn annotate_file<'m>(
     input: AnnotateFile,
 ) -> BoxFuture<'m, Result<(), AppFault>> {
     Box::pin(async move {
-        let drive = br_drive::drive_of(cx, input.file_id)
-            .await?
-            .ok_or(AppFault::Refused(br_drive::codes::FILE_NOT_FOUND))?;
-        let workspace = cx
-            .load::<WorkspaceRow>(&drive)
-            .await?
-            .ok_or(AppFault::Refused(WORKSPACE_NOT_FOUND))?;
-        workspace.transfer_gate(cx.principal()).require()?;
-        br_drive::set_metadata::<AppPrincipal>(cx, input.file_id, input.metadata).await?;
+        // The library asks the host's gate (`DriveRequest::SetMetadata`): the
+        // owner-only rule of the drive applies with no check of its own here.
+        let principal = cx.principal().clone();
+        br_drive::set_metadata::<AppPrincipal>(cx, &principal, input.file_id, input.metadata)
+            .await?;
         Ok(())
     })
 }

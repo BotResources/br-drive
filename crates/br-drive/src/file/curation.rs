@@ -29,8 +29,11 @@ pub async fn set_protected<H: DriveHost>(
     Ok(())
 }
 
+/// Writes the host's free JSON on a file, asking the host's gate
+/// (`DriveRequest::SetMetadata`) on behalf of `principal` first.
 pub async fn set_metadata<H: DriveHost>(
     ops: &mut Ops<'_>,
+    principal: &H,
     file_id: Uuid,
     metadata: serde_json::Value,
 ) -> Result<(), DriveFault> {
@@ -38,6 +41,7 @@ pub async fn set_metadata<H: DriveHost>(
         .load::<FileRow<H>>(&file_id)
         .await?
         .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
+    file.set_metadata_gate(principal).require()?;
     if file.metadata == metadata {
         return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
     }

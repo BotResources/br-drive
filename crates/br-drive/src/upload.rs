@@ -175,10 +175,7 @@ pub fn commit_upload<'m, H: DriveHost>(
             .load::<FileRow<H>>(&input.file_id)
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
-        cx.principal()
-            .drive_gate(&file.as_create_request())
-            .require()?;
-        file.require_pending()?;
+        file.commit_gate(cx.principal()).require()?;
         let landed = reader
             .head(BlobRef(file.blob_ref))
             .await?

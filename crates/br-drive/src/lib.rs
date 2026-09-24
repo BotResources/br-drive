@@ -6,6 +6,7 @@ mod fault;
 mod file;
 mod folders;
 mod host;
+mod host_window;
 mod image;
 mod label;
 mod media;
