@@ -168,6 +168,7 @@ macro_rules! drive_slice {
                     media_type: ::std::string::String,
                     size: $crate::ByteCount,
                     sha256: ::std::string::String,
+                    title: ::core::option::Option<::std::string::String>,
                 ) -> ::async_graphql::Result<$crate::UploadTicket> {
                     ::core::result::Result::Ok(
                         ::service_engine::execute::<$p, $crate::RequestUpload>(
@@ -177,6 +178,7 @@ macro_rules! drive_slice {
                                 drive_id,
                                 path,
                                 name,
+                                title,
                                 media_type,
                                 size: size.0,
                                 sha256_hex: sha256,
@@ -381,6 +383,19 @@ macro_rules! drive_slice {
                             path,
                             drive_id,
                         },
+                    )
+                    .await
+                }
+
+                async fn [<$prefix _retitle_file>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    title: ::std::string::String,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::RetitleFile>(
+                        ctx,
+                        $crate::RetitleFile { file_id, title },
                     )
                     .await
                 }

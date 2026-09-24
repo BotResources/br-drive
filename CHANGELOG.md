@@ -83,6 +83,16 @@ single git tag `v{version}` releases the set. Format follows
 
 ### Added
 
+- A file's **title**: `drive.file.title` (migration `9121000007`, at most 255
+  characters, existing files backfilled with their name without its
+  extension), projected as `DriveFile.title`. `RequestUpload` takes an
+  optional `title` (the `FileTitle` value object, built only by parsing:
+  trimmed, 1–255 characters, one line, no control or bidirectional-override
+  character, `INVALID_TITLE`); absent, it is the requested name without its
+  extension. `<p>RetitleFile(fileId, title)` changes it through
+  the new `DriveRequest::RetitleFile { file }` gate (affordance `retitle`,
+  cause `Retitled`); renaming or moving never touches the title, retitling
+  never moves the file.
 - `DriveHost::STEP_TIMEOUT` (default 72 h, Jobs' longest run; checked at
   registration): a step silent that long — measured from its last sign of
   life: entry, run start, plan, step, runner report — has its job cancelled
@@ -132,6 +142,12 @@ single git tag `v{version}` releases the set. Format follows
   to every principal; `SetMetadata` was not asked at all.
 - A host that mapped refusals to its own "not found" can drop that: the
   library answers `FILE_NOT_FOUND` for a file outside `visible_drives`.
+- `DriveRequest::RetitleFile { file }` is new: decide it explicitly (a
+  wildcard arm answers it), including for a `protected` file — the library
+  does not refuse a retitle on protection. `RequestUpload` takes an optional
+  `title`.
+- Migration `9121000007` is one-way: once applied, a pre-0.2 binary cannot
+  create a file (`title` is `NOT NULL`).
 
 ## 0.1.0 — 2026-09-23
 

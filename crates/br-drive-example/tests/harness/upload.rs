@@ -20,6 +20,7 @@ pub struct UploadRequest<'a> {
     pub name: &'a str,
     pub media_type: &'a str,
     pub bytes: &'a [u8],
+    pub title: Option<&'a str>,
 }
 
 impl<'a> UploadRequest<'a> {
@@ -30,12 +31,13 @@ impl<'a> UploadRequest<'a> {
             name,
             media_type: "text/plain",
             bytes,
+            title: None,
         }
     }
 }
 
-const REQUEST: &str = "mutation($f:UUID!,$d:UUID!,$p:String!,$n:String!,$m:String!,$s:ByteCount!,$h:String!){\
-    workspaceRequestUpload(fileId:$f,driveId:$d,path:$p,name:$n,mediaType:$m,size:$s,sha256:$h){fileId url fields}}";
+const REQUEST: &str = "mutation($f:UUID!,$d:UUID!,$p:String!,$n:String!,$m:String!,$s:ByteCount!,$h:String!,$t:String){\
+    workspaceRequestUpload(fileId:$f,driveId:$d,path:$p,name:$n,mediaType:$m,size:$s,sha256:$h,title:$t){fileId url fields}}";
 
 pub async fn request(
     world: &World,
@@ -72,6 +74,7 @@ pub async fn request_with_hash(
                 "m": request.media_type,
                 "s": request.bytes.len(),
                 "h": sha256,
+                "t": request.title,
             }),
         )
         .await

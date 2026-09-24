@@ -14,6 +14,7 @@ use crate::host::DriveHost;
 use crate::path::{DrivePath, FileName};
 use crate::processing;
 use crate::ruleset::{Trigger, select_ruleset};
+use crate::title::FileTitle;
 
 #[derive(Debug, Deserialize)]
 pub struct EditPage {
@@ -140,6 +141,43 @@ pub fn update_file<'m, H: DriveHost>(
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
         cx.impact_caused::<File, _>(&file.id, cause)?;
+        Ok(())
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RetitleFile {
+    pub file_id: Uuid,
+    pub title: String,
+}
+
+impl MutationInput for RetitleFile {
+    type Output = ();
+    type Error = DriveFault;
+    const NAME: &'static str = "drive_retitle_file";
+}
+
+/// Changes the title and nothing else: the name, the path, the drive and the
+/// processing state are untouched.
+pub fn retitle_file<'m, H: DriveHost>(
+    cx: &'m mut Mutation<'m, H>,
+    input: RetitleFile,
+) -> BoxFuture<'m, Result<(), DriveFault>> {
+    Box::pin(async move {
+        let title = FileTitle::parse(&input.title)
+            .map_err(|_| DriveFault::Refused(codes::INVALID_TITLE))?;
+        let mut file = cx
+            .load::<FileRow<H>>(&input.file_id)
+            .await?
+            .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
+        file.retitle_gate(cx.principal()).require()?;
+        if file.title == title {
+            return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
+        }
+        file.title = title;
+        file.updated_at = cx.now().as_datetime();
+        cx.save(&file).await?;
+        cx.impact_caused::<File, _>(&file.id, FileCause::Retitled)?;
         Ok(())
     })
 }

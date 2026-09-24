@@ -13,8 +13,8 @@ pub use aggregate::{
 pub use curation::{drive_of, set_metadata, set_protected};
 pub use delta::{DriveDelta, DriveRemove, DriveReset, DriveUpsert, DriveView};
 pub use gestures::{
-    DeleteFile, EditPage, Process, RegeneratePage, UpdateFile, delete_file, edit_page, process,
-    regenerate_page, update_file,
+    DeleteFile, EditPage, Process, RegeneratePage, RetitleFile, UpdateFile, delete_file, edit_page,
+    process, regenerate_page, retitle_file, update_file,
 };
 pub use images::{
     IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded,
@@ -45,6 +45,7 @@ pub(crate) mod tests_support {
             drive_id: Uuid::now_v7(),
             path: DrivePath::root(),
             name: FileName::parse("a.txt").expect("a sound name"),
+            title: crate::title::FileTitle::parse("a").expect("a sound title"),
             protected: false,
             media_type: MediaType::parse("text/plain").expect("a sound media type"),
             size_bytes: 1,

@@ -373,6 +373,7 @@ async fn a_path_or_name_that_does_not_normalize_is_refused() {
                 name: "a.txt",
                 media_type,
                 bytes: PAYLOAD,
+                title: None,
             },
         )
         .await;
@@ -407,6 +408,7 @@ async fn a_path_or_name_that_does_not_normalize_is_refused() {
             name: "blob.bin",
             media_type: "application/x-unrenderable",
             bytes: PAYLOAD,
+            title: None,
         },
     )
     .await;

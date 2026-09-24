@@ -21,6 +21,7 @@ use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
 use crate::processing;
 use crate::ruleset::{Trigger, select_ruleset};
+use crate::title::FileTitle;
 
 pub const UPLOAD_DEADLINE_AGGREGATE: &str = "drive_file";
 pub const UPLOAD_DEADLINE_VERB: &str = "upload-deadline";
@@ -32,6 +33,8 @@ pub struct RequestUpload {
     pub drive_id: Uuid,
     pub path: String,
     pub name: String,
+    /// The file's title; absent, it defaults to `name` without its extension.
+    pub title: Option<String>,
     pub media_type: String,
     pub size: u64,
     pub sha256_hex: String,
@@ -78,6 +81,12 @@ pub fn request_upload<'m, H: DriveHost>(
         }
         let path = DrivePath::parse(&input.path).map_err(Reason::from)?;
         let name = FileName::parse(&input.name).map_err(Reason::from)?;
+        let title = match input.title.as_deref() {
+            Some(title) => {
+                FileTitle::parse(title).map_err(|_| DriveFault::Refused(codes::INVALID_TITLE))?
+            }
+            None => FileTitle::from_name(&name),
+        };
         let media_type = MediaType::parse(&input.media_type)
             .map_err(|_| DriveFault::Refused(codes::INVALID_MEDIA_TYPE))?;
         let digest = Sha256Digest::from_hex(&input.sha256_hex)
@@ -107,6 +116,7 @@ pub fn request_upload<'m, H: DriveHost>(
             drive_id: input.drive_id,
             path,
             name,
+            title,
             protected: false,
             media_type,
             size_bytes: i64::try_from(input.size)

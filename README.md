@@ -120,7 +120,7 @@ every `RequestUpload`.
   `UpdateFile { file, target_drive }` (a cross-drive move names both drives),
   `DeleteFile { file }`, `MoveFolder { drive, old_prefix, new_prefix }`,
   `DeleteFolder { drive, prefix }`, `Process { file }`, `EditPage { file }`,
-  `RegeneratePage { file, number }`, `ManageRulesets`, `ReadRulesets`,
+  `RegeneratePage { file, number }`, `RetitleFile { file }`, `ManageRulesets`, `ReadRulesets`,
   `ManageLabels`, `ReadLabels`, `SetFileLabels { file }`,
   `SetMetadata { file }`. The host answers `Gate::allowed()`
   or `Gate::blocked(<its own reason code>)` — to refuse a media type it cannot
@@ -135,7 +135,7 @@ every `RequestUpload`.
   `MoveFolder`, `DeleteFolder`) keeps the host's code, and a move toward an
   unknown drive answers the host's refusal before `DRIVE_NOT_FOUND`. The
   same decision feeds the mutation guard and the `affordances` on
-  `DriveFile` (`delete`, `rename`, `move`, `download`, `editPage`,
+  `DriveFile` (`delete`, `rename`, `move`, `retitle`, `download`, `editPage`,
   `process`, `setLabels`, `commit`, `setMetadata`) and on `DrivePage`
   (`editPage`, `regeneratePage`), so the front renders and never decides.
   The gate decides on the principal as the request found it: an engine
@@ -178,11 +178,12 @@ renders it, is committed at
 
 | Root | Shape |
 |---|---|
-| `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256): UploadTicket!` | gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). |
+| `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256, title?): UploadTicket!` | `title` trimmed, 1–255 characters, one line, no control or bidirectional-override character (`INVALID_TITLE`); absent, it is the requested `name` without its extension (`report.pdf` → `report`; a name with no stem is kept whole; a collision renames the file, never its title); gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). |
 | `<p>CommitUpload(fileId, rulesetId?): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then the `upload` rule is picked (the given `rulesetId`, or the default matching the media type) and the chain starts (`PROCESSING`), or the file is `READY` when no rule matches. A second commit is `FILE_NOT_PENDING`. |
 | `<p>Process(fileId, rulesetId?): MutationAck!` | re-process a `READY` or `FAILED` file with the `reprocess` rule (`NO_RULESET_MATCHES`, `RULESET_MISMATCH`, `FILE_PROCESSING` while a chain runs): the pages, the images (released) and the indexer triple are wiped at chain start. Affordance `process`. |
 | `<p>RegeneratePage(fileId, number, comment?, rulesetId?): MutationAck!` | run the `regenerate_page` rule on one page of a `READY` file: `page` and `comment` are merged into the first step's options; `PAGE_NOT_FOUND`, `NO_RULESET_MATCHES`. Affordance `regeneratePage` on the page. |
 | `<p>UpdateFile(fileId, name?, path?, driveId?): MutationAck!` | rename, move, or move to another drive of the same host; both drives are locked before the sibling check, so a concurrent collision answers `NAME_TAKEN`, never a database error; `NOTHING_TO_CHANGE` when nothing differs, `FILE_PROTECTED` on a protected file. |
+| `<p>RetitleFile(fileId, title): MutationAck!` | gate `RetitleFile { file }` (affordance `retitle`); changes the title and nothing else — never the name, the path, the drive or the state, and `UpdateFile` never touches the title; `INVALID_TITLE`, `NOTHING_TO_CHANGE` for the same title; the host decides whether a `protected` file may be retitled (the row is in the request). |
 | `<p>DeleteFile(fileId): MutationAck!` | cascade; the source blob is released in the same transaction. |
 | `<p>MoveFolder(driveId, oldPrefix, newPrefix): MutationAck!` | bulk pipeline: one `UPDATE` on the prefix (the rows are locked first), then `folder_moved`; `FOLDER_NOT_FOUND`, `FOLDER_INTO_ITSELF`, `NAME_TAKEN` (refused as a whole), `FILE_PROTECTED` if any file under the prefix is protected, `INVALID_PATH` for the root or a rebased path over 1024 bytes. |
 | `<p>DeleteFolder(driveId, prefix): MutationAck!` | bulk pipeline: one `DELETE` for every file under the prefix, one blob release per file, then `folder_deleted`. |
@@ -200,6 +201,7 @@ renders it, is committed at
 | `<p>FilePages(fileId): DriveDelta!` | one file's rendition (milestone 3): a `DriveReset` with every `DrivePage` of the file, then a `DriveUpsert` / `DriveRemove` per page; gated on `ReadFile` for the file's drive, so a caller who cannot read the file gets an empty window and a caller who loses the drive gets one `DriveRemove` per page. |
 
 `DriveFile`: `id`, `driveId`, `path` (normalized, `""` = root), `name`,
+`title` (the human-facing title, independent of the name),
 `protected`, `mediaType`, `sizeBytes` (`ByteCount`, a 64-bit JSON number —
 GraphQL `Int` is 32-bit), `sha256` (hex), `processingState`
 (`PENDING | PROCESSING | READY | FAILED`), `processingError`, `metadata`
@@ -208,7 +210,7 @@ mediaType, sizeBytes, page }`, `labelIds` (computed, by label name), `rulesetId`
 (the snapshot the last chain ran), `progress { stepIndex, stepCount,
 runnerType, plan, currentIndex, currentLabel, at }` (non-null only while
 `PROCESSING`), `createdBy`, `createdAt`, `updatedAt`, `affordances` (`delete`,
-`rename`, `move`, `download`, `editPage`, `process` — `download` is denied
+`rename`, `move`, `retitle`, `download`, `editPage`, `process`, `setLabels` — `download` is denied
 `FILE_NOT_READY` until the commit, `editPage` until the file is `READY` and
 `FILE_PROCESSING` while a chain runs; `process` needs `READY` or `FAILED`).
 The pages are
@@ -222,7 +224,7 @@ DrivePage | DriveLabel | DriveRuleset`: `DriveReset { revision, views }`, `Drive
 cause }`, `DriveRemove { revision, projector, key, cause }` (`projector` is
 `drive_files` or `drive_pages`; a page key is `{ fileId, number }`), plus the
 lane notices. `cause` is one of the library's file causes (`UploadRequested`,
-`UploadCommitted`, `UploadAbandoned`, `SourceAvailable`, `Renamed`, `Moved {
+`UploadCommitted`, `UploadAbandoned`, `SourceAvailable`, `Renamed`, `Retitled`, `Moved {
 from_drive }`, `FolderMoved`, `ProtectionChanged { protected }`,
 `MetadataChanged`, `ImageRequested { name }`, `ImageAvailable { name }`,
 `ImagesDropped { names }`, `ReportStored { job_id, done }`,
@@ -463,7 +465,7 @@ and changes nothing.
 `DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`, `FILE_PROTECTED`,
 `FILE_NOT_PENDING`, `FILE_NOT_READY`, `FILE_PROCESSING`, `FILE_TOO_LARGE`,
 `UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_FILE_ID`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,
-`INVALID_NAME`, `NAME_TAKEN`, `FOLDER_INTO_ITSELF`, `NOTHING_TO_CHANGE`,
+`INVALID_NAME`, `INVALID_TITLE`, `NAME_TAKEN`, `FOLDER_INTO_ITSELF`, `NOTHING_TO_CHANGE`,
 `KEY_REUSED`, `RUNNER_SCOPE_REQUIRED`, `JOB_NOT_ACTIVE`, `SOURCE_NOT_AVAILABLE`,
 `INVALID_IMAGE_NAME`, `IMAGE_UPLOAD_PENDING`, `INVALID_PAGE`,
 `INVALID_PAGE_ORIGIN`, `PAGE_NOT_FOUND`, `INDEXER_FIELDS_TOGETHER`,

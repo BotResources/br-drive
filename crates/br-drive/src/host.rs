@@ -39,6 +39,10 @@ pub enum DriveRequest<'a, H> {
     DeleteFile {
         file: &'a FileRow<H>,
     },
+    /// Changing a file's title; never its name, path or drive.
+    RetitleFile {
+        file: &'a FileRow<H>,
+    },
     MoveFolder {
         drive: Uuid,
         old_prefix: &'a DrivePath,
@@ -83,6 +87,7 @@ impl<H> DriveRequest<'_, H> {
             | Self::SetMetadata { file }
             | Self::UpdateFile { file, .. }
             | Self::DeleteFile { file }
+            | Self::RetitleFile { file }
             | Self::Process { file }
             | Self::EditPage { file }
             | Self::RegeneratePage { file, .. }
