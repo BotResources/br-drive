@@ -326,9 +326,19 @@ async fn an_image_round_trips_through_a_verified_upload_and_a_wrong_checksum_is_
         ("img01.png", "INVALID_IMAGE_NAME"),
         ("p2-img01.png", "INVALID_IMAGE_NAME"),
         ("p002-img01.PNG", "INVALID_IMAGE_NAME"),
+        ("p0002-img01.png", "INVALID_IMAGE_NAME"),
+        ("p1000-img000.png", "INVALID_IMAGE_NAME"),
     ] {
         let refused = request_image(&world, &runner, file_id, job_id, name, IMAGE).await;
         assert_eq!(error_code(&refused), code, "{name}");
+    }
+    for name in ["p1000-img01.png", "p002-img100.png"] {
+        let ticket =
+            image_ticket(&request_image(&world, &runner, file_id, job_id, name, IMAGE).await);
+        assert_eq!(
+            ticket.file_id, file_id,
+            "a page past 999 and an image past 99 have their name: {name}"
+        );
     }
     let oversized = world
         .gql(

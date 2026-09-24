@@ -36,6 +36,7 @@ pub struct World {
 pub struct WorldOptions {
     pub reaper_interval: Duration,
     pub upload_window: Duration,
+    pub watch_catalogue: bool,
 }
 
 impl Default for WorldOptions {
@@ -43,6 +44,7 @@ impl Default for WorldOptions {
         Self {
             reaper_interval: Duration::from_millis(150),
             upload_window: HostSettings::DEFAULT_UPLOAD_WINDOW,
+            watch_catalogue: true,
         }
     }
 }
@@ -77,6 +79,7 @@ impl World {
                 settings: HostSettings {
                     upload_window: options.upload_window,
                 },
+                watch_catalogue: options.watch_catalogue,
             },
         )
         .await
@@ -627,9 +630,18 @@ pub async fn next_delta(
     root: &str,
     matches: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    next_delta_within(sub, root, Duration::from_secs(15), matches).await
+}
+
+pub async fn next_delta_within(
+    sub: &mut Subscription,
+    root: &str,
+    within: Duration,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + within;
     loop {
-        let delta = sub.next_payload(Duration::from_secs(15)).await;
+        let delta = sub.next_payload(within).await;
         let node = &delta[root];
         if std::env::var("DRIVE_TRACE_DELTAS").is_ok() {
             eprintln!("delta: {node}");

@@ -7,7 +7,52 @@ single git tag `v{version}` releases the set. Format follows
 
 ## Unreleased
 
-Nothing yet.
+### Fixed
+
+- A processing chain of more than one step reaches `READY` against the real
+  Jobs service: no step names the previous step's job as `parent_job_id` any
+  more. Jobs refuses a terminal parent (`parent_job_terminal`), and the chain
+  only advances once the previous job completed, so every second step was
+  rejected and its file failed; with a live parent the step would have been
+  owned by the parent's runner instead of the host. The chain is a host-side
+  sequence correlated by the file id.
+- A `creation_rejected` `duplicate_active_entity` no longer leaves the file
+  unprocessable: the live job Jobs names (`params.activeJobId`) is kept on the
+  file (`drive.file.stray_job_id`) and cancelled at once, and the next launch
+  cancels it again before asking for its own job, so a `Process` gets through.
+  `DeleteFile` and the other deletions cancel it too.
+- A chain fired before the host's first runner-type catalogue scan (a fresh
+  database) is deferred instead of failing the file `catalogue_not_watched`:
+  the file waits in its step (`LaunchDeferred { step }`) and a `launch-retry`
+  message asks again every `LAUNCH_RETRY_AFTER` (5 s). Saving a rule before
+  that scan is accepted, every step reported in `unknownRunnerTypes`, instead
+  of refused with `CATALOGUE_NOT_WATCHED`. Both codes stay exported, no longer
+  raised.
+- The runner source presign is scoped to the one file the job names, while
+  that job is the file's active one, instead of enumerating every file with a
+  live job on each `RunnerContext` call (`br_drive::scoped_to_job`).
+- Image names are no longer capped at page 999 and image 99: the page and
+  index widths of `p{page:03}-img{n:02}.{ext}` are minimums (`p1000-img100.png`
+  is accepted), a number is never padded wider than it needs, an index is
+  never zero.
+
+### Added
+
+- `DriveHost::STEP_TIMEOUT` (default 24 h): a step still running past it has
+  its job cancelled and its file lands `FAILED` `timed_out`
+  (`br_drive::TIMED_OUT`). Jobs never fails a job no live runner picks up, so
+  this is the way out for a runner type with no live instance. Scheduled per
+  step through a `step-deadline` message on a `{service}-drive-step-deadline`
+  durable.
+- Migration `9121000006`: `drive.file.step_entered_at` (when the running step
+  was entered; the deadline and the deferred launch key on it) and
+  `drive.file.stray_job_id`.
+- The example host's Jobs stand-in judges every `job.create` the way Jobs
+  does — terminal, deleted or unknown parent, second live job on a source
+  entity — and answers `creation_rejected` itself, with a regression scenario
+  for the double; new scenarios for the step timeout, the duplicate-job trap
+  and the deferred launch. The example host can boot without its catalogue
+  watch (`BootOptions::watch_catalogue`) and start it later.
 
 ## 0.1.0 — 2026-09-23
 

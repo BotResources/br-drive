@@ -81,7 +81,7 @@ rolls them together. The host never writes to the `drive` schema directly.
 
 1. **Compose**: `slice drive ["drive"] from br_drive::drive_slice { query = drive::DriveQuery, mutation = drive::DriveMutation, subscription = drive::DriveSubscription }` under the host's `prefix`; every root below appears at that prefix.
 2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and both of the library's self-commands arrive as a service actor, and a resolver that rejects services parks all ten reactions.
-3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `visible_drives` (never a service principal), `display_name`, `upload_window`, `erase_mode`, the two folder hooks.
+3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `STEP_TIMEOUT`, `drive_gate`, `visible_drives` (never a service principal), `display_name`, `upload_window`, `erase_mode`, the two folder hooks.
 4. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
 5. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
 6. **Catalogue watch**: `br_drive::watch_runner_types(engine.nats().clone(), pool.clone())` after boot, `CatalogueWatch::stop` at shutdown; the `PUBLISHED_LANGUAGE` bucket must exist on the broker.
@@ -208,7 +208,8 @@ lane notices. `cause` is one of the library's file causes (`UploadRequested`,
 from_drive }`, `FolderMoved`, `ProtectionChanged { protected }`,
 `MetadataChanged`, `ImageRequested { name }`, `ImageAvailable { name }`,
 `ImagesDropped { names }`, `ReportStored { job_id, done }`,
-`ProcessingStarted { job_id, step }`, `ProgressChanged`,
+`ProcessingStarted { job_id, step }`, `LaunchDeferred { step }`,
+`ProgressChanged`,
 `ProcessingFinished`, `ProcessingFailed { reason }`, `LabelsChanged {
 detached }`, `Erased`, `Deleted`, `FolderDeleted`, `DriveDeleted`), page
 causes (`Reported { job_id, origin
@@ -267,8 +268,11 @@ regeneration). The config never carries a presigned URL — the runner mints one
 through `RunnerContext` when it needs it.
 
 Image naming: `p{page:03}-img{n:02}.{ext}` — page-scoped, unique per file,
-`ext` 1–8 lowercase alphanumerics, `n` starting at `01` (e.g. `p003-img01.png`);
-anything else is `INVALID_IMAGE_NAME`. The markdown references images by that
+`ext` 1–8 lowercase alphanumerics, `n` starting at `01` (e.g. `p003-img01.png`).
+The widths are minimums: page 1000 is `p1000-…`, the hundredth image of a page
+is `…-img100.…`, and a number is never padded wider than it needs
+(`p0003-img01.png` is refused), so every image has exactly one name. Anything
+else is `INVALID_IMAGE_NAME`. The markdown references images by that
 name, never by URL; the front resolves a name to a presigned GET with
 `<p>FileAccess(fileId, name)` (inline disposition; `null` for a caller who
 cannot read the file, for an unknown name, and until the object landed). The
@@ -317,25 +321,40 @@ second rule), else `NO_RULESET_MATCHES` and the file is left as it is.
 rule, else `NO_RULESET_MATCHES` (a regeneration cannot be inferred from an
 upload snapshot). A rule never applies retroactively, and a rule edited or
 deleted while a chain runs never reaches that chain: the File keeps a `steps`
-snapshot taken when the rule fired. Saving a rule on a host whose catalogue
-watch has never scanned is refused with `CATALOGUE_NOT_WATCHED`.
+snapshot taken when the rule fired. A rule saved on a host whose catalogue
+watch has not scanned yet is kept, every step reported in
+`unknownRunnerTypes`.
 
 The chain, one step at a time, in the library's own transactions:
 
-1. the step's runner type must be `ACTIVE` in the mirrored catalogue, else
+1. the file enters the step (`PROCESSING`, `progress { stepIndex, stepCount,
+   runnerType }`) and a `step-deadline` message is scheduled at
+   `now + DriveHost::STEP_TIMEOUT` (default 24 h, Jobs' own inactivity
+   timeout): a step still running then has its job cancelled
+   (`job.cancel.v2`) and the file lands `FAILED` `timed_out`, open to a
+   reprocess. Jobs never fails a job no live runner picks up — its backstops
+   need a started run — so without it a runner type with no live instance
+   would hold the file in `PROCESSING` for good;
+2. the step's runner type must be `ACTIVE` in the mirrored catalogue, else
    `FAILED` with `processingError = runner_type_unavailable` before any job
-   (Jobs would not refuse an unknown type — it would wait); on a host whose
-   catalogue watch has never scanned the chain fails `catalogue_not_watched`
-   and an error is logged;
-2. a `job_id` is minted on the File (`PROCESSING`, `progress { stepIndex,
-   stepCount, runnerType }`) and `integration.cmd.jobs.job.create.v1` is
-   staged through the engine outbox: `producer`, `source_bc` and `config.host`
-   are the host service, `source_entity_id` is the file (so Jobs enforces one
-   live job per file), `parent_job_id` the previous step's job,
-   `triggered_by` the principal of the gesture (`DriveHost::display_name`);
+   (Jobs would not refuse an unknown type — it would wait). On a host whose
+   catalogue watch has not completed its first scan yet — a fresh database —
+   the launch is **deferred**, not failed: the file waits in the step
+   (`LaunchDeferred { step }`) and a `launch-retry` message asks again every
+   `LAUNCH_RETRY_AFTER` (5 s) until the scan lands, the step deadline
+   bounding the wait;
+3. a `job_id` is minted on the File and `integration.cmd.jobs.job.create.v1`
+   is staged through the engine outbox: `producer`, `source_bc` and
+   `config.host` are the host service, `source_entity_id` is the file (so Jobs
+   enforces one live job per file), `triggered_by` the principal of the
+   gesture (`DriveHost::display_name`), and **no `parent_job_id`**: the chain
+   is a host-side sequence correlated by the file id, and every step is owned
+   by the host (Jobs refuses a terminal parent, and a live one would make the
+   step the parent runner's work);
 3. the eight `integration.evt.jobs.job.*.v1` facts are consumed on eight
    durables named `{service}-drive-job-…` (every durable the library binds,
-   the `upload-deadline` and `image-landed` ones included, is namespaced by
+   the `upload-deadline`, `image-landed`, `step-deadline` and `launch-retry`
+   ones included, is namespaced by
    `DriveHost::SERVICE`, so N hosts on one cluster never share a consumer)
    and matched on the File's `job_id` — a fact about a job no file holds is
    acknowledged and ignored, so every fact can be redelivered:
@@ -349,13 +368,23 @@ The chain, one step at a time, in the library's own transactions:
    the reason code (`ProcessingFailed { reason }`), `cancelled` lands `FAILED`
    `cancelled` — unless the cancel was ours: `DeleteFile`, `DeleteFolder` and
    `delete_drive` stage `job.cancel.v2` for every file they remove while it
-   is `PROCESSING`, and the later `cancelled` fact finds no file;
-4. the runner's `done: true` report records `done_at` and stages
+   is `PROCESSING`, and the later `cancelled` fact finds no file. A
+   `creation_rejected` `duplicate_active_entity` means Jobs still holds a live
+   job on the file that the library lost track of (a lost `job.finish`, a
+   restored host database): the job Jobs names (`params.activeJobId`) is kept
+   on the file and cancelled at once, and the next launch cancels it again
+   before asking for its own job, so a `Process` always gets through;
+5. the runner's `done: true` report records `done_at` and stages
    `job.finish.v2` (or advances the chain directly when Jobs already said
    `completed`).
 
 `ruleset_id` and `steps` stay on the File for replay; `job_id`, `step_*`,
 `plan` and `progress_*` are null outside `PROCESSING`.
+
+The runner source presign (`<p>RunnerContext`'s `sourceUrl`) goes through the
+`drive_runner_sources` view scoped to the one file the job names, and only
+while that job is the file's active one — never a population of every
+in-flight file.
 
 The catalogue mirror: `drive.known_runner_type` is fed by
 `br_drive::watch_runner_types` — a boot scan of `PUBLISHED_LANGUAGE` under
@@ -365,9 +394,10 @@ the wire: an entry whose `version` is not `contract_jobs::runner::WIRE_VERSION`
 is logged as an error and treated as unknown, never as active; the watch is
 restarted after a fault. The host starts it next to the engine and stops it at
 shutdown — engine 0.3.0 gives a library no boot or shutdown hook, so the
-library cannot own that lifecycle; a host that forgets it is told loudly:
-`CATALOGUE_NOT_WATCHED` on every rule save and `catalogue_not_watched` on
-every chain, with an error log. It is a hand-rolled watch and not the
+library cannot own that lifecycle; a host that forgets it is told loudly: a
+warning on every rule save and every deferred launch, every rule saved
+reporting all its steps as unknown, and every chain waiting in its first step
+until its deadline. It is a hand-rolled watch and not the
 engine's mirror kit because the kit requires a `/`-terminated consumed prefix
 and the catalogue is published by a non-engine producer under a dot prefix
 with a per-value `version`; the watch is replaced by the kit when the kit
@@ -409,10 +439,11 @@ and changes nothing.
 `INVALID_INDEXER_VALUE`, `BATCH_TOO_LARGE`, `RULESET_NOT_FOUND`,
 `RULESET_NAME_TAKEN`, `INVALID_RULESET`, `DEFAULT_ALREADY_SET`,
 `RULESET_MISMATCH`, `NO_RULESET_MATCHES`, `RUNNER_TYPE_UNAVAILABLE`,
-`CATALOGUE_NOT_WATCHED`, `LABEL_NOT_FOUND`, `LABEL_NAME_TAKEN`,
+`LABEL_NOT_FOUND`, `LABEL_NAME_TAKEN`,
 `INVALID_LABEL` — plus the host's own codes through the gate and the hooks. On a `FAILED` file, `processingError` carries the runner's
-`reason_code` verbatim, or one of the library's: `runner_type_unavailable`,
-`catalogue_not_watched`, `cancelled`.
+`reason_code` verbatim (Jobs' `creation_rejected` codes included, e.g.
+`duplicate_active_entity`), or one of the library's:
+`runner_type_unavailable`, `timed_out`, `cancelled`.
 
 ## Follow-ups
 
@@ -427,16 +458,16 @@ and changes nothing.
   host's scale (tens of rules), noted for the record.
 - The catalogue watch's health is not on the engine's readiness: the readiness
   assembly is the engine's, and its mirror-handle registration is a
-  test-support API in 0.3.0. `drive.catalogue_scan` says whether a scan ever
-  ran; a readiness reason for it needs the engine hook.
+  test-support API in 0.3.0. Since 0.2 a chain fired before the first scan is
+  deferred rather than failed, so readiness is no longer what protects a fresh
+  host; a readiness reason for the watch still needs the engine hook.
 - Engine 0.3.0's `Query::download` populates the projector with its default
   window and then asks membership by key, so the runner's source presign
-  cannot be told which file it is about: the `drive_runner_sources` projector
-  enumerates every file id for that membership check, once per
-  `RunnerContext` call, after the direct, keyed checks (runner scope, file,
-  active job) passed — since milestone 4 only the files with a live job are
-  enumerated (`job_id IS NOT NULL`, indexed); a key-aware download in the
-  engine would remove the population altogether.
+  cannot be told which file it is about through the window. The runner
+  context resolver scopes the population to the job's own file (a task-local
+  set around the download, `br_drive::scoped_to_job`), and the population
+  re-checks that the job is still the file's active one; a key-aware download
+  in the engine would remove the scoping.
 
 ## The example host
 
@@ -451,7 +482,11 @@ embedded `drive` slice, the catalogue watch started at boot,
 the host in process and drives it over GraphQL and a real
 `graphql-transport-ws` socket. Jobs is played by a stand-in that publishes the
 real `contract-jobs` DTOs on the real subjects and reads the commands the host
-stages for `jobs`; the fake runner exercises the three runner roots.
+stages for `jobs`. It judges every `job.create` the way Jobs does — a terminal,
+deleted or unknown parent is refused, and so is a second live job on one
+source entity (`duplicate_active_entity`, naming the live job) — answering
+`creation_rejected` on its own, so a contract violation fails the suite
+instead of passing it; the fake runner exercises the three runner roots.
 
 ## Running the example's suite
 

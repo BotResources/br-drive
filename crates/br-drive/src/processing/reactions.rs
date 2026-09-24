@@ -1,7 +1,8 @@
 use chrono::SubsecRound;
+use contract_jobs::command::CancelJob;
 use contract_jobs::event::{
     JobCancelled, JobCompleted, JobCreationRejected, JobFailed, JobPlanDeclared, JobQueued,
-    JobStarted, JobStepStarted,
+    JobStarted, JobStepStarted, REASON_DUPLICATE_ACTIVE_ENTITY,
 };
 use futures_util::future::BoxFuture;
 use service_engine::inbound::{ReactionCoordinates, ReactionMessage};
@@ -10,6 +11,10 @@ use uuid::Uuid;
 
 use super::CANCELLED;
 use super::chain::{advance, file_of_job, mark_failed};
+use super::commands::JobCancel;
+
+/// The rejection parameter carrying the job that holds the source entity.
+const ACTIVE_JOB_ID_PARAM: &str = "activeJobId";
 use crate::fault::DriveReactionFault;
 use crate::file::{File, FileCause, FileRow, ProcessingState};
 use crate::host::DriveHost;
@@ -141,11 +146,37 @@ pub fn on_creation_rejected<'r, H: DriveHost>(
     fact: CreationRejectedFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        let Some(file) = active_file::<H>(cx, fact.0.job_id).await? else {
+        let Some(mut file) = active_file::<H>(cx, fact.0.job_id).await? else {
             return Ok(());
         };
+        if fact.0.reason_code == REASON_DUPLICATE_ACTIVE_ENTITY {
+            // Jobs still holds a live job on this file that the library lost
+            // track of (a lost `job.finish`, a restored database, …). Its id is
+            // kept and it is cancelled now; the next launch cancels it again
+            // before asking for a new job, so a reprocess always gets through.
+            if let Some(stray) = active_job_of(&fact.0.params) {
+                file.stray_job_id = Some(stray);
+                cx.command(JobCancel {
+                    payload: CancelJob { job_id: stray },
+                })?;
+            } else {
+                tracing::warn!(
+                    file = %file.id,
+                    params = %fact.0.params,
+                    "a duplicate_active_entity rejection names no active job; nothing to cancel"
+                );
+            }
+        }
         fail_file(cx, file, &fact.0.reason_code).await
     })
+}
+
+/// The live job Jobs names on a `duplicate_active_entity` rejection.
+fn active_job_of(params: &serde_json::Value) -> Option<Uuid> {
+    params
+        .get(ACTIVE_JOB_ID_PARAM)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
 }
 
 pub fn on_plan_declared<'r, H: DriveHost>(
@@ -217,7 +248,7 @@ pub fn on_completed<'r, H: DriveHost>(
             }
             return Ok(());
         }
-        advance(cx, &mut file, fact.0.job_id).await?;
+        advance(cx, &mut file).await?;
         Ok(())
     })
 }

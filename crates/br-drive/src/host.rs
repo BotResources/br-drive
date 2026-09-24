@@ -96,6 +96,14 @@ pub trait DriveHost: Principal {
 
     const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
+    /// How long one step of a processing chain may stay unfinished before the
+    /// library cancels its job and fails the file with `timed_out`. Jobs never
+    /// fails a job no live runner has picked up, so without it a file whose
+    /// runner type has no live instance would sit in PROCESSING for good. The
+    /// default matches Jobs' own inactivity timeout; a host whose steps may
+    /// legitimately run longer raises it.
+    const STEP_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;
 
     fn visible_drives(&self) -> Vec<Uuid>;

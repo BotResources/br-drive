@@ -126,6 +126,8 @@ pub fn request_upload<'m, H: DriveHost>(
             triggered_by: None,
             done_at: None,
             completed_at: None,
+            step_entered_at: None,
+            stray_job_id: None,
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,

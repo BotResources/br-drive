@@ -45,8 +45,8 @@ pub use label::{
 pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
 pub use processing::{
-    CANCELLED, CATALOGUE_NOT_WATCHED, ChainPlan, Initiator, RUNNER_TYPE_UNAVAILABLE, RootNames,
-    durable,
+    CANCELLED, CATALOGUE_NOT_WATCHED, ChainPlan, Initiator, LAUNCH_RETRY_AFTER,
+    RUNNER_TYPE_UNAVAILABLE, RootNames, TIMED_OUT, durable,
 };
 pub use register::register;
 pub use ruleset::{
@@ -57,6 +57,7 @@ pub use ruleset::{
 pub use runner::{
     MAX_REPORT_PAGES, ReportedPage, ReportedPageInput, RunnerContext, RunnerReport,
     RunnerRequestImageUpload, RunnerSource, RunnerSources, RunnerWindow, runner_context,
+    scoped_to_job,
 };
 pub use upload::{CommitUpload, RequestUpload, UploadTicket};
 

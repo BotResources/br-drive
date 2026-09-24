@@ -17,7 +17,7 @@ pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, protected, medi
      processing_state, processing_error, metadata, summary, page_count, estimated_tokens, \
      ruleset_id, steps, step_index, step_count, step_runner_type, job_id, plan, \
      progress_index, progress_label, progress_at, triggered_by, done_at, completed_at, \
-     created_by, created_at, updated_at";
+     step_entered_at, stray_job_id, created_by, created_at, updated_at";
 
 /// The library is the only writer of these columns; a value that does not
 /// decode is reported and read as absent rather than breaking the file's view.
@@ -99,6 +99,8 @@ pub(crate) fn row_to_file_prefixed<H>(
         ),
         done_at: row.get(column("done_at").as_str()),
         completed_at: row.get(column("completed_at").as_str()),
+        step_entered_at: row.get(column("step_entered_at").as_str()),
+        stray_job_id: row.get(column("stray_job_id").as_str()),
         created_by: row.get(column("created_by").as_str()),
         created_at: row.get(column("created_at").as_str()),
         updated_at: row.get(column("updated_at").as_str()),
@@ -175,7 +177,8 @@ impl<H: DriveHost> Persistence for FileStore<H> {
                    ruleset_id = $13, steps = $14, step_index = $15, step_count = $16, \
                    step_runner_type = $17, job_id = $18, plan = $19, progress_index = $20, \
                    progress_label = $21, progress_at = $22, triggered_by = $23, \
-                   done_at = $24, completed_at = $25 \
+                   done_at = $24, completed_at = $25, step_entered_at = $26, \
+                   stray_job_id = $27 \
                  WHERE id = $1",
             )
             .bind(file.id)
@@ -206,6 +209,8 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             )?)
             .bind(file.done_at)
             .bind(file.completed_at)
+            .bind(file.step_entered_at)
+            .bind(file.stray_job_id)
             .execute(conn)
             .await?;
             Ok(())
@@ -222,7 +227,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
                 "INSERT INTO drive.file ({FILE_COLUMNS}) VALUES \
                  ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                   $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, \
-                  $30, $31)"
+                  $30, $31, $32, $33)"
             ))
             .bind(file.id)
             .bind(file.drive_id)
@@ -255,6 +260,8 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             )?)
             .bind(file.done_at)
             .bind(file.completed_at)
+            .bind(file.step_entered_at)
+            .bind(file.stray_job_id)
             .bind(file.created_by)
             .bind(file.created_at)
             .bind(file.updated_at)
@@ -332,11 +339,20 @@ pub async fn image_refs_of_files(
         .collect())
 }
 
-pub async fn ids_with_live_job(conn: &mut PgConnection) -> Result<Vec<Uuid>, EngineError> {
-    let rows = sqlx::query("SELECT id FROM drive.file WHERE job_id IS NOT NULL")
-        .fetch_all(conn)
-        .await?;
-    Ok(rows.iter().map(|row| row.get::<Uuid, _>("id")).collect())
+pub async fn holds_active_job(
+    conn: &mut PgConnection,
+    file_id: Uuid,
+    job_id: Uuid,
+) -> Result<bool, EngineError> {
+    let held: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM drive.file \
+         WHERE id = $1 AND job_id = $2 AND processing_state = 'processing')",
+    )
+    .bind(file_id)
+    .bind(job_id)
+    .fetch_one(conn)
+    .await?;
+    Ok(held)
 }
 
 pub async fn delete_pages(conn: &mut PgConnection, file_id: Uuid) -> Result<u64, EngineError> {

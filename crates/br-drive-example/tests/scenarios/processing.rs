@@ -186,7 +186,15 @@ async fn the_ruleset_chain_runs_step_by_step_over_jobs_facts_and_lands_ready() {
     let job_b = create_b.job_id;
     assert_ne!(job_b, job_a);
     assert_eq!(create_b.runner_type, INDEX);
-    assert_eq!(create_b.parent_job_id, Some(job_a));
+    assert!(
+        create_b.parent_job_id.is_none(),
+        "a chain step never names the finished step's job as its parent: Jobs refuses a \
+         terminal parent, and a live one would take the step away from the host"
+    );
+    assert!(
+        !jobs.rejected(job_b),
+        "Jobs accepts the second step: the host stays its owner"
+    );
     assert_eq!(create_b.config.as_ref().unwrap()["step"], 1);
     assert_eq!(
         error_code(&context(&world, &runner, file_id, job_a).await),
@@ -991,7 +999,10 @@ async fn a_completed_fact_that_arrives_before_the_runners_final_report_waits_for
     );
     let create_b: contract_jobs::command::CreateJob =
         serde_json::from_value(payload).expect("the next step's job");
-    assert_eq!(create_b.parent_job_id, Some(job_a));
+    assert!(
+        create_b.parent_job_id.is_none(),
+        "the step launched by the report names no parent either"
+    );
     assert_eq!(create_b.runner_type, INDEX);
     assert_eq!(
         world.file(&owner, file_id).await["progress"]["stepIndex"],

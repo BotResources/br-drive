@@ -88,15 +88,20 @@ impl<H: DriveHost> Projector for RunnerSources<H> {
         if !cx.principal().is_runner() {
             return Ok(Population::Keys(BTreeSet::new()));
         }
-        let keys: BTreeSet<Uuid> = match query.file_id {
-            Some(file_id) => BTreeSet::from([file_id]),
-            None => {
-                let mut conn = cx.pool().acquire().await.map_err(EngineError::from)?;
-                store::ids_with_live_job(&mut conn)
-                    .await?
-                    .into_iter()
-                    .collect()
-            }
+        // The population is the one file the runner's job names, and only
+        // while that job is the file's active one: the presign re-checks what
+        // `runner_context` checked, it never widens it.
+        let Ok((file_id, job_id)) = RUNNER_JOB.try_with(|scope| *scope) else {
+            return Ok(Population::Keys(BTreeSet::new()));
+        };
+        if query.file_id.is_some_and(|wanted| wanted != file_id) {
+            return Ok(Population::Keys(BTreeSet::new()));
+        }
+        let mut conn = cx.pool().acquire().await.map_err(EngineError::from)?;
+        let keys = if store::holds_active_job(&mut conn, file_id, job_id).await? {
+            BTreeSet::from([file_id])
+        } else {
+            BTreeSet::new()
         };
         Ok(Population::Keys(keys))
     }
@@ -104,6 +109,23 @@ impl<H: DriveHost> Projector for RunnerSources<H> {
     fn project(row: &FileRow<H>, _principal: &H) -> Result<RunnerSource, EngineError> {
         Ok(RunnerSource { file_id: row.id })
     }
+}
+
+tokio::task_local! {
+    static RUNNER_JOB: (Uuid, Uuid);
+}
+
+/// Runs `presign` with the runner source population scoped to `file_id` and
+/// `job_id`. The engine asks a view's population without the key it is about
+/// to serve, so the runner context resolver names the job's own file here
+/// rather than letting the population cover every in-flight file.
+#[doc(hidden)]
+pub async fn scoped_to_job<F: std::future::Future>(
+    file_id: Uuid,
+    job_id: Uuid,
+    presign: F,
+) -> F::Output {
+    RUNNER_JOB.scope((file_id, job_id), presign).await
 }
 
 fn runner_only<H: DriveHost>(principal: &H) -> Result<(), DriveFault> {
@@ -380,7 +402,7 @@ pub fn runner_report<'m, H: DriveHost>(
                 if let Some(cause) = cause {
                     cx.impact_caused::<File, _>(&file.id, cause)?;
                 }
-                crate::processing::advance(cx, &mut file, input.job_id).await?;
+                crate::processing::advance(cx, &mut file).await?;
                 return Ok(());
             }
             crate::processing::finish_active_job(cx, &file)?;

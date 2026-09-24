@@ -130,13 +130,17 @@ macro_rules! drive_slice {
                     )
                     .await
                     .map_err($crate::DriveFault::into_graphql)?;
-                    let url = ::service_engine::Query::<$p>::new(ctx)?
-                        .download::<$crate::RunnerSources<$p>>(
+                    let query = ::service_engine::Query::<$p>::new(ctx)?;
+                    let url = $crate::scoped_to_job(
+                        file_id,
+                        job_id,
+                        query.download::<$crate::RunnerSources<$p>>(
                             &file_id,
                             ::service_engine::BlobRef(context.source),
                             ::service_engine::blobs::Disposition::Inline,
-                        )
-                        .await?;
+                        ),
+                    )
+                    .await?;
                     let ::core::option::Option::Some(url) = url else {
                         return ::core::result::Result::Err(::service_engine::coded_error(
                             $crate::codes::SOURCE_NOT_AVAILABLE.code(),
