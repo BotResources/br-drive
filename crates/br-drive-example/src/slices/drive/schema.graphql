@@ -58,6 +58,7 @@ type DriveMutation {
 	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!, title: String): UploadTicket!
 	workspaceCommitUpload(fileId: UUID!, rulesetId: UUID): MutationAck!
 	workspaceProcess(fileId: UUID!, rulesetId: UUID): MutationAck!
+	workspaceCancelProcessing(fileId: UUID!): MutationAck!
 	workspaceRegeneratePage(fileId: UUID!, number: Int!, comment: String, rulesetId: UUID): MutationAck!
 	workspaceCreateRuleset(id: UUID!, name: String!, trigger: Trigger!, mediaTypes: [String!]!, steps: [RulesetStepInput!]!, isDefault: Boolean! = false): RulesetSaved!
 	workspaceUpdateRuleset(id: UUID!, name: String, mediaTypes: [String!], steps: [RulesetStepInput!], isDefault: Boolean): RulesetSaved!
@@ -205,7 +206,6 @@ input ReportedPageInput {
 
 type RulesetSaved {
 	id: UUID!
-	unknownRunnerTypes: [String!]!
 }
 
 input RulesetStepInput {

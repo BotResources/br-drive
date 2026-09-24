@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use contract_jobs::catalog::RunnerTypeLifecycle;
 use contract_jobs::command::TriggeredBy;
 use uuid::Uuid;
 
@@ -14,15 +13,6 @@ use crate::harness::{
 };
 
 const BYTES: &[u8] = b"the source to process";
-
-async fn catalogue(world: &World, jobs: &JobsStandIn) {
-    jobs.declare_runner_type(RENDER, RunnerTypeLifecycle::Active)
-        .await;
-    jobs.declare_runner_type(INDEX, RunnerTypeLifecycle::Active)
-        .await;
-    world.await_known_runner_type(RENDER, Some("active")).await;
-    world.await_known_runner_type(INDEX, Some("active")).await;
-}
 
 async fn two_step_rule(world: &World, manager: &str) -> Uuid {
     ruleset_id(
@@ -68,7 +58,6 @@ async fn the_ruleset_chain_runs_step_by_step_over_jobs_facts_and_lands_ready() {
     let owner_id = Uuid::now_v7();
     let owner = manager_passport(owner_id, "Ada Lovelace");
     let runner = service_passport(&[RUNNER_SCOPE]);
-    catalogue(&world, &jobs).await;
     let rule = two_step_rule(&world, &owner).await;
     let drive = world.create_workspace(&owner, "library").await;
     let mut files = drive_subscription(&world, &owner, drive).await;
@@ -246,7 +235,6 @@ async fn a_variant_is_picked_by_id_the_catch_all_serves_other_media_types_and_mi
     let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
-    catalogue(&world, &jobs).await;
     two_step_rule(&world, &manager).await;
     let variant = ruleset_id(
         &create_ruleset(
@@ -383,18 +371,13 @@ async fn a_variant_is_picked_by_id_the_catch_all_serves_other_media_types_and_mi
 }
 
 #[tokio::test]
-async fn an_unknown_or_deprecated_runner_type_fails_the_file_before_any_job_is_created() {
-    let world = World::start("pod-chain-unavailable").await;
+async fn a_rule_naming_a_runner_type_jobs_does_not_know_waits_for_the_users_cancel() {
+    // Given: a rule whose step names a runner type nobody declared to Jobs —
+    // the library keeps no copy of the catalogue, so the rule is saved as is
+    let world = World::start("pod-chain-unknown-type").await;
     let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
-    jobs.declare_runner_type("legacy", RunnerTypeLifecycle::Deprecated)
-        .await;
-    jobs.publish_catalogue_noise("garbled", serde_json::json!({ "not": "an entry" }))
-        .await;
-    world
-        .await_known_runner_type("legacy", Some("deprecated"))
-        .await;
     let saved = create_ruleset(
         &world,
         &manager,
@@ -402,76 +385,50 @@ async fn an_unknown_or_deprecated_runner_type_fails_the_file_before_any_job_is_c
             name: "ghost first",
             trigger: "UPLOAD",
             media_types: &["text/plain"],
-            steps: &[
-                ("ghost", serde_json::json!({})),
-                ("legacy", serde_json::json!({})),
-            ],
+            steps: &[("ghost", serde_json::json!({}))],
             is_default: true,
         },
     )
     .await;
     assert_eq!(
-        ok(&saved)["workspaceCreateRuleset"]["unknownRunnerTypes"],
-        serde_json::json!(["ghost", "legacy"]),
-        "a deprecated type is warned like an unknown one"
+        ok(&saved)["workspaceCreateRuleset"]
+            .as_object()
+            .map(|saved| saved.keys().cloned().collect::<Vec<_>>()),
+        Some(vec!["id".to_string()])
     );
     let drive = world.create_workspace(&owner, "library").await;
 
+    // When: a file is uploaded
     let file_id = upload(
         &world,
         &owner,
-        &UploadRequest::text(drive, "", "doomed.txt", BYTES),
+        &UploadRequest::text(drive, "", "ghostly.txt", BYTES),
     )
     .await;
-    let file = world.await_state(&owner, file_id, "FAILED").await;
-    assert_eq!(file["processingError"], "runner_type_unavailable");
-    assert!(file["progress"].is_null());
-    assert_eq!(file["affordances"]["process"]["allowed"], true);
+
+    // Then: Jobs accepts the job — it never dispatches it — and the file waits
+    let create = jobs.await_create(file_id).await;
+    assert_eq!(create.runner_type, "ghost");
+    let file = world.await_state(&owner, file_id, "PROCESSING").await;
+    assert_eq!(file["progress"]["runnerType"], "ghost");
+    assert_eq!(file["affordances"]["cancelProcessing"]["allowed"], true);
     jobs.expect_no_command(Duration::from_secs(1)).await;
 
-    let reprocess = reprocess_rule(&world, &manager).await;
-    let retried = world
-        .gql(
-            &owner,
-            "mutation($f:UUID!){workspaceProcess(fileId:$f){success}}",
-            serde_json::json!({ "f": file_id }),
-        )
-        .await;
-    ok(&retried);
-    let _ = reprocess;
-    let file = world.await_state(&owner, file_id, "FAILED").await;
-    assert_eq!(
-        file["processingError"], "runner_type_unavailable",
-        "the reprocess rule names a type the catalogue does not carry yet"
-    );
-    jobs.declare_runner_type(RENDER, RunnerTypeLifecycle::Active)
-        .await;
-    world.await_known_runner_type(RENDER, Some("active")).await;
+    // When: the owner cancels it
     ok(&world
         .gql(
             &owner,
-            "mutation($f:UUID!){workspaceProcess(fileId:$f){success}}",
+            "mutation($f:UUID!){workspaceCancelProcessing(fileId:$f){success}}",
             serde_json::json!({ "f": file_id }),
         )
         .await);
-    let create = jobs.await_create(file_id).await;
-    assert_eq!(create.runner_type, RENDER);
-    assert_eq!(
-        world.file(&owner, file_id).await["processingState"],
-        "PROCESSING"
-    );
-    jobs.retire_runner_type(RENDER).await;
-    world.await_known_runner_type(RENDER, None).await;
-    jobs.publish_catalogue_noise(
-        RENDER,
-        serde_json::json!({ "runner_type": RENDER, "lifecycle": "ACTIVE", "version": 99 }),
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    world.await_known_runner_type(RENDER, None).await;
-    jobs.declare_runner_type(RENDER, RunnerTypeLifecycle::Active)
-        .await;
-    world.await_known_runner_type(RENDER, Some("active")).await;
+
+    // Then: Jobs cancels the job and the file lands FAILED `cancelled`
+    jobs.await_cancel(create.job_id).await;
+    let file = world.await_state(&owner, file_id, "FAILED").await;
+    assert_eq!(file["processingError"], "cancelled");
+    assert!(file["progress"].is_null());
+    assert_eq!(file["affordances"]["process"]["allowed"], true);
 
     world.cleanup().await;
 }
@@ -483,7 +440,6 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    catalogue(&world, &jobs).await;
     two_step_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
     let mut files = drive_subscription(&world, &owner, drive).await;
@@ -599,7 +555,6 @@ async fn a_foreign_cancel_fails_the_file_while_the_cancel_we_asked_for_is_absorb
     let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
-    catalogue(&world, &jobs).await;
     two_step_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
 
@@ -650,7 +605,6 @@ async fn a_rule_edited_or_deleted_mid_chain_never_reaches_a_running_or_a_process
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    catalogue(&world, &jobs).await;
     let drive = world.create_workspace(&owner, "library").await;
 
     let early = upload(
@@ -750,7 +704,6 @@ async fn every_jobs_fact_replayed_changes_nothing() {
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    catalogue(&world, &jobs).await;
     two_step_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
     let file_id = upload(
@@ -869,7 +822,6 @@ async fn a_page_edit_during_processing_and_a_report_on_a_pending_file_are_refuse
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    catalogue(&world, &jobs).await;
     two_step_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
 
@@ -949,78 +901,11 @@ async fn a_page_edit_during_processing_and_a_report_on_a_pending_file_are_refuse
 }
 
 #[tokio::test]
-async fn a_completed_fact_that_arrives_before_the_runners_final_report_waits_for_it() {
-    let world = World::start("pod-chain-early-completed").await;
-    let jobs = JobsStandIn::attach(&world).await;
-    let manager = manager_passport(Uuid::now_v7(), "Ada");
-    let owner = passport(Uuid::now_v7());
-    let runner = service_passport(&[RUNNER_SCOPE]);
-    catalogue(&world, &jobs).await;
-    two_step_rule(&world, &manager).await;
-    let drive = world.create_workspace(&owner, "library").await;
-
-    let file_id = upload(
-        &world,
-        &owner,
-        &UploadRequest::text(drive, "", "early.txt", BYTES),
-    )
-    .await;
-    let job_a = jobs.await_create(file_id).await.job_id;
-    jobs.complete(job_a).await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    let waiting = world.file(&owner, file_id).await;
-    assert_eq!(waiting["processingState"], "PROCESSING");
-    assert_eq!(
-        waiting["progress"]["stepIndex"], 0,
-        "the chain does not advance on Jobs' word alone"
-    );
-    jobs.expect_no_command(Duration::from_millis(500)).await;
-
-    ok(&report(
-        &world,
-        &runner,
-        file_id,
-        Report {
-            job_id: job_a,
-            pages: vec![(1, "late but complete")],
-            origin: None,
-            indexer: None,
-            done: true,
-        },
-    )
-    .await);
-    let (subject, payload) = jobs
-        .next_command(Duration::from_secs(15))
-        .await
-        .expect("the report advances the chain");
-    assert_eq!(
-        subject,
-        contract_jobs::CMD_JOB_CREATE_V1,
-        "no finish is staged for a job Jobs already completed: {payload}"
-    );
-    let create_b: contract_jobs::command::CreateJob =
-        serde_json::from_value(payload).expect("the next step's job");
-    assert!(
-        create_b.parent_job_id.is_none(),
-        "the step launched by the report names no parent either"
-    );
-    assert_eq!(create_b.runner_type, INDEX);
-    assert_eq!(
-        world.file(&owner, file_id).await["progress"]["stepIndex"],
-        1
-    );
-    assert_eq!(world.file_pages(&owner, file_id).await.len(), 1);
-
-    world.cleanup().await;
-}
-
-#[tokio::test]
 async fn a_process_gesture_picks_the_given_rule_and_refuses_when_nothing_at_all_applies() {
     let world = World::start("pod-chain-process-order").await;
     let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
-    catalogue(&world, &jobs).await;
     let drive = world.create_workspace(&owner, "library").await;
 
     let plain = upload(

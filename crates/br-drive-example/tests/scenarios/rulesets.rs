@@ -1,13 +1,12 @@
 use std::time::Duration;
 
-use contract_jobs::catalog::RunnerTypeLifecycle;
 use uuid::Uuid;
 
 use crate::harness::runner::{INDEX, RENDER, RuleSpec, create_ruleset, ruleset_id};
 use crate::harness::upload::{UploadRequest, upload};
 use crate::harness::{
-    JobsStandIn, RULESET_DELTAS, World, WorldOptions, catalogue_subscription, error_code,
-    manager_passport, next_delta, ok, passport, service_passport,
+    JobsStandIn, RULESET_DELTAS, World, catalogue_subscription, error_code, manager_passport,
+    next_delta, ok, passport, service_passport,
 };
 
 const BYTES: &[u8] = b"ruled bytes";
@@ -41,13 +40,9 @@ async fn with_no_rule_declared_an_upload_is_ready_on_commit_and_no_job_is_create
 #[tokio::test]
 async fn rulesets_are_managed_by_the_hosts_managers_and_validated_at_save() {
     let world = World::start("pod-rules-crud").await;
-    let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let reader = passport(Uuid::now_v7());
     let runner = service_passport(&["workspace:runner"]);
-    jobs.declare_runner_type(RENDER, RunnerTypeLifecycle::Active)
-        .await;
-    world.await_known_runner_type(RENDER, Some("active")).await;
 
     let refused = create_ruleset(
         &world,
@@ -80,9 +75,9 @@ async fn rulesets_are_managed_by_the_hosts_managers_and_validated_at_save() {
     .await;
     let default_id = ruleset_id(&saved);
     assert_eq!(
-        ok(&saved)["workspaceCreateRuleset"]["unknownRunnerTypes"],
-        serde_json::json!(["summarize"]),
-        "a step whose runner type is not ACTIVE in the catalogue is warned at save"
+        ok(&saved)["workspaceCreateRuleset"]["id"],
+        default_id.to_string(),
+        "a step naming a runner type nobody declared is saved as is: Jobs judges it at run time"
     );
 
     let listed = world.rulesets(&reader).await;
@@ -205,18 +200,18 @@ async fn rulesets_are_managed_by_the_hosts_managers_and_validated_at_save() {
     let updated = world
         .gql(
             &manager,
-            "mutation($id:UUID!,$s:[RulesetStepInput!]){workspaceUpdateRuleset(id:$id,steps:$s){id unknownRunnerTypes}}",
+            "mutation($id:UUID!,$s:[RulesetStepInput!]){workspaceUpdateRuleset(id:$id,steps:$s){id}}",
             serde_json::json!({ "id": variant, "s": [{ "runnerType": RENDER }] }),
         )
         .await;
     assert_eq!(
-        ok(&updated)["workspaceUpdateRuleset"]["unknownRunnerTypes"],
-        serde_json::json!([])
+        ok(&updated)["workspaceUpdateRuleset"]["id"],
+        variant.to_string()
     );
     let unchanged = world
         .gql(
             &manager,
-            "mutation($id:UUID!,$s:[RulesetStepInput!]){workspaceUpdateRuleset(id:$id,steps:$s){id unknownRunnerTypes}}",
+            "mutation($id:UUID!,$s:[RulesetStepInput!]){workspaceUpdateRuleset(id:$id,steps:$s){id}}",
             serde_json::json!({ "id": variant, "s": [{ "runnerType": RENDER }] }),
         )
         .await;
@@ -224,7 +219,7 @@ async fn rulesets_are_managed_by_the_hosts_managers_and_validated_at_save() {
     let promoted = world
         .gql(
             &manager,
-            "mutation($id:UUID!){workspaceUpdateRuleset(id:$id,isDefault:true){id unknownRunnerTypes}}",
+            "mutation($id:UUID!){workspaceUpdateRuleset(id:$id,isDefault:true){id}}",
             serde_json::json!({ "id": variant }),
         )
         .await;
@@ -263,11 +258,7 @@ async fn rulesets_are_managed_by_the_hosts_managers_and_validated_at_save() {
 #[tokio::test]
 async fn two_concurrent_saves_of_one_name_answer_exactly_one_name_taken() {
     let world = World::start("pod-rules-concurrent").await;
-    let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
-    jobs.declare_runner_type(RENDER, RunnerTypeLifecycle::Active)
-        .await;
-    world.await_known_runner_type(RENDER, Some("active")).await;
 
     let world_ref = &world;
     let manager_ref = &manager;
@@ -311,57 +302,9 @@ async fn two_concurrent_saves_of_one_name_answer_exactly_one_name_taken() {
 }
 
 #[tokio::test]
-async fn a_rule_saved_before_the_first_catalogue_scan_is_kept_with_its_steps_flagged_unknown() {
-    let world = World::start_with(
-        "pod-rules-unscanned",
-        WorldOptions {
-            watch_catalogue: false,
-            ..WorldOptions::default()
-        },
-    )
-    .await;
-    let manager = manager_passport(Uuid::now_v7(), "Ada");
-    let jobs = JobsStandIn::attach(&world).await;
-    // Jobs already publishes both types ACTIVE: only the missing scan explains
-    // the warning below.
-    for runner_type in [RENDER, INDEX] {
-        jobs.declare_runner_type(runner_type, RunnerTypeLifecycle::Active)
-            .await;
-    }
-
-    let saved = create_ruleset(
-        &world,
-        &manager,
-        RuleSpec {
-            name: "early",
-            trigger: "UPLOAD",
-            media_types: &["*"],
-            steps: &[
-                (RENDER, serde_json::json!({})),
-                (INDEX, serde_json::json!({})),
-            ],
-            is_default: true,
-        },
-    )
-    .await;
-    assert_eq!(
-        ok(&saved)["workspaceCreateRuleset"]["unknownRunnerTypes"],
-        serde_json::json!([INDEX, RENDER]),
-        "a host that has not scanned yet cannot vouch for any runner type: a warning, not a refusal"
-    );
-    assert_eq!(world.rulesets(&manager).await.len(), 1);
-
-    world.cleanup().await;
-}
-
-#[tokio::test]
-async fn the_rule_table_is_read_live_and_a_save_carries_its_warning_as_the_cause() {
+async fn the_rule_table_is_read_live_and_a_save_carries_its_cause() {
     let world = World::start("pod-rules-live").await;
-    let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
-    jobs.declare_runner_type(RENDER, RunnerTypeLifecycle::Active)
-        .await;
-    world.await_known_runner_type(RENDER, Some("active")).await;
     let mut live =
         catalogue_subscription(&world, &manager, RULESET_DELTAS, "workspaceRulesetsChanged").await;
 
@@ -386,9 +329,15 @@ async fn the_rule_table_is_read_live_and_a_save_carries_its_warning_as_the_cause
     })
     .await;
     assert!(
-        upsert["cause"].is_null()
-            || upsert["cause"]["unknown_runner_types"] == serde_json::json!(["ghost"]),
-        "a rule entering the window arrives by repopulation, a later save carries its warning: {upsert}"
+        upsert["cause"].is_null() || upsert["cause"]["kind"] == "Saved",
+        "a rule entering the window arrives by repopulation, a later save carries its cause: {upsert}"
+    );
+    assert_eq!(
+        ok(&saved)["workspaceCreateRuleset"]
+            .as_object()
+            .map(|saved| saved.len()),
+        Some(1),
+        "a save answers the rule's id alone: Jobs judges a runner type, not the library"
     );
     ok(&world
         .gql(
@@ -401,11 +350,7 @@ async fn the_rule_table_is_read_live_and_a_save_carries_its_warning_as_the_cause
         node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "Saved"
     })
     .await;
-    assert_eq!(
-        updated["cause"]["unknown_runner_types"],
-        serde_json::json!([]),
-        "the warning list is the save's cause"
-    );
+    assert_eq!(updated["cause"], serde_json::json!({ "kind": "Saved" }));
     assert_eq!(updated["view"]["steps"].as_array().unwrap().len(), 1);
     ok(&world
         .gql(

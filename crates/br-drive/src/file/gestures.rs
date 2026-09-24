@@ -1,3 +1,4 @@
+use contract_jobs::command::CancelJob;
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use service_engine::BlobRef;
@@ -301,13 +302,57 @@ pub fn regenerate_page<'m, H: DriveHost>(
         if let Some(comment) = input.comment {
             options.insert("comment".into(), serde_json::Value::String(comment));
         }
-        debug_assert_eq!(file.processing_state, ProcessingState::Ready);
+        debug_assert_eq!(file.processing_state(), ProcessingState::Ready);
         let initiator = processing::Initiator::of(cx.principal());
         let plan = processing::ChainPlan::from_ruleset(
             &ruleset,
             Some(&serde_json::Value::Object(options)),
         );
         processing::start_chain(cx, &mut file, plan, initiator).await?;
+        Ok(())
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelProcessing {
+    pub file_id: Uuid,
+}
+
+impl MutationInput for CancelProcessing {
+    type Output = ();
+    type Error = DriveFault;
+    const NAME: &'static str = "drive_cancel_processing";
+}
+
+/// Asks Jobs to cancel the job running on a PROCESSING file. The request is
+/// logged on the job (`cancel_requested`) and the file stays PROCESSING until
+/// Jobs confirms with `cancelled`, which lands it FAILED `cancelled`, open to
+/// a reprocess. Asking again sends the cancel again — Jobs may not have
+/// consumed the job's creation yet when the first one reaches it.
+pub fn cancel_processing<'m, H: DriveHost>(
+    cx: &'m mut Mutation<'m, H>,
+    input: CancelProcessing,
+) -> BoxFuture<'m, Result<(), DriveFault>> {
+    Box::pin(async move {
+        let mut file = cx
+            .load::<FileRow<H>>(&input.file_id)
+            .await?
+            .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
+        file.cancel_processing_gate(cx.principal()).require()?;
+        let Some(job_id) = file.active_job().map(|job| job.job_id) else {
+            return Err(DriveFault::Refused(codes::FILE_NOT_PROCESSING));
+        };
+        let entry = processing::job_entry(
+            processing::job_event::CANCEL_REQUESTED,
+            cx.now().as_datetime(),
+            serde_json::json!({}),
+        )?;
+        processing::append_job_event(cx.connection(), job_id, entry).await?;
+        cx.command(processing::JobCancel {
+            payload: CancelJob { job_id },
+        })?;
+        processing::refresh_status(cx, &mut file).await?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::CancelRequested { job_id })?;
         Ok(())
     })
 }

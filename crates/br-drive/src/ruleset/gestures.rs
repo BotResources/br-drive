@@ -9,7 +9,6 @@ use super::{
     ANY_MEDIA_TYPE, MAX_RULESET_NAME_BYTES, MAX_RULESET_STEPS, MAX_RUNNER_TYPE_BYTES, Ruleset,
     RulesetCause, RulesetRow, RulesetStep, Trigger,
 };
-use crate::catalogue;
 use crate::fault::{DriveFault, codes};
 use crate::host::{DriveHost, DriveRequest};
 use crate::media::MediaType;
@@ -17,7 +16,6 @@ use crate::media::MediaType;
 #[derive(Debug, Clone, PartialEq, Eq, async_graphql::SimpleObject)]
 pub struct RulesetSaved {
     pub id: Uuid,
-    pub unknown_runner_types: Vec<String>,
 }
 
 fn validate_name(name: &str) -> Result<String, DriveFault> {
@@ -114,19 +112,6 @@ fn manage_gate<H: DriveHost>(principal: &H) -> Result<(), DriveFault> {
     Ok(())
 }
 
-/// A rule saved before the host's first catalogue scan is kept: its steps are
-/// reported as unknown runner types (the save's warning), and a chain that
-/// fires before the scan defers its launch instead of failing.
-async fn note_unscanned_catalogue(conn: &mut PgConnection) -> Result<(), DriveFault> {
-    if !catalogue::scanned(conn).await? {
-        tracing::warn!(
-            "a ruleset was saved on a host where no runner-type catalogue scan has completed \
-             yet; start `br_drive::watch_runner_types` next to the engine"
-        );
-    }
-    Ok(())
-}
-
 #[derive(Debug, Deserialize)]
 pub struct CreateRuleset {
     pub id: Uuid,
@@ -152,7 +137,6 @@ pub fn create_ruleset<'m, H: DriveHost>(
         let name = validate_name(&input.name)?;
         let media_types = validate_media_types(&input.media_types)?;
         validate_steps(&input.steps)?;
-        note_unscanned_catalogue(cx.connection()).await?;
         serialize_rulesets(cx.connection()).await?;
         require_free_name(cx.connection(), &name, None).await?;
         if input.is_default {
@@ -171,18 +155,8 @@ pub fn create_ruleset<'m, H: DriveHost>(
             updated_at: now,
         };
         cx.create(&ruleset).await?;
-        let unknown_runner_types =
-            catalogue::inactive_among(cx.connection(), &ruleset.runner_types()).await?;
-        cx.impact_caused::<Ruleset, _>(
-            &ruleset.id,
-            RulesetCause::Saved {
-                unknown_runner_types: unknown_runner_types.clone(),
-            },
-        )?;
-        Ok(OneShot(RulesetSaved {
-            id: ruleset.id,
-            unknown_runner_types,
-        }))
+        cx.impact_caused::<Ruleset, _>(&ruleset.id, RulesetCause::Saved)?;
+        Ok(OneShot(RulesetSaved { id: ruleset.id }))
     })
 }
 
@@ -207,7 +181,6 @@ pub fn update_ruleset<'m, H: DriveHost>(
 ) -> BoxFuture<'m, Result<OneShot<RulesetSaved>, DriveFault>> {
     Box::pin(async move {
         manage_gate(cx.principal())?;
-        note_unscanned_catalogue(cx.connection()).await?;
         serialize_rulesets(cx.connection()).await?;
         let mut ruleset = cx
             .load::<RulesetRow>(&input.id)
@@ -247,18 +220,8 @@ pub fn update_ruleset<'m, H: DriveHost>(
         ruleset.is_default = is_default;
         ruleset.updated_at = cx.now().as_datetime();
         cx.save(&ruleset).await?;
-        let unknown_runner_types =
-            catalogue::inactive_among(cx.connection(), &ruleset.runner_types()).await?;
-        cx.impact_caused::<Ruleset, _>(
-            &ruleset.id,
-            RulesetCause::Saved {
-                unknown_runner_types: unknown_runner_types.clone(),
-            },
-        )?;
-        Ok(OneShot(RulesetSaved {
-            id: ruleset.id,
-            unknown_runner_types,
-        }))
+        cx.impact_caused::<Ruleset, _>(&ruleset.id, RulesetCause::Saved)?;
+        Ok(OneShot(RulesetSaved { id: ruleset.id }))
     })
 }
 

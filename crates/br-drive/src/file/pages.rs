@@ -20,7 +20,7 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use super::aggregate::{File, FileRow, PageOrigin, drive_memberships};
-use super::store::{FileStore, config_error, file_columns_as, row_to_file_prefixed};
+use super::store::{FileStore, config_error, file_select, row_to_file_prefixed};
 use crate::host::{DRIVE_DIM, DriveHost};
 
 pub const EDIT_PAGE_ACTION: ActionName = ActionName::from_static("editPage");
@@ -86,10 +86,11 @@ pub(crate) async fn load_pages<H: DriveHost>(
         "SELECT p.file_id, p.number, p.markdown, p.origin, p.updated_by, p.updated_at, {} \
          FROM drive.file_page p \
          JOIN drive.file f ON f.id = p.file_id \
+         JOIN drive.file_status s ON s.file_id = f.id \
          JOIN unnest($1::uuid[], $2::int[]) AS wanted(file_id, number) \
            ON wanted.file_id = p.file_id AND wanted.number = p.number \
          ORDER BY p.file_id, p.number",
-        file_columns_as("f", "f_")
+        file_select("f_")
     ))
     .bind(&files)
     .bind(&numbers)

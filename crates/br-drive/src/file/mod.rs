@@ -8,15 +8,16 @@ pub(crate) mod rendition;
 pub(crate) mod store;
 mod view;
 
-pub(crate) use aggregate::file_changed;
 pub use aggregate::{
-    File, FileCause, FileRow, FileVisibility, PageOrigin, ProcessingState, UnknownDbValue,
+    File, FileCause, FileRow, FileStatus, FileVisibility, PageOrigin, ProcessingState,
+    UnknownDbValue,
 };
+pub(crate) use aggregate::{file_changed, file_touched};
 pub use curation::{drive_of, set_metadata, set_protected};
 pub use delta::{DriveDelta, DriveRemove, DriveReset, DriveUpsert, DriveView};
 pub use gestures::{
-    DeleteFile, EditPage, Process, RegeneratePage, RetitleFile, UpdateFile, delete_file, edit_page,
-    process, regenerate_page, retitle_file, update_file,
+    CancelProcessing, DeleteFile, EditPage, Process, RegeneratePage, RetitleFile, UpdateFile,
+    cancel_processing, delete_file, edit_page, process, regenerate_page, retitle_file, update_file,
 };
 pub use images::{
     IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded,
@@ -32,16 +33,17 @@ pub use view::{ByteCount, DriveFile, DriveFiles, DriveImage, DriveProgress, Driv
 pub(crate) mod tests_support {
     use std::marker::PhantomData;
 
-    use chrono::{DateTime, Utc};
+    use chrono::Utc;
     use uuid::Uuid;
 
-    use super::{FileRow, ProcessingState};
+    use super::{FileRow, FileStatus, ProcessingState};
     use crate::media::MediaType;
     use crate::path::{DrivePath, FileName};
 
-    /// A file inside step `step`, entered at `entered`, for the unit tests of
-    /// the rules that read a file's step.
-    pub fn processing_file<H>(step: i32, entered: DateTime<Utc>) -> FileRow<H> {
+    /// A committed file in `state`, with no job, for the unit tests of the
+    /// rules that read a file row.
+    pub fn a_file<H>(state: ProcessingState) -> FileRow<H> {
+        let now = Utc::now();
         FileRow {
             id: Uuid::now_v7(),
             drive_id: Uuid::now_v7(),
@@ -53,32 +55,21 @@ pub(crate) mod tests_support {
             size_bytes: 1,
             sha256: [0; 32],
             blob_ref: Uuid::now_v7(),
-            processing_state: ProcessingState::Processing,
-            processing_error: None,
+            committed_at: Some(now),
             metadata: serde_json::json!({}),
             summary: None,
             page_count: None,
             estimated_tokens: None,
             ruleset_id: None,
             steps: None,
-            step_index: Some(step),
-            step_count: Some(step + 1),
-            step_runner_type: None,
-            job_id: None,
-            plan: None,
-            progress_index: None,
-            progress_label: None,
-            progress_at: None,
-            triggered_by: None,
-            done_at: None,
-            completed_at: None,
-            step_entered_at: Some(entered),
-            step_alive_at: Some(entered),
-            run_started_at: None,
-            stray_job_id: None,
             created_by: Uuid::now_v7(),
-            created_at: entered,
-            updated_at: entered,
+            created_at: now,
+            updated_at: now,
+            status: FileStatus {
+                state,
+                error: None,
+                last_job: None,
+            },
             host: PhantomData,
         }
     }

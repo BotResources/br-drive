@@ -20,10 +20,6 @@ pub struct Service {
     readiness: ReadinessHandle,
     stop: Arc<Notify>,
     handle: JoinHandle<Result<(), EngineError>>,
-    #[cfg(feature = "drive")]
-    catalogue: tokio::sync::Mutex<Option<br_drive::CatalogueWatch>>,
-    #[cfg(feature = "drive")]
-    watch_inputs: (service_engine::nats::Nats, PgPool),
     eraser: service_engine::Eraser<AppPrincipal>,
 }
 
@@ -59,21 +55,7 @@ impl Service {
             .await;
     }
 
-    /// Starts the runner-type catalogue watch of a host booted without it.
-    #[cfg(feature = "drive")]
-    pub async fn start_catalogue_watch(&self) {
-        let mut watch = self.catalogue.lock().await;
-        if watch.is_none() {
-            let (nats, pool) = self.watch_inputs.clone();
-            *watch = Some(br_drive::watch_runner_types(nats, pool));
-        }
-    }
-
     pub async fn shutdown(self) {
-        #[cfg(feature = "drive")]
-        if let Some(watch) = self.catalogue.into_inner() {
-            watch.stop().await;
-        }
         self.stop.notify_one();
         let _ = self.handle.await;
     }
@@ -82,9 +64,6 @@ impl Service {
 pub struct BootOptions {
     pub await_ready: bool,
     pub settings: HostSettings,
-    /// Start the runner-type catalogue watch at boot (a host that forgets it
-    /// is what `false` models).
-    pub watch_catalogue: bool,
 }
 
 impl Default for BootOptions {
@@ -92,7 +71,6 @@ impl Default for BootOptions {
         Self {
             await_ready: true,
             settings: HostSettings::default(),
-            watch_catalogue: true,
         }
     }
 }
@@ -118,26 +96,11 @@ pub async fn boot(
 ) -> Result<Service, EngineError> {
     let http_addr = config.http_addr;
     let readiness = ReadinessHandle::not_ready("booting");
-    let (engine, app) = assemble(
-        config,
-        pool.clone(),
-        nats,
-        readiness.clone(),
-        options.settings,
-    )
-    .await?;
+    let (engine, app) = assemble(config, pool, nats, readiness.clone(), options.settings).await?;
     let stop = engine.shutdown_handle();
     let settle = engine.settle_handle();
     let blob_reader = engine.blob_reader();
     let eraser = engine.eraser();
-    #[cfg(feature = "drive")]
-    let watch_inputs = (engine.nats().clone(), pool);
-    #[cfg(feature = "drive")]
-    let catalogue = tokio::sync::Mutex::new(
-        options
-            .watch_catalogue
-            .then(|| br_drive::watch_runner_types(watch_inputs.0.clone(), watch_inputs.1.clone())),
-    );
 
     let listener = TcpListener::bind(http_addr)
         .await
@@ -178,10 +141,6 @@ pub async fn boot(
         readiness,
         stop,
         handle,
-        #[cfg(feature = "drive")]
-        catalogue,
-        #[cfg(feature = "drive")]
-        watch_inputs,
         eraser,
     })
 }

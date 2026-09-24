@@ -215,6 +215,18 @@ macro_rules! drive_slice {
                     .await
                 }
 
+                async fn [<$prefix _cancel_processing>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::CancelProcessing>(
+                        ctx,
+                        $crate::CancelProcessing { file_id },
+                    )
+                    .await
+                }
+
                 async fn [<$prefix _regenerate_page>](
                     &self,
                     ctx: &::async_graphql::Context<'_>,

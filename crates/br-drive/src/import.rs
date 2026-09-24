@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::fault::{DriveFault, codes};
 use crate::file::rendition::{apply_indexing, validate_rendition};
 use crate::file::store::{self, PageWrite};
-use crate::file::{FileCause, FileRow, Page, PageCause, PageKey, PageOrigin, ProcessingState};
+use crate::file::{FileCause, FileRow, Page, PageCause, PageKey, PageOrigin};
 use crate::host::DriveHost;
 use crate::image::ImageName;
 use crate::media::MediaType;
@@ -66,8 +66,9 @@ pub fn import_commit<'m, H: DriveHost>(
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.import_commit_gate(cx.principal()).require()?;
         require_landed(&reader, &file).await?;
-        file.processing_state = ProcessingState::Ready;
-        file.updated_at = cx.now().as_datetime();
+        let now = cx.now().as_datetime();
+        file.committed_at = Some(now);
+        file.updated_at = now;
         cx.save(&file).await?;
         crate::file::file_changed::<H>(cx, &file, FileCause::UploadCommitted)?;
         Ok(())

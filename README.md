@@ -57,10 +57,6 @@ The engine's "library slice" path, exactly as `example-lib-roster` does it:
    `9_121_000_001..=9_121_999_999`), then the host's, and grants the app role
    every schema. Configure object storage (`EngineConfig::with_blob_storage`);
    the library registers its `drive_source` blob kind when storage is configured.
-   Start the runner-type catalogue mirror next to the engine:
-   `br_drive::watch_runner_types(engine.nats().clone(), pool.clone())` returns
-   a `CatalogueWatch` the host stops at shutdown (milestone 4, see "Processing
-   rules").
 4. Create and delete drives from the host's own mutations, in the host's own
    transaction: `br_drive::create_drive::<AppPrincipal>(cx, &workspace_row,
    created_by)` and `br_drive::delete_drive::<AppPrincipal>(cx, id)` (cascades
@@ -90,14 +86,13 @@ rolls them together. The host never writes to the `drive` schema directly.
 ### Embedding checklist
 
 1. **Compose**: `slice drive ["drive"] from br_drive::drive_slice { query = drive::DriveQuery, mutation = drive::DriveMutation, subscription = drive::DriveSubscription }` under the host's `prefix`; every root below appears at that prefix.
-2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and both of the library's self-commands arrive as a service actor, and a resolver that rejects services parks all ten reactions.
-3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `IMPORT_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `PICKUP_TIMEOUT`, `STEP_TIMEOUT`, `drive_gate`, `visible_drives` (never a service principal), `display_name`, `upload_window`, `erase_mode`, the two folder hooks.
+2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and both of the library's self-commands (`upload-deadline`, `image-landed`) arrive as a service actor, and a resolver that rejects services parks all ten reactions.
+3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `IMPORT_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `visible_drives` (never a service principal), `display_name`, `upload_window`, `erase_mode`, the two folder hooks.
 4. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
 5. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
-6. **Catalogue watch**: `br_drive::watch_runner_types(engine.nats().clone(), pool.clone())` after boot, `CatalogueWatch::stop` at shutdown; the `PUBLISHED_LANGUAGE` bucket must exist on the broker.
-7. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
-8. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
-9. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_protected`, `set_metadata`, `drive_of` for curation.
+6. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
+7. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
+8. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_protected`, `set_metadata`, `drive_of` for curation.
 
 ### The `DriveHost` seam
 
@@ -108,8 +103,6 @@ impl DriveHost for AppPrincipal {
     const VISIBILITY_DEPS: Deps = Deps::from_bits(1 << OWNERSHIP_DEP);
     const IMPORT_SCOPE: Option<&'static str> = Some("workspace:import"); // default None: no import
     type DriveOwner = Workspace;                        // or br_drive::NoDriveOwner
-    const PICKUP_TIMEOUT: Duration = …;                 // default 1 h
-    const STEP_TIMEOUT: Duration = …;                   // default 72 h
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate { … }
     fn visible_drives(&self) -> Vec<Uuid> { … }
@@ -132,7 +125,8 @@ every `RequestUpload`.
   commit to the uploader), `ReadFile { file }`,
   `UpdateFile { file, target_drive }` (a cross-drive move names both drives),
   `DeleteFile { file }`, `MoveFolder { drive, old_prefix, new_prefix }`,
-  `DeleteFolder { drive, prefix }`, `Process { file }`, `EditPage { file }`,
+  `DeleteFolder { drive, prefix }`, `Process { file }`,
+  `CancelProcessing { file }`, `EditPage { file }`,
   `RegeneratePage { file, number }`, `RetitleFile { file }`, `Import { file }`, `ImportCommit { file }`, `ManageRulesets`, `ReadRulesets`,
   `ManageLabels`, `ReadLabels`, `SetFileLabels { file }`,
   `SetMetadata { file }`. The host answers `Gate::allowed()`
@@ -149,7 +143,7 @@ every `RequestUpload`.
   unknown drive answers the host's refusal before `DRIVE_NOT_FOUND`. The
   same decision feeds the mutation guard and the `affordances` on
   `DriveFile` (`delete`, `rename`, `move`, `retitle`, `download`, `editPage`,
-  `process`, `setLabels`, `commit`, `setMetadata`) and on `DrivePage`
+  `process`, `cancelProcessing`, `setLabels`, `commit`, `setMetadata`) and on `DrivePage`
   (`editPage`, `regeneratePage`), so the front renders and never decides.
   The gate decides on the principal as the request found it: an engine
   principal's facts are loaded when the request arrives, so a host whose
@@ -231,6 +225,7 @@ renders it, is committed at
 | `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256, title?): UploadTicket!` | `title` trimmed, 1–255 characters, one line, no control or bidirectional-override character (`INVALID_TITLE`); absent, it is the requested `name` without its extension (`report.pdf` → `report`; a name with no stem is kept whole; a collision renames the file, never its title); gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). |
 | `<p>CommitUpload(fileId, rulesetId?): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then the `upload` rule is picked (the given `rulesetId`, or the default matching the media type) and the chain starts (`PROCESSING`), or the file is `READY` when no rule matches. A second commit is `FILE_NOT_PENDING`. |
 | `<p>Process(fileId, rulesetId?): MutationAck!` | re-process a `READY` or `FAILED` file with the `reprocess` rule (`NO_RULESET_MATCHES`, `RULESET_MISMATCH`, `FILE_PROCESSING` while a chain runs): the pages, the images (released) and the indexer triple are wiped at chain start. Affordance `process`. |
+| `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; logs `cancel_requested` on the running job and stages `job.cancel.v2` for it (`CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). Affordance `cancelProcessing`. |
 | `<p>RegeneratePage(fileId, number, comment?, rulesetId?): MutationAck!` | run the `regenerate_page` rule on one page of a `READY` file: `page` and `comment` are merged into the first step's options; `PAGE_NOT_FOUND`, `NO_RULESET_MATCHES`. Affordance `regeneratePage` on the page. |
 | `<p>UpdateFile(fileId, name?, path?, driveId?): MutationAck!` | rename, move, or move to another drive of the same host; both drives are locked before the sibling check, so a concurrent collision answers `NAME_TAKEN`, never a database error; `NOTHING_TO_CHANGE` when nothing differs, `FILE_PROTECTED` on a protected file. |
 | `<p>RetitleFile(fileId, title): MutationAck!` | gate `RetitleFile { file }` (affordance `retitle`); changes the title and nothing else — never the name, the path, the drive or the state, and `UpdateFile` never touches the title; `INVALID_TITLE`, `NOTHING_TO_CHANGE` for the same title; the host decides whether a `protected` file may be retitled (the row is in the request). |
@@ -247,7 +242,7 @@ renders it, is committed at
 | `<p>FileAccess(fileId, name: String): String` | a short-lived presigned GET on the source (attachment); `null` when the caller cannot see the file, a coded refusal when the `download` affordance is denied (the host's code first, then `FILE_NOT_READY` before the commit), and `null` between the commit and the engine reaper's promotion (a verified blob is never downloadable in the pending window; the `SourceAvailable` cause says when to retry). With `name`, a presigned GET on that extracted image (inline; `null` for an unknown name and until the object landed). |
 | `<p>DriveChanged(driveId): DriveDelta!` | the file list: the engine snapshot on connect (`DriveReset` of `DriveFile`s), then `DriveUpsert` / `DriveRemove` on the contiguous revision. |
 | `<p>LabelsChanged: DriveDelta!` | the label catalogue live: a `DriveReset` of `DriveLabel`s, then an upsert (`Created`, `Updated`) or a remove per label. |
-| `<p>RulesetsChanged: DriveDelta!` | the rule table live, for the manager's screen: an upsert per save with `Saved { unknown_runner_types }` as its cause (the same warning the save answers), a remove per delete. |
+| `<p>RulesetsChanged: DriveDelta!` | the rule table live, for the manager's screen: an upsert per save (`Saved`), a remove per delete. |
 | `<p>FilePages(fileId): DriveDelta!` | one file's rendition (milestone 3): a `DriveReset` with every `DrivePage` of the file, then a `DriveUpsert` / `DriveRemove` per page; gated on `ReadFile` for the file's drive, so a caller who cannot read the file gets an empty window and a caller who loses the drive gets one `DriveRemove` per page. |
 
 `DriveFile`: `id`, `driveId`, `path` (normalized, `""` = root), `name`,
@@ -260,9 +255,12 @@ mediaType, sizeBytes, page }`, `labelIds` (computed, by label name), `rulesetId`
 (the snapshot the last chain ran), `progress { stepIndex, stepCount,
 runnerType, plan, currentIndex, currentLabel, at }` (non-null only while
 `PROCESSING`), `createdBy`, `createdAt`, `updatedAt`, `affordances` (`delete`,
-`rename`, `move`, `retitle`, `download`, `editPage`, `process`, `setLabels` — `download` is denied
+`rename`, `move`, `retitle`, `download`, `editPage`, `process`, `cancelProcessing`, `setLabels` — `download` is denied
 `FILE_NOT_READY` until the commit, `editPage` until the file is `READY` and
-`FILE_PROCESSING` while a chain runs; `process` needs `READY` or `FAILED`).
+`FILE_PROCESSING` while a chain runs; `process` needs `READY` or `FAILED`;
+`cancelProcessing` needs `PROCESSING`, `FILE_NOT_PROCESSING` otherwise).
+`processingState`, `processingError` and `progress` are computed, never
+stored: see "Processing rules".
 The pages are
 **not** on the file: `DrivePage { fileId, number, markdown, origin, updatedBy,
 updatedAt, affordances { editPage } }` has its own projector, keyed by
@@ -278,13 +276,12 @@ lane notices. `cause` is one of the library's file causes (`UploadRequested`,
 from_drive }`, `FolderMoved`, `ProtectionChanged { protected }`,
 `MetadataChanged`, `ImageRequested { name }`, `ImageAvailable { name }`,
 `ImagesDropped { names }`, `ReportStored { job_id, done }`, `RenditionImported`,
-`ProcessingStarted { job_id, step }`, `LaunchDeferred { step }`,
-`ProgressChanged`,
-`ProcessingFinished`, `ProcessingFailed { reason }`, `LabelsChanged {
+`ProcessingStarted { job_id, step }`, `ProgressChanged`,
+`ProcessingFinished`, `ProcessingFailed { reason }`, `CancelRequested { job_id }`, `LabelsChanged {
 detached }`, `Erased`, `Deleted`, `FolderDeleted`, `DriveDeleted`), page
 causes (`Reported { job_id, origin
 }`, `Edited`, `Imported { origin }`), label causes (`Created`, `Updated`, `Deleted`) or rule causes
-(`Saved { unknown_runner_types }`, `Deleted`) on a delta the engine attributes
+(`Saved`, `Deleted`) on a delta the engine attributes
 to an impact; a key that
 **enters or leaves** a live session's window (a created or deleted file, a
 page the runner reports for the first time, a drive gained or lost) is
@@ -293,7 +290,8 @@ delivered by the engine's window repopulation and carries no cause in engine
 `DriveReset`).
 
 Abandoned uploads: `RequestUpload` schedules an `upload-deadline` reaction at
-`now + upload_window`; a file still `PENDING` then is deleted (its blob is
+`now + upload_window`; a file whose upload is still not confirmed then
+(`committed_at` unset, so `PENDING`) is deleted (its blob is
 released and the engine reaper removes the object). A file whose object landed
 but was never committed is deleted the same way.
 
@@ -323,11 +321,12 @@ runner reports and never interprets a media type.
 | `<p>ImportPages(fileId, pages: [ImportedPageInput!]!, summary, pageCount, estimatedTokens): MutationAck!` | the host-privileged import of an existing rendition: a service account holding the host's `IMPORT_SCOPE` (`IMPORT_SCOPE_REQUIRED` otherwise, before anything else), then the gate `Import { file }`, then a `READY` file (`FILE_PROCESSING`, `FILE_NOT_READY` otherwise) — no job, no runner scope. Pages `{ number, markdown, origin? }` (`RUNNER` by default; `EDITED` keeps a page a person had corrected; `REGENERATED` is refused, `INVALID_PAGE_ORIGIN`; an imported page records the importer and the import time as its `updatedBy` / `updatedAt`) are upserted by number under the same rules as a report (≤ 512 per call, numbers ≥ 1 and distinct, the indexing pair together, the estimate optional); each reaches `<p>FilePages` (`Imported { origin }`), an indexing reaches the file (`RenditionImported`); the file stays `READY`; `NOTHING_TO_CHANGE` for an empty import. For a downstream project moving an existing corpus in without re-running its conversions. |
 | `<p>ImportImage(fileId, name, mediaType, size: ByteCount, sha256): UploadTicket!` | same scope, gate and state; the runner's verified image path (page-scoped name, replacement on landing) without its job. |
 | `<p>ImportCommit(fileId): MutationAck!` | commits a pending upload **without processing**: the same scope as an import (`IMPORT_SCOPE_REQUIRED` first, before any file is looked at), then the host's own gate `ImportCommit { file }` on the pending row (its uploader included — the example host reserves it to the migration account's own uploads), then `FILE_NOT_PENDING`, then the same live storage HEAD as `CommitUpload` (`UPLOAD_NOT_LANDED`); the file lands `READY` (`UploadCommitted`) and no rule runs, even when an `upload` rule matches — no chain, no `job.create`. For a host that declared its processing rules before migrating its corpus: upload, `ImportCommit`, then `ImportPages` / `ImportImage`. A normal `CommitUpload` is unchanged. |
-| `<p>RunnerReport(fileId, jobId, pages: [ReportedPageInput!], origin: PageOrigin, summary, pageCount, estimatedTokens, done): MutationAck!` | pages in one or several batches of at most `MAX_REPORT_PAGES` (512, `BATCH_TOO_LARGE`), **upserted by number** (a replayed batch changes nothing; a number twice in one batch is `INVALID_PAGE`); each page reaches `<p>FilePages` on its own key (`Reported { job_id, origin }`) and the file row is touched only by the indexer's triple. `origin` `RUNNER` (default) or `REGENERATED` — on a regenerated page the images of that page that its new markdown no longer references (matched on the whole name, `![…](p001-img01.png)`, never as a substring) are dropped and released (`ImagesDropped { names }` on the file); `summary` and `pageCount` are the indexer's pair and move together, `estimatedTokens` is optional and only rides along with them (`INDEXER_FIELDS_TOGETHER` otherwise, `INVALID_INDEXER_VALUE` when negative; an indexing without an estimate clears a previous one; `ReportStored { job_id, done }` on the file when any of the three changes); an empty report is `NOTHING_TO_CHANGE` unless `done`; `done: true` records `done_at` and stages `job.finish.v2` (see "Processing rules"). |
+| `<p>RunnerReport(fileId, jobId, pages: [ReportedPageInput!], origin: PageOrigin, summary, pageCount, estimatedTokens, done): MutationAck!` | pages in one or several batches of at most `MAX_REPORT_PAGES` (512, `BATCH_TOO_LARGE`), **upserted by number** (a replayed batch changes nothing; a number twice in one batch is `INVALID_PAGE`); each page reaches `<p>FilePages` on its own key (`Reported { job_id, origin }`) and the file row is touched only by the indexer's triple. `origin` `RUNNER` (default) or `REGENERATED` — on a regenerated page the images of that page that its new markdown no longer references (matched on the whole name, `![…](p001-img01.png)`, never as a substring) are dropped and released (`ImagesDropped { names }` on the file); `summary` and `pageCount` are the indexer's pair and move together, `estimatedTokens` is optional and only rides along with them (`INDEXER_FIELDS_TOGETHER` otherwise, `INVALID_INDEXER_VALUE` when negative; an indexing without an estimate clears a previous one; `ReportStored { job_id, done }` on the file when any of the three changes); an empty report is `NOTHING_TO_CHANGE` unless `done`; `done: true` stages `job.finish.v2` (see "Processing rules"). |
 
-The job. Every runner root validates `jobId` against the File's own `job_id`
-— the job of the step that is running (`JOB_NOT_ACTIVE` for any other job, for
-a file that never landed, and for a file that is not `PROCESSING`). `done:
+The job. Every runner root validates `jobId` against the file's running job —
+the last job of its log while the file is `PROCESSING` (`JOB_NOT_ACTIVE` for
+any other job, for a file that never landed, and for a file that is not
+`PROCESSING`). `done:
 true` on the report stages `integration.cmd.jobs.job.finish.v2 { job_id }` in
 the report's transaction — the only path to a completed job; Jobs' `completed`
 fact then moves the file to the next step or to `READY`.
@@ -378,7 +377,7 @@ run *steps* in order" — a list, never a graph.
 | Root | Shape |
 |---|---|
 | `<p>Rulesets: [DriveRuleset!]!` | `{ id, name, trigger, mediaTypes, steps[] { runnerType, options }, isDefault, createdBy, createdAt, updatedAt }`; empty for a caller the host's `ReadRulesets` gate refuses. |
-| `<p>CreateRuleset(id, name, trigger: Trigger!, mediaTypes: [String!]!, steps: [RulesetStepInput!]!, isDefault): RulesetSaved!` | gate `ManageRulesets`; `trigger` `UPLOAD \| REPROCESS \| REGENERATE_PAGE`; `mediaTypes` are `type/subtype`, `type/*` or `*` (lowercased, `INVALID_MEDIA_TYPE`); `name` unique per host, case-insensitive (`RULESET_NAME_TAKEN`); 1–32 steps of `{ runnerType, options? }` (`INVALID_RULESET`). One default per (trigger, media-type pattern): a second default whose patterns overlap an existing default's is `DEFAULT_ALREADY_SET` (`*` is its own bucket). Answers `{ id, unknownRunnerTypes }` — the steps whose runner type is not `ACTIVE` in the Jobs catalogue, a warning at save time. |
+| `<p>CreateRuleset(id, name, trigger: Trigger!, mediaTypes: [String!]!, steps: [RulesetStepInput!]!, isDefault): RulesetSaved!` | gate `ManageRulesets`; `trigger` `UPLOAD \| REPROCESS \| REGENERATE_PAGE`; `mediaTypes` are `type/subtype`, `type/*` or `*` (lowercased, `INVALID_MEDIA_TYPE`); `name` unique per host, case-insensitive (`RULESET_NAME_TAKEN`); 1–32 steps of `{ runnerType, options? }` (`INVALID_RULESET`). One default per (trigger, media-type pattern): a second default whose patterns overlap an existing default's is `DEFAULT_ALREADY_SET` (`*` is its own bucket). Answers `{ id }`. A runner type is a name the library never checks: Jobs judges it when the step's job is created (below). |
 | `<p>UpdateRuleset(id, name?, mediaTypes?, steps?, isDefault?): RulesetSaved!` | same rules; `NOTHING_TO_CHANGE` when nothing differs; the trigger is immutable. |
 | `<p>DeleteRuleset(id): MutationAck!` | `RULESET_NOT_FOUND`; files keep the `rulesetId` and the `steps` snapshot of a deleted rule. |
 
@@ -394,45 +393,14 @@ second rule), else `NO_RULESET_MATCHES` and the file is left as it is.
 rule, else `NO_RULESET_MATCHES` (a regeneration cannot be inferred from an
 upload snapshot). A rule never applies retroactively, and a rule edited or
 deleted while a chain runs never reaches that chain: the File keeps a `steps`
-snapshot taken when the rule fired. A rule saved on a host whose catalogue
-watch has not scanned yet is kept, every step reported in
-`unknownRunnerTypes`.
+snapshot taken when the rule fired.
 
 The chain, one step at a time, in the library's own transactions:
 
-1. the file enters the step (`PROCESSING`, `progress { stepIndex, stepCount,
-   runnerType }`) and a `step-deadline` message is scheduled. The deadline has
-   two stages. **Pickup**: `DriveHost::PICKUP_TIMEOUT` (default 1 h) from the
-   creation of the step's job until Jobs reports its run started — a runner
-   type with no live instance, whose job Jobs never dispatches, fails the file
-   within the hour instead of three days later. **Run silence**:
-   `DriveHost::STEP_TIMEOUT` (default 72 h, Jobs' own longest run) after the
-   run's last sign of life — its start, then every plan, step and runner
-   report (a report or a plan also ends the pickup stage, should the `started`
-   fact come late). A step past either has its job cancelled
-   (`job.cancel.v2`) and the file lands `FAILED` `timed_out`, open to a
-   reprocess. Jobs never fails a job no live runner picks up — its backstops
-   need a started run — so without it that file would sit in `PROCESSING` for
-   good. A host whose fleet may keep work queued longer than an hour raises
-   `PICKUP_TIMEOUT`. The pickup clock starts at the step's **first** job: a
-   launch deferred until the first catalogue scan does not eat into it, a
-   relaunch after a crossed cancel does not restart it. It starts when the job
-   is staged, so a Jobs or broker outage longer than `PICKUP_TIMEOUT` fails
-   the steps entered during it; and Jobs reports only a job's first run as
-   started, so a retry after a failed attempt waits under `STEP_TIMEOUT`.
-   Both are checked at registration (positive, within the scheduler's range,
-   and `PICKUP_TIMEOUT` ≤ `STEP_TIMEOUT`);
-2. the step's runner type must be `ACTIVE` in the mirrored catalogue, else
-   `FAILED` with `processingError = runner_type_unavailable` before any job
-   (Jobs would not refuse an unknown type — it would wait). On a host whose
-   catalogue watch has not completed its first scan yet — a fresh database —
-   the launch is **deferred**, not failed: the file waits in the step and a
-   `launch-retry` message asks again after `LAUNCH_RETRY_AFTER` (5 s), then
-   twice as long each time up to `LAUNCH_RETRY_CAP` (5 min), until the scan
-   lands — one warning at the first deferral — the pickup deadline bounding
-   the wait (it starts over when the step's first job is finally created);
-3. a `job_id` is minted on the File and `integration.cmd.jobs.job.create.v1`
-   is staged through the engine outbox: `producer`, `source_bc` and
+1. a step is a **job**: the library mints a UUIDv7 `job_id`, records it in the
+   file's job log (`drive.file_job`: the job, its step index, its initiator,
+   an empty log) and stages `integration.cmd.jobs.job.create.v1` through the
+   engine outbox in the same transaction: `producer`, `source_bc` and
    `config.host` are the host service, `source_entity_id` is the file (so Jobs
    enforces one live job per file; `RequestUpload` refuses a file id that is
    not a UUIDv7 with `INVALID_FILE_ID`, since Jobs would refuse every job of
@@ -442,63 +410,67 @@ The chain, one step at a time, in the library's own transactions:
    is a host-side sequence correlated by the file id, and every step is owned
    by the host (Jobs refuses a terminal parent, and a live one would make the
    step the parent runner's work);
-4. the eight `integration.evt.jobs.job.*.v1` facts are consumed on eight
+2. the eight `integration.evt.jobs.job.*.v1` facts are consumed on eight
    durables named `{service}-drive-job-…` (every durable the library binds,
-   the `upload-deadline`, `image-landed`, `step-deadline` and `launch-retry`
-   ones included, is namespaced by
-   `DriveHost::SERVICE`, so N hosts on one cluster never share a consumer)
-   and matched on the File's `job_id` — a fact about a job no file holds is
-   acknowledged and ignored, so every fact can be redelivered:
-   `plan_declared` fills `progress.plan`, `step_started` moves
-   `progress.currentIndex / currentLabel / at` (forward by index, or by a
-   newer start instant when a retry attempt restarts the plan),
-   `completed` launches the next step or lands `READY`
-   (`ProcessingFinished`) — only once the runner's final report landed
-   (`done_at`); a `completed` that arrives first is kept on the row and the
-   report advances the chain — `creation_rejected` / `failed` land `FAILED` with
+   the `upload-deadline` and `image-landed` ones included, is namespaced by
+   `DriveHost::SERVICE`, so N hosts on one cluster never share a consumer).
+   Each fact is **appended to the log of its own job** — `{kind, at,
+   ...the fact's payload as received}`, in arrival order — after the job's
+   file row is locked; a fact about a job no file holds is acknowledged and
+   ignored, so every fact can be redelivered. Only the file's **last** job
+   moves the file: `plan_declared` fills `progress.plan` and `step_started`
+   moves `progress.currentIndex / currentLabel / at` (the latest start wins,
+   whatever the arrival order; `ProgressChanged` only when the progress
+   moved), `completed` launches the next step or lands `READY`
+   (`ProcessingFinished`), `creation_rejected` / `failed` land `FAILED` with
    the reason code (`ProcessingFailed { reason }`), `cancelled` lands `FAILED`
-   `cancelled` — unless the cancel was ours: `DeleteFile`, `DeleteFolder` and
-   `delete_drive` stage `job.cancel.v2` for every file they remove while it
-   is `PROCESSING`, and the later `cancelled` fact finds no file. A
-   `creation_rejected` `duplicate_active_entity` means Jobs still holds a live
-   job on the file (`params.activeJobId`, checked against the file and host
-   Jobs names). A job the library had lost track of (a lost `job.finish`, a
-   restored host database) is kept on the file as a stray and cancelled at
-   once, and the file fails; every later launch cancels the stray again
-   before asking for its job, until Jobs queues a job of the file. When the
-   job Jobs names is a stray the library already cancelled — Jobs consumes
-   `job.cancel` and `job.create` on separate durables, so they may cross — the
-   step does not fail: it waits and relaunches through `launch-retry`,
-   bounded by its deadline. A job cancelled by the deadline is kept as a stray
-   the same way;
-5. the runner's `done: true` report records `done_at` and stages
-   `job.finish.v2` (or advances the chain directly when Jobs already said
-   `completed`).
+   `cancelled`. A fact of an older job — or a fact of the last job after its
+   first terminal fact (Jobs' facts ride separate durables, so a step may
+   arrive after the completion) — is logged and changes nothing;
+3. the runner's `done: true` report stages `job.finish.v2`; Jobs marks a job
+   completed only on its owner's finish, so its `completed` fact is what
+   advances the chain — the chain never moves on a report alone.
 
-`ruleset_id` and `steps` stay on the File for replay; `job_id`, `step_*`,
-`plan` and `progress_*` are null outside `PROCESSING`.
+The state is **computed, never stored**. The `drive.file_status` view reads
+each file's last job: no job and no `committed_at` → `PENDING`; no job and
+`committed_at` set → `READY`; a last job whose first terminal entry is
+`completed` → `READY` (the next step's job is appended in the transaction that
+logs the completion, so a completed last job means the chain is over);
+`failed`, `cancelled` or `creation_rejected` → `FAILED`, `processingError`
+read from that entry (a runner's `failure_report.reason_code`, else Jobs'
+`failure_cause`; a rejection's `reason_code`; `cancelled`); anything else, or
+an empty log → `PROCESSING`. Every gate, affordance, view and the
+`file_counts` helper read it; a gesture locks the file row before reading it,
+so two gestures never both see the same last job, and a partial unique index
+keeps at most one unsettled job per file whatever happens. `ruleset_id` and
+`steps` stay on the File for replay; `progress` is `null` outside
+`PROCESSING`.
+
+A file stuck in `PROCESSING` has one way out, the user's
+`<p>CancelProcessing` (above): the library keeps **no deadline** of its own.
+Jobs refuses at creation a runner type it knows and no longer accepts jobs
+for (`creation_rejected` `runner_type_retired`: the file fails at once), but
+it accepts a runner type it does not know and never dispatches its job — as it
+never fails a job no live runner picks up. Such a file waits in `PROCESSING`
+until someone cancels it; Jobs' `cancelled` then lands it `FAILED`, and a
+reprocess (a fixed rule, a started runner) starts over. The library keeps no
+copy of the runner-type catalogue: a rule may name any runner type.
+
+A `creation_rejected` `duplicate_active_entity` means Jobs still holds a live
+job on the file that the library does not count as live (a lost
+`job.finish`, a restored host database, a cancel and a create that crossed on
+Jobs' separate consumers). When the job Jobs names (`params.activeJobId`)
+belongs to this file of this host (`sourceEntityId`, `sourceBc`), the library
+stages `job.cancel.v2` for it; the rejection lands the file `FAILED`
+`duplicate_active_entity`, and the user's reprocess gets through once Jobs
+cancelled it (a cancel is idempotent). `DeleteFile`, `DeleteFolder` and
+`delete_drive` stage `job.cancel.v2` for the running job of every file they
+remove, and the later `cancelled` fact finds no file.
 
 The runner source presign (`<p>RunnerContext`'s `sourceUrl`) goes through the
 `drive_runner_sources` view scoped to the one file the job names, and only
-while that job is the file's active one — never a population of every
+while that job is the file's running one — never a population of every
 in-flight file.
-
-The catalogue mirror: `drive.known_runner_type` is fed by
-`br_drive::watch_runner_types` — a boot scan of `PUBLISHED_LANGUAGE` under
-`jobs.runner_type.` (recorded in `drive.catalogue_scan`) then a KV watch,
-tolerant of an entry that does not decode (warned and skipped) and strict on
-the wire: an entry whose `version` is not `contract_jobs::runner::WIRE_VERSION`
-is logged as an error and treated as unknown, never as active; the watch is
-restarted after a fault. The host starts it next to the engine and stops it at
-shutdown — engine 0.3.0 gives a library no boot or shutdown hook, so the
-library cannot own that lifecycle; a host that forgets it is told loudly: a
-warning on every rule save and every deferred launch, every rule saved
-reporting all its steps as unknown, and every chain waiting in its first step
-until its deadline. It is a hand-rolled watch and not the
-engine's mirror kit because the kit requires a `/`-terminated consumed prefix
-and the catalogue is published by a non-engine producer under a dot prefix
-with a per-value `version`; the watch is replaced by the kit when the kit
-accepts such a prefix.
 
 ## Erase
 
@@ -510,13 +482,15 @@ the engine's `PersonErased` fact. `DriveHost::erase_mode` picks the mode:
 
 - `Anonymise` (default): every `created_by` / `updated_by` the person left on
   drives, files, pages, labels, label links and rules, and the `triggered_by`
-  of the chains they started, is rewritten to `br_drive::REDACTED_PERSON`
+  of the jobs they started (on the job log), is rewritten to `br_drive::REDACTED_PERSON`
   (the nil UUID); nothing is deleted.
 - `Delete`: every file the person created is deleted (its pages, images and
   label links cascade, its objects are purged through the manifest), then the
   rest is anonymised. A job still running on such a file is not cancelled —
   the erase pipeline's `Ops` has no outbound identity — the deleted file
-  refuses the runner's next call and Jobs times the job out. Drives
+  refuses the runner's next call, and the job is left to Jobs (its run
+  backstops; a job no runner picked up waits for an administrator's cancel in
+  Jobs — the file, and its cancel affordance, are gone). Drives
   are the host's to delete (`delete_drive`). The erase context cannot stage a
   projector reset, so live sessions are told file by file up to
   `BULK_RESET_THRESHOLD` and catch up on their next reset past it.
@@ -535,12 +509,14 @@ and changes nothing.
 `INVALID_PAGE_ORIGIN`, `PAGE_NOT_FOUND`, `INDEXER_FIELDS_TOGETHER`,
 `INVALID_INDEXER_VALUE`, `BATCH_TOO_LARGE`, `RULESET_NOT_FOUND`,
 `RULESET_NAME_TAKEN`, `INVALID_RULESET`, `DEFAULT_ALREADY_SET`,
-`RULESET_MISMATCH`, `NO_RULESET_MATCHES`, `RUNNER_TYPE_UNAVAILABLE`,
+`RULESET_MISMATCH`, `NO_RULESET_MATCHES`, `FILE_NOT_PROCESSING`,
 `LABEL_NOT_FOUND`, `LABEL_NAME_TAKEN`,
 `INVALID_LABEL` — plus the host's own codes through the gate and the hooks. On a `FAILED` file, `processingError` carries the runner's
 `reason_code` verbatim (Jobs' `creation_rejected` codes included, e.g.
-`duplicate_active_entity`), or one of the library's:
-`runner_type_unavailable`, `timed_out`, `cancelled`.
+`duplicate_active_entity`, `runner_type_retired`), Jobs' `failure_cause`
+when the runner sent no report, or `cancelled`; a file that was `FAILED`
+before migration `9121000007` keeps its stored error, and one found
+`PROCESSING` without a job reads `interrupted`.
 
 ## Follow-ups
 
@@ -549,26 +525,20 @@ and changes nothing.
   Jobs' timeout, and past
   `BULK_RESET_THRESHOLD` deleted files, live `DriveChanged` sessions catch up
   on their next reset instead of receiving one `Remove` per file.
-- The catalogue watch stamps `seen_at` and `scanned_at` from the database
-  clock: it runs outside the engine's `Ops` and has no engine clock.
 - `select_ruleset` reads the defaults of one trigger per gesture — fine at a
   host's scale (tens of rules), noted for the record.
-- The catalogue watch's health is not on the engine's readiness: the readiness
-  assembly is the engine's, and its mirror-handle registration is a
-  test-support API in 0.3.0. Since 0.2 a chain fired before the first scan is
-  deferred rather than failed, so readiness is no longer what protects a fresh
-  host; a readiness reason for the watch still needs the engine hook.
-- A deferred launch is woken by its own backed-off retry, not by the first
-  catalogue scan: the watch runs outside the engine's pipelines and stages no
-  impact. Waking the deferred files from the scan would need the watch to
-  publish one `launch-retry` per waiting file.
-- Files already `PROCESSING` when migration `9121000006` is applied carry no
-  step clock and get no deadline; a host upgrading with chains in flight lets
-  them finish (or deletes them) — the deadline covers every step entered
-  after the upgrade.
+- A job Jobs holds on a file the library cannot tell about is cancelled only
+  on a `duplicate_active_entity` rejection: nothing polls Jobs. A manual
+  retry of a failed job in Jobs is not followed either — the file settled on
+  the job's first terminal fact (`FAILED`), later facts are logged only, and
+  the runner of the retried run is refused `JOB_NOT_ACTIVE`; the user
+  reprocesses instead.
+- A runner report the library refuses (an invalid batch, say) is a refused
+  mutation: its transaction rolls back, so nothing is logged on the job and
+  the runner decides whether to fail its run with Jobs.
 - The Jobs double serializes the commands it reads, so the crossing of a
-  `job.cancel` and a `job.create` staged together (separate durables in
-  Jobs) is handled in the library but not reproduced by the suite.
+  `job.cancel` and a `job.create` on Jobs' separate durables is modelled by
+  dropping cancels (`drop_cancels`), not reproduced as a race.
 - Engine 0.3.0's `Query::download` populates the projector with its default
   window and then asks membership by key, so the runner's source presign
   cannot be told which file it is about through the window. The runner
@@ -584,9 +554,8 @@ facts, faults, the `DriveHost` impl), one `workspace` slice (the host object a
 drive hangs off, owner-only gate: `workspaceCreate` / `workspaceDelete` /
 `workspaceTransfer` / `workspaceProtectFile`; the `workspace:manage` scope on
 a human passport is its `ManageRulesets` gate, any human reads the rules), the
-embedded `drive` slice, the catalogue watch started at boot (or later, for
-the scenarios that model a fresh host), a 20 s `PICKUP_TIMEOUT` and a 30 s
-`STEP_TIMEOUT` so the timeout scenarios run in the suite, a
+embedded `drive` slice (its `CancelProcessing` gate allows a workspace's
+owner, like every per-file gesture), a
 `{"hold": true}` metadata rule refusing to move or delete a file (the per-file
 rule the folder scenarios meet), a `workspace:sweep` scope allowed folder
 gestures but no file, `src/bin/service.rs` handing everything to the engine boot kit, and `tests/`
@@ -596,10 +565,12 @@ the host in process and drives it over GraphQL and a real
 real `contract-jobs` DTOs on the real subjects and reads the commands the host
 stages for `jobs`. It judges every `job.create` the way Jobs does, in Jobs' order — the inputs
 `svc-jobs` refuses before its domain (non-v7 ids, a blank or over-long display
-name, a source not named by its producer), a reused id, a second live job on
-one source entity (`duplicate_active_entity`, naming the live job), a
-self-named, terminal, deleted or unknown parent — answering
-`creation_rejected` on its own and `cancelled` for a live job it cancels, so a
+name, a source not named by its producer), a runner type it retired
+(`runner_type_retired`; any other type is accepted, known or not), a reused
+id, a second live job on one source entity (`duplicate_active_entity`,
+naming the live job), a self-named, terminal, deleted or unknown parent —
+answering `creation_rejected` on its own and `cancelled` for a live job it
+cancels (or dropping every cancel, to model one Jobs consumed too early), so a
 contract violation fails the suite instead of passing it; the fake runner exercises the three runner roots.
 
 ## Running the example's suite

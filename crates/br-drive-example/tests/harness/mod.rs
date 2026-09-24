@@ -36,7 +36,6 @@ pub struct World {
 pub struct WorldOptions {
     pub reaper_interval: Duration,
     pub upload_window: Duration,
-    pub watch_catalogue: bool,
 }
 
 impl Default for WorldOptions {
@@ -44,7 +43,6 @@ impl Default for WorldOptions {
         Self {
             reaper_interval: Duration::from_millis(150),
             upload_window: HostSettings::DEFAULT_UPLOAD_WINDOW,
-            watch_catalogue: true,
         }
     }
 }
@@ -79,7 +77,6 @@ impl World {
                 settings: HostSettings {
                     upload_window: options.upload_window,
                 },
-                watch_catalogue: options.watch_catalogue,
             },
         )
         .await
@@ -215,11 +212,15 @@ impl World {
     }
 
     pub async fn job_of(&self, file_id: Uuid) -> Option<Uuid> {
-        sqlx::query_scalar("SELECT job_id FROM drive.file WHERE id = $1")
-            .bind(file_id)
-            .fetch_one(&self.db.app)
-            .await
-            .expect("the file row carries its job")
+        sqlx::query_scalar(
+            "SELECT last_job_id FROM drive.file_status \
+             WHERE file_id = $1 AND processing_state = 'processing'",
+        )
+        .bind(file_id)
+        .fetch_optional(&self.db.app)
+        .await
+        .expect("read the file's status")
+        .flatten()
     }
 
     pub async fn await_job(&self, file_id: Uuid) -> Uuid {
@@ -251,27 +252,6 @@ impl World {
             assert!(
                 std::time::Instant::now() < deadline,
                 "{file_id} never reached {state}: {file}"
-            );
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
-    }
-
-    pub async fn await_known_runner_type(&self, runner_type: &str, lifecycle: Option<&str>) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            let found: Option<String> = sqlx::query_scalar(
-                "SELECT lifecycle FROM drive.known_runner_type WHERE runner_type = $1",
-            )
-            .bind(runner_type)
-            .fetch_optional(&self.db.app)
-            .await
-            .expect("read the catalogue mirror");
-            if found.as_deref() == lifecycle {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the catalogue mirror never showed {runner_type} as {lifecycle:?} (found {found:?})"
             );
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
@@ -357,50 +337,39 @@ impl World {
             .expect("read the blob row")
     }
 
-    /// Delivers a `drive_file.{verb}` command to the host as its scheduler or
-    /// the broker would — a redelivery, or a message outliving its step.
-    pub async fn send_file_command(&self, verb: &str, payload: serde_json::Value) {
-        use br_core_integration::{Actor, EventMetadata, IntegrationCommand, ServiceAccountId};
-        let command = IntegrationCommand::new(
-            Uuid::now_v7(),
-            format!("drive_file.{verb}"),
-            1,
-            chrono::Utc::now(),
-            EventMetadata::new(
-                Actor::Service(ServiceAccountId::from(Uuid::now_v7())),
-                Uuid::now_v7(),
-            ),
-            payload,
-        );
-        let bytes = serde_json::to_vec(&command).expect("the command encodes");
-        let client = async_nats::connect(self.nats_server.url())
-            .await
-            .expect("dial the ephemeral broker");
-        let js = async_nats::jetstream::new(client);
-        js.publish(
-            format!(
-                "integration.cmd.{}.drive_file.{verb}.v1",
-                br_drive_example::SERVICE
-            ),
-            bytes.into(),
+    /// The job log of a file, oldest job first: each job's id, step and
+    /// entries — what the library recorded of every Jobs fact it received.
+    pub async fn job_log(&self, file_id: Uuid) -> Vec<(Uuid, i32, Vec<serde_json::Value>)> {
+        let rows: Vec<(Uuid, i32, serde_json::Value)> = sqlx::query_as(
+            "SELECT job_id, step_index, events FROM drive.file_job \
+             WHERE file_id = $1 ORDER BY created_at, job_id",
         )
+        .bind(file_id)
+        .fetch_all(&self.db.app)
         .await
-        .expect("publish the command")
-        .await
-        .expect("the stream acks the command");
+        .expect("read the file's job log");
+        rows.into_iter()
+            .map(|(job, step, events)| {
+                let events = events.as_array().cloned().unwrap_or_default();
+                (job, step, events)
+            })
+            .collect()
     }
 
-    /// The step a file is in and the instant it was entered — what a step
-    /// message names.
-    pub async fn step_clock(
-        &self,
-        file_id: Uuid,
-    ) -> (Option<i32>, Option<chrono::DateTime<chrono::Utc>>) {
-        sqlx::query_as("SELECT step_index, step_entered_at FROM drive.file WHERE id = $1")
-            .bind(file_id)
-            .fetch_one(&self.db.app)
-            .await
-            .expect("the file row carries its step clock")
+    /// The kinds of the entries logged on one job, in arrival order.
+    pub async fn job_events(&self, job_id: Uuid) -> Vec<String> {
+        let events: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT events FROM drive.file_job WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_optional(&self.db.app)
+                .await
+                .expect("read the job's log");
+        events
+            .and_then(|events| events.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|entry| entry["kind"].as_str().map(str::to_string))
+            .collect()
     }
 
     pub async fn send_upload_deadline(&self, file_id: Uuid) {

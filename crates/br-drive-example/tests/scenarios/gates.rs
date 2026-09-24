@@ -123,7 +123,7 @@ async fn a_stranger_learns_nothing_of_a_file_it_cannot_see_and_changes_nothing()
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
     let stranger = passport(Uuid::now_v7());
-    install_render_rule(&world, &jobs, &manager).await;
+    install_render_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
     let elsewhere = world.create_workspace(&stranger, "elsewhere").await;
     let processing = upload(

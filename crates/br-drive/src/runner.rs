@@ -340,10 +340,6 @@ pub fn runner_report<'m, H: DriveHost>(
         file.require_active_job(input.job_id)?;
         let by = cx.principal().id().as_uuid();
         let now = cx.now().as_datetime();
-        // A report is a sign of life of a started run: the step's deadline
-        // moves back (and the pickup stage is over, should the started fact
-        // come late).
-        crate::processing::run_alive(&mut file, now);
 
         let mut dropped = Vec::new();
         if input.origin == PageOrigin::Regenerated {
@@ -396,29 +392,16 @@ pub fn runner_report<'m, H: DriveHost>(
                 done: input.done,
             });
         }
-        if input.done && file.done_at.is_none() {
-            file.done_at = Some(now);
-            dirty = true;
-            if file.completed_at.is_some() {
-                // Jobs already said the job is over: the report is what the
-                // chain was waiting for.
-                if dirty {
-                    file.updated_at = now;
-                }
-                if let Some(cause) = cause {
-                    crate::file::file_changed::<H>(cx, &file, cause)?;
-                }
-                crate::processing::advance(cx, &mut file).await?;
-                return Ok(());
-            }
-            crate::processing::finish_active_job(cx, &file)?;
+        // The final report hands the job back to Jobs: `job.finish` is the only
+        // path to a completed job, and Jobs' `completed` advances the chain.
+        // A repeated `done` asks again; Jobs refuses it as already terminal.
+        if input.done {
+            crate::processing::finish_job(cx, input.job_id)?;
         }
-        // Saved every time for the step's sign of life; `updated_at` moves only
-        // with what the file shows.
         if dirty {
             file.updated_at = now;
+            cx.save(&file).await?;
         }
-        cx.save(&file).await?;
         if let Some(cause) = cause {
             crate::file::file_changed::<H>(cx, &file, cause)?;
         }

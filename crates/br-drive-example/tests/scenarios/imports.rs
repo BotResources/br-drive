@@ -194,7 +194,7 @@ async fn an_import_is_the_hosts_privilege_on_a_ready_file_and_obeys_every_rendit
         },
     )
     .await;
-    install_render_rule(&world, &jobs, &manager).await;
+    install_render_rule(&world, &manager).await;
     let processing = upload(
         &world,
         &owner,
@@ -309,7 +309,7 @@ async fn a_migration_commits_an_upload_without_processing_under_an_upload_rule_t
     let importer = service_passport(&[IMPORT_SCOPE]);
     let runner = service_passport(&[RUNNER_SCOPE]);
     let human_importer = manager_passport_with_scopes(Uuid::now_v7(), "Ada", &[IMPORT_SCOPE]);
-    install_render_rule(&world, &jobs, &manager).await;
+    install_render_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
     let mut files = drive_subscription(&world, &owner, drive).await;
     quiet(&mut files).await;
@@ -401,7 +401,7 @@ async fn a_migration_commits_an_upload_without_processing_under_an_upload_rule_t
             node["view"]["processingState"] != "READY"
                 || matches!(
                     node["cause"]["kind"].as_str(),
-                    Some("ProcessingStarted" | "LaunchDeferred" | "ProcessingFailed")
+                    Some("ProcessingStarted" | "ProcessingFailed")
                 )
         },
     )
@@ -522,7 +522,7 @@ async fn the_hosts_own_object_republishes_as_the_files_of_its_drive_land_fail_mo
     counts_reach(&mut workspaces, library, 1, 1).await;
 
     // When: a second file enters a chain that fails
-    install_render_rule(&world, &jobs, &manager).await;
+    install_render_rule(&world, &manager).await;
     let doomed = upload(
         &world,
         &owner,

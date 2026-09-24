@@ -8,17 +8,37 @@ use service_engine::{BlobRef, Cohort};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
-use super::aggregate::{FileRow, PageOrigin, ProcessingState};
+use super::aggregate::{FileRow, FileStatus, PageOrigin, ProcessingState};
 use crate::host::{DRIVE_DIM, DriveHost};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
+use crate::processing::FileJob;
 use crate::title::FileTitle;
 
+/// The columns of `drive.file` itself, in insert order.
 pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, title, protected, media_type, size_bytes, sha256, blob_ref, \
-     processing_state, processing_error, metadata, summary, page_count, estimated_tokens, \
-     ruleset_id, steps, step_index, step_count, step_runner_type, job_id, plan, \
-     progress_index, progress_label, progress_at, triggered_by, done_at, completed_at, \
-     step_entered_at, step_alive_at, run_started_at, stray_job_id, created_by, created_at, updated_at";
+     committed_at, metadata, summary, page_count, estimated_tokens, ruleset_id, steps, \
+     created_by, created_at, updated_at";
+
+/// The columns of `drive.file_status` a file row reads beside its own: the
+/// computed state and error, and the file's last job.
+const STATUS_COLUMNS: &str = "processing_state, processing_error, last_job_id, last_job_step, \
+     last_job_triggered_by, last_job_events, last_job_created_at";
+
+/// The file table joined to its computed status, aliased `f` and `s`.
+pub(crate) const FILE_FROM: &str = "drive.file f JOIN drive.file_status s ON s.file_id = f.id";
+
+/// The select list of a file row read through `FILE_FROM`, every column
+/// named `{prefix}{column}`.
+pub(crate) fn file_select(prefix: &str) -> String {
+    let file = FILE_COLUMNS
+        .split(", ")
+        .map(|column| format!("f.{column} AS {prefix}{column}", column = column.trim()));
+    let status = STATUS_COLUMNS
+        .split(", ")
+        .map(|column| format!("s.{column} AS {prefix}{column}", column = column.trim()));
+    file.chain(status).collect::<Vec<_>>().join(", ")
+}
 
 /// The library is the only writer of these columns; a value that does not
 /// decode is reported and read as absent rather than breaking the file's view.
@@ -69,6 +89,30 @@ pub(crate) fn row_to_file_prefixed<H>(
     let name: String = row.get(column("name").as_str());
     let title: String = row.get(column("title").as_str());
     let media_type: String = row.get(column("media_type").as_str());
+    let last_job_id: Option<Uuid> = row.get(column("last_job_id").as_str());
+    let last_job = match last_job_id {
+        Some(job_id) => {
+            let events: Option<serde_json::Value> = row.get(column("last_job_events").as_str());
+            Some(FileJob {
+                job_id,
+                step_index: row
+                    .get::<Option<i32>, _>(column("last_job_step").as_str())
+                    .unwrap_or_default(),
+                triggered_by: decode_json(
+                    "a job's initiator",
+                    row.get(column("last_job_triggered_by").as_str()),
+                ),
+                events: match events {
+                    Some(serde_json::Value::Array(events)) => events,
+                    _ => Vec::new(),
+                },
+                created_at: row
+                    .get::<Option<DateTime<Utc>>, _>(column("last_job_created_at").as_str())
+                    .unwrap_or_default(),
+            })
+        }
+        None => None,
+    };
     Ok(FileRow {
         id: row.get(column("id").as_str()),
         drive_id: row.get(column("drive_id").as_str()),
@@ -80,45 +124,43 @@ pub(crate) fn row_to_file_prefixed<H>(
         size_bytes: row.get(column("size_bytes").as_str()),
         sha256: sha256(row.get(column("sha256").as_str()))?,
         blob_ref: row.get(column("blob_ref").as_str()),
-        processing_state: ProcessingState::from_db_str(&state).map_err(config_error)?,
-        processing_error: row.get(column("processing_error").as_str()),
+        committed_at: row.get(column("committed_at").as_str()),
         metadata: row.get(column("metadata").as_str()),
         summary: row.get(column("summary").as_str()),
         page_count: row.get(column("page_count").as_str()),
         estimated_tokens: row.get(column("estimated_tokens").as_str()),
         ruleset_id: row.get(column("ruleset_id").as_str()),
         steps: decode_json("a file's steps snapshot", row.get(column("steps").as_str())),
-        step_index: row.get(column("step_index").as_str()),
-        step_count: row.get(column("step_count").as_str()),
-        step_runner_type: row.get(column("step_runner_type").as_str()),
-        job_id: row.get(column("job_id").as_str()),
-        plan: row.get(column("plan").as_str()),
-        progress_index: row.get(column("progress_index").as_str()),
-        progress_label: row.get(column("progress_label").as_str()),
-        progress_at: row.get(column("progress_at").as_str()),
-        triggered_by: decode_json(
-            "a file's initiator",
-            row.get(column("triggered_by").as_str()),
-        ),
-        done_at: row.get(column("done_at").as_str()),
-        completed_at: row.get(column("completed_at").as_str()),
-        step_entered_at: row.get(column("step_entered_at").as_str()),
-        step_alive_at: row.get(column("step_alive_at").as_str()),
-        run_started_at: row.get(column("run_started_at").as_str()),
-        stray_job_id: row.get(column("stray_job_id").as_str()),
         created_by: row.get(column("created_by").as_str()),
         created_at: row.get(column("created_at").as_str()),
         updated_at: row.get(column("updated_at").as_str()),
+        status: FileStatus {
+            state: ProcessingState::from_db_str(&state).map_err(config_error)?,
+            error: row.get(column("processing_error").as_str()),
+            last_job,
+        },
         host: PhantomData,
     })
 }
 
-pub(crate) fn file_columns_as(alias: &str, prefix: &str) -> String {
-    FILE_COLUMNS
-        .split(", ")
-        .map(|column| format!("{alias}.{column} AS {prefix}{column}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+/// The status of one file as `drive.file_status` computes it now — read again
+/// after the library wrote the file's job log in the same transaction.
+pub(crate) async fn status_of(
+    conn: &mut PgConnection,
+    file_id: Uuid,
+) -> Result<Option<FileStatus>, EngineError> {
+    let row = sqlx::query(&format!(
+        "SELECT {} FROM {FILE_FROM} WHERE f.id = $1",
+        file_select("")
+    ))
+    .bind(file_id)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row
+        .as_ref()
+        .map(row_to_file::<()>)
+        .transpose()?
+        .map(|file| file.status))
 }
 
 pub struct FileStore<H>(PhantomData<fn() -> H>);
@@ -136,7 +178,8 @@ impl<H: DriveHost> Persistence for FileStore<H> {
     ) -> BoxFuture<'a, Result<Option<FileRow<H>>, EngineError>> {
         Box::pin(async move {
             let row = sqlx::query(&format!(
-                "SELECT {FILE_COLUMNS} FROM drive.file WHERE id = $1"
+                "SELECT {} FROM {FILE_FROM} WHERE f.id = $1",
+                file_select("")
             ))
             .bind(key)
             .fetch_optional(conn)
@@ -158,7 +201,8 @@ impl<H: DriveHost> Persistence for FileStore<H> {
     ) -> BoxFuture<'a, Result<Vec<(Uuid, FileRow<H>)>, EngineError>> {
         Box::pin(async move {
             let rows = sqlx::query(&format!(
-                "SELECT {FILE_COLUMNS} FROM drive.file WHERE id = ANY($1)"
+                "SELECT {} FROM {FILE_FROM} WHERE f.id = ANY($1)",
+                file_select("")
             ))
             .bind(keys)
             .fetch_all(conn)
@@ -177,14 +221,9 @@ impl<H: DriveHost> Persistence for FileStore<H> {
         Box::pin(async move {
             sqlx::query(
                 "UPDATE drive.file SET drive_id = $2, path = $3, name = $4, protected = $5, \
-                   processing_state = $6, processing_error = $7, metadata = $8, summary = $9, \
-                   page_count = $10, estimated_tokens = $11, updated_at = $12, \
-                   ruleset_id = $13, steps = $14, step_index = $15, step_count = $16, \
-                   step_runner_type = $17, job_id = $18, plan = $19, progress_index = $20, \
-                   progress_label = $21, progress_at = $22, triggered_by = $23, \
-                   done_at = $24, completed_at = $25, step_entered_at = $26, \
-                   stray_job_id = $27, step_alive_at = $28, title = $29, \
-                   run_started_at = $30 \
+                   committed_at = $6, metadata = $7, summary = $8, page_count = $9, \
+                   estimated_tokens = $10, updated_at = $11, ruleset_id = $12, steps = $13, \
+                   title = $14 \
                  WHERE id = $1",
             )
             .bind(file.id)
@@ -192,8 +231,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.path.as_str())
             .bind(file.name.as_str())
             .bind(file.protected)
-            .bind(file.processing_state.as_str())
-            .bind(&file.processing_error)
+            .bind(file.committed_at)
             .bind(&file.metadata)
             .bind(&file.summary)
             .bind(file.page_count)
@@ -201,25 +239,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.updated_at)
             .bind(file.ruleset_id)
             .bind(encode_json("a file's steps snapshot", file.steps.as_ref())?)
-            .bind(file.step_index)
-            .bind(file.step_count)
-            .bind(&file.step_runner_type)
-            .bind(file.job_id)
-            .bind(&file.plan)
-            .bind(file.progress_index)
-            .bind(&file.progress_label)
-            .bind(file.progress_at)
-            .bind(encode_json(
-                "a file's initiator",
-                file.triggered_by.as_ref(),
-            )?)
-            .bind(file.done_at)
-            .bind(file.completed_at)
-            .bind(file.step_entered_at)
-            .bind(file.stray_job_id)
-            .bind(file.step_alive_at)
             .bind(file.title.as_str())
-            .bind(file.run_started_at)
             .execute(conn)
             .await?;
             Ok(())
@@ -235,8 +255,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             sqlx::query(&format!(
                 "INSERT INTO drive.file ({FILE_COLUMNS}) VALUES \
                  ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                  $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, \
-                  $30, $31, $32, $33, $34, $35, $36)"
+                  $16, $17, $18, $19, $20)"
             ))
             .bind(file.id)
             .bind(file.drive_id)
@@ -248,32 +267,13 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.size_bytes)
             .bind(file.sha256.to_vec())
             .bind(file.blob_ref)
-            .bind(file.processing_state.as_str())
-            .bind(&file.processing_error)
+            .bind(file.committed_at)
             .bind(&file.metadata)
             .bind(&file.summary)
             .bind(file.page_count)
             .bind(file.estimated_tokens)
             .bind(file.ruleset_id)
             .bind(encode_json("a file's steps snapshot", file.steps.as_ref())?)
-            .bind(file.step_index)
-            .bind(file.step_count)
-            .bind(&file.step_runner_type)
-            .bind(file.job_id)
-            .bind(&file.plan)
-            .bind(file.progress_index)
-            .bind(&file.progress_label)
-            .bind(file.progress_at)
-            .bind(encode_json(
-                "a file's initiator",
-                file.triggered_by.as_ref(),
-            )?)
-            .bind(file.done_at)
-            .bind(file.completed_at)
-            .bind(file.step_entered_at)
-            .bind(file.step_alive_at)
-            .bind(file.run_started_at)
-            .bind(file.stray_job_id)
             .bind(file.created_by)
             .bind(file.created_at)
             .bind(file.updated_at)

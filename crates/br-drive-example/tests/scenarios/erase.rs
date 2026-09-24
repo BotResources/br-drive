@@ -1,10 +1,9 @@
 use std::time::Duration;
 
-use contract_jobs::catalog::RunnerTypeLifecycle;
 use uuid::Uuid;
 
 use crate::harness::archive::ARCHIVE_RUNNER_SCOPE;
-use crate::harness::runner::{RENDER, RUNNER_SCOPE, Report, install_render_rule, report};
+use crate::harness::runner::{RUNNER_SCOPE, Report, install_render_rule, report};
 use crate::harness::upload::{Ticket, UploadRequest, post_bytes, sha256_hex, upload};
 use crate::harness::{ArchiveHost, JobsStandIn, World, manager_passport, ok, service_passport};
 
@@ -22,11 +21,10 @@ async fn created_by(world: &World, table: &str, column: &str, id: Uuid) -> Uuid 
 #[tokio::test]
 async fn anonymising_a_person_rewrites_every_id_they_left_and_keeps_their_files() {
     let world = World::start("pod-erase-anonymise").await;
-    let jobs = JobsStandIn::attach(&world).await;
     let person_id = Uuid::now_v7();
     let person = manager_passport(person_id, "Ada");
     let runner = service_passport(&[RUNNER_SCOPE]);
-    install_render_rule(&world, &jobs, &person).await;
+    install_render_rule(&world, &person).await;
     let drive = world.create_workspace(&person, "mine").await;
     let file_id = upload(
         &world,
@@ -108,8 +106,8 @@ async fn anonymising_a_person_rewrites_every_id_they_left_and_keeps_their_files(
             .unwrap();
     assert_eq!(link_by, REDACTED);
     let initiator: serde_json::Value =
-        sqlx::query_scalar("SELECT triggered_by FROM drive.file WHERE id = $1")
-            .bind(file_id)
+        sqlx::query_scalar("SELECT triggered_by FROM drive.file_job WHERE job_id = $1")
+            .bind(job_id)
             .fetch_one(&world.db.app)
             .await
             .unwrap();
@@ -149,14 +147,11 @@ async fn deleting_a_person_removes_their_files_and_purges_their_objects() {
     let other_id = Uuid::now_v7();
     let other = manager_passport(other_id, "Cy");
     let runner = service_passport(&[ARCHIVE_RUNNER_SCOPE]);
-    jobs.declare_runner_type(RENDER, RunnerTypeLifecycle::Active)
-        .await;
-    archive.await_known_runner_type(RENDER).await;
     ok(&archive
         .gql(
             &world,
             &person,
-            "mutation($id:UUID!){archiveVaultCreateRuleset(id:$id,name:\"render\",trigger:UPLOAD,mediaTypes:[\"text/plain\"],steps:[{runnerType:\"render\"}],isDefault:true){id unknownRunnerTypes}}",
+            "mutation($id:UUID!){archiveVaultCreateRuleset(id:$id,name:\"render\",trigger:UPLOAD,mediaTypes:[\"text/plain\"],steps:[{runnerType:\"render\"}],isDefault:true){id}}",
             serde_json::json!({ "id": Uuid::now_v7() }),
         )
         .await);

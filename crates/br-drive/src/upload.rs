@@ -15,7 +15,7 @@ use crate::blob::DriveSource;
 use crate::drive::DriveRow;
 use crate::fault::{DriveFault, DriveReactionFault, codes};
 use crate::file::store;
-use crate::file::{FileCause, FileRow, ProcessingState};
+use crate::file::{FileCause, FileRow, FileStatus};
 use crate::host::{DriveHost, DriveRequest};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
@@ -123,32 +123,17 @@ pub fn request_upload<'m, H: DriveHost>(
                 .map_err(|_| DriveFault::Refused(codes::FILE_TOO_LARGE))?,
             sha256: *digest.as_bytes(),
             blob_ref: blob.reference().as_uuid(),
-            processing_state: ProcessingState::Pending,
-            processing_error: None,
+            committed_at: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             summary: None,
             page_count: None,
             estimated_tokens: None,
             ruleset_id: None,
             steps: None,
-            step_index: None,
-            step_count: None,
-            step_runner_type: None,
-            job_id: None,
-            plan: None,
-            progress_index: None,
-            progress_label: None,
-            progress_at: None,
-            triggered_by: None,
-            done_at: None,
-            completed_at: None,
-            step_entered_at: None,
-            step_alive_at: None,
-            run_started_at: None,
-            stray_job_id: None,
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,
+            status: FileStatus::pending(),
             host: PhantomData,
         };
         cx.create(&file).await?;
@@ -188,8 +173,9 @@ pub fn commit_upload<'m, H: DriveHost>(
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.commit_gate(cx.principal()).require()?;
         require_landed(&reader, &file).await?;
-        file.processing_state = ProcessingState::Ready;
-        file.updated_at = cx.now().as_datetime();
+        let now = cx.now().as_datetime();
+        file.committed_at = Some(now);
+        file.updated_at = now;
         let ruleset = select_ruleset(
             cx.connection(),
             Trigger::Upload,
@@ -267,7 +253,9 @@ pub fn upload_deadline<'r, H: DriveHost>(
         let Some(file) = cx.load::<FileRow<H>>(&message.file_id).await? else {
             return Ok(());
         };
-        if file.processing_state != ProcessingState::Pending {
+        // An upload never confirmed: its object never arrived, or arrived and
+        // was never committed.
+        if file.committed_at.is_some() {
             return Ok(());
         }
         cx.delete(&file).await?;

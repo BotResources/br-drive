@@ -8,7 +8,6 @@ use br_core_integration::{
     Actor, EventCoords, EventMetadata, IntegrationCommand, IntegrationEvent, ServiceAccountId,
 };
 use chrono::Utc;
-use contract_jobs::catalog::{RunnerType, RunnerTypeLifecycle, runner_type_key};
 use contract_jobs::command::{CancelJob, CreateJob, FinishJob};
 use contract_jobs::event::{
     EVENT_TYPE_CANCELLED, EVENT_TYPE_COMPLETED, EVENT_TYPE_CREATION_REJECTED, EVENT_TYPE_FAILED,
@@ -26,7 +25,7 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use service_engine::nats::{INTEGRATION_CMD, KV_PUBLISHED_LANGUAGE};
+use service_engine::nats::INTEGRATION_CMD;
 use uuid::Uuid;
 
 use super::World;
@@ -49,6 +48,12 @@ struct Held {
 struct Ledger {
     jobs: HashMap<Uuid, Held>,
     rejections: HashMap<Uuid, JobCreationRejected>,
+    /// Runner types Jobs knows and no longer accepts jobs for. Any other type,
+    /// known or not, is accepted — an unknown one is then never dispatched.
+    retired: std::collections::HashSet<String>,
+    /// Drop every `job.cancel` unread, as Jobs does with a cancel it consumes
+    /// before the creation of the job it names.
+    dropping_cancels: bool,
 }
 
 /// The input checks `svc-jobs` runs before the domain (`app/create.rs::build`
@@ -95,8 +100,8 @@ fn malformed(create: &CreateJob) -> Option<(&'static str, &'static str)> {
 }
 
 impl Ledger {
-    /// The verdict Jobs would give, in Jobs' order (input, id reuse, source,
-    /// parent): `None` to accept, else the rejection.
+    /// The verdict Jobs would give, in Jobs' order (input, runner type, id
+    /// reuse, source, parent): `None` to accept, else the rejection.
     fn judge(&self, create: &CreateJob) -> Option<JobCreationRejected> {
         let reject = |reason_code: &str, mut params: serde_json::Map<String, Value>| {
             params.insert("jobId".into(), Value::String(create.job_id.to_string()));
@@ -115,6 +120,12 @@ impl Ledger {
         };
         if let Some((code, field)) = malformed(create) {
             return reject(code, named("field", field.to_string()));
+        }
+        if self.retired.contains(&create.runner_type) {
+            return reject(
+                "runner_type_retired",
+                named("runnerType", create.runner_type.clone()),
+            );
         }
         if let Some(existing) = self.jobs.get(&create.job_id) {
             return match &existing.declared {
@@ -275,10 +286,24 @@ async fn drain(
             CMD_JOB_CANCEL_V2 => {
                 let cancel: CancelJob =
                     serde_json::from_value(payload.clone()).expect("a job.cancel decodes");
-                ledger
-                    .lock()
-                    .expect("the ledger lock")
-                    .settle(cancel.job_id);
+                let was_live = {
+                    let mut ledger = ledger.lock().expect("the ledger lock");
+                    !ledger.dropping_cancels && ledger.settle(cancel.job_id)
+                };
+                // Jobs cancels a live job at once and says so; a cancel of a
+                // settled or unknown job changes nothing.
+                if was_live {
+                    publish_fact(
+                        &js,
+                        actor,
+                        evt_job_cancelled_v1_coords().unwrap(),
+                        EVENT_TYPE_CANCELLED,
+                        JobCancelled {
+                            job_id: cancel.job_id,
+                        },
+                    )
+                    .await;
+                }
                 None
             }
             _ => None,
@@ -348,6 +373,24 @@ impl JobsStandIn {
             },
         );
         job_id
+    }
+
+    /// While `dropping`, every `job.cancel` is dropped: the job stays live and
+    /// no `cancelled` follows.
+    pub fn drop_cancels(&self, dropping: bool) {
+        self.ledger
+            .lock()
+            .expect("the ledger lock")
+            .dropping_cancels = dropping;
+    }
+
+    /// Jobs retires `runner_type`: it refuses every new job of it at creation.
+    pub fn retire_runner_type(&self, runner_type: &str) {
+        self.ledger
+            .lock()
+            .expect("the ledger lock")
+            .retired
+            .insert(runner_type.to_string());
     }
 
     /// A settled job an administrator deleted from Jobs' ledger (Jobs never
@@ -442,50 +485,6 @@ impl JobsStandIn {
             .rejections
             .get(&job_id)
             .cloned()
-    }
-
-    pub async fn declare_runner_type(&self, runner_type: &str, lifecycle: RunnerTypeLifecycle) {
-        let kv = self
-            .js
-            .get_key_value(KV_PUBLISHED_LANGUAGE)
-            .await
-            .expect("the published-language bucket exists");
-        let entry = RunnerType {
-            runner_type: runner_type.to_string(),
-            lifecycle,
-            version: 1,
-        };
-        kv.put(
-            runner_type_key(runner_type),
-            serde_json::to_vec(&entry).unwrap().into(),
-        )
-        .await
-        .expect("publish the runner type");
-    }
-
-    pub async fn publish_catalogue_noise(&self, runner_type: &str, value: Value) {
-        let kv = self
-            .js
-            .get_key_value(KV_PUBLISHED_LANGUAGE)
-            .await
-            .expect("the published-language bucket exists");
-        kv.put(
-            runner_type_key(runner_type),
-            serde_json::to_vec(&value).unwrap().into(),
-        )
-        .await
-        .expect("publish the noise");
-    }
-
-    pub async fn retire_runner_type(&self, runner_type: &str) {
-        let kv = self
-            .js
-            .get_key_value(KV_PUBLISHED_LANGUAGE)
-            .await
-            .expect("the published-language bucket exists");
-        kv.delete(runner_type_key(runner_type))
-            .await
-            .expect("retire the runner type");
     }
 
     async fn publish<T: Serialize>(&self, coords: EventCoords, event_type: &str, payload: T) {

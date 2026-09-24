@@ -158,7 +158,7 @@ impl RulesetRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum RulesetCause {
-    Saved { unknown_runner_types: Vec<String> },
+    Saved,
     Deleted,
 }
 
