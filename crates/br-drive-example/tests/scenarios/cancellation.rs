@@ -65,7 +65,6 @@ async fn a_job_no_runner_picks_up_waits_until_the_user_cancels_it_then_can_be_re
     )
     .await;
     let stuck = jobs.await_create(file_id).await.job_id;
-    jobs.queue(stuck, RENDER).await;
     let mut files = drive_subscription(&world, &owner, drive).await;
 
     // Then: the file waits in PROCESSING — no deadline fails it — and offers
@@ -87,6 +86,15 @@ async fn a_job_no_runner_picks_up_waits_until_the_user_cancels_it_then_can_be_re
         "FILE_NOT_FOUND",
         "a principal who cannot see the file learns nothing of it"
     );
+    assert_eq!(
+        error_code(&cancel(&world, &runner, file_id).await),
+        "FILE_NOT_FOUND",
+        "a runner sees no drive, so it cancels nothing"
+    );
+    assert_eq!(
+        error_code(&cancel(&world, &owner, Uuid::now_v7()).await),
+        "FILE_NOT_FOUND"
+    );
 
     crate::poll_until!(Duration::from_secs(15), {
         (world.job_events(stuck).await == ["queued"]).then_some(())
@@ -103,6 +111,10 @@ async fn a_job_no_runner_picks_up_waits_until_the_user_cancels_it_then_can_be_re
     .await;
     assert_eq!(requested["cause"]["job_id"], stuck.to_string());
     assert_eq!(requested["view"]["processingState"], "PROCESSING");
+    assert_eq!(
+        requested["view"]["affordances"]["cancelProcessing"]["allowed"], true,
+        "until Jobs confirms, the cancel may be asked again"
+    );
     jobs.await_cancel(stuck).await;
 
     // And: Jobs' `cancelled` lands the file FAILED `cancelled`, open to a reprocess
@@ -116,8 +128,8 @@ async fn a_job_no_runner_picks_up_waits_until_the_user_cancels_it_then_can_be_re
     assert!(failed["view"]["progress"].is_null());
     assert_eq!(failed["view"]["affordances"]["process"]["allowed"], true);
     assert_eq!(
-        failed["view"]["affordances"]["cancelProcessing"]["reason"],
-        "FILE_NOT_PROCESSING"
+        failed["view"]["affordances"]["cancelProcessing"],
+        serde_json::json!({ "allowed": false, "reason": "FILE_NOT_PROCESSING" })
     );
     assert_eq!(
         world.job_events(stuck).await,
@@ -128,6 +140,19 @@ async fn a_job_no_runner_picks_up_waits_until_the_user_cancels_it_then_can_be_re
         error_code(&context(&world, &runner, file_id, stuck).await),
         "JOB_NOT_ACTIVE",
         "the cancelled job no longer opens the file"
+    );
+    // A `queued` redelivered after the cancellation reopens nothing.
+    jobs.queue(stuck, RENDER).await;
+    refute_delta(
+        &mut files,
+        "workspaceDriveChanged",
+        Duration::from_millis(800),
+        |node| node["view"]["processingState"] != "FAILED",
+    )
+    .await;
+    assert_eq!(
+        world.file(&owner, file_id).await["processingState"],
+        "FAILED"
     );
     assert_eq!(
         error_code(&cancel(&world, &owner, file_id).await),
@@ -143,7 +168,33 @@ async fn a_job_no_runner_picks_up_waits_until_the_user_cancels_it_then_can_be_re
     let retry = jobs.await_create(file_id).await.job_id;
     assert_ne!(retry, stuck);
     done(&world, &jobs, &runner, file_id, retry).await;
-    world.await_state(&owner, file_id, "READY").await;
+    let ready = world.await_state(&owner, file_id, "READY").await;
+    assert_eq!(
+        ready["affordances"]["cancelProcessing"],
+        serde_json::json!({ "allowed": false, "reason": "FILE_NOT_PROCESSING" })
+    );
+    assert_eq!(
+        error_code(&cancel(&world, &owner, file_id).await),
+        "FILE_NOT_PROCESSING"
+    );
+    let pending = Uuid::now_v7();
+    ticket(
+        &request(
+            &world,
+            &owner,
+            pending,
+            &UploadRequest::text(drive, "", "pending.txt", BYTES),
+        )
+        .await,
+    );
+    assert_eq!(
+        world.file(&owner, pending).await["affordances"]["cancelProcessing"],
+        serde_json::json!({ "allowed": false, "reason": "FILE_NOT_PROCESSING" })
+    );
+    assert_eq!(
+        error_code(&cancel(&world, &owner, pending).await),
+        "FILE_NOT_PROCESSING"
+    );
     let log = world.job_log(file_id).await;
     assert_eq!(
         log.iter().map(|(job, _, _)| *job).collect::<Vec<_>>(),
@@ -192,15 +243,99 @@ async fn a_cancel_jobs_dropped_can_be_asked_again() {
     jobs.await_cancel(job).await;
     let file = world.await_state(&owner, file_id, "FAILED").await;
     assert_eq!(file["processingError"], "cancelled");
+    let mut events = world.job_events(job).await;
+    events.sort_unstable();
     assert_eq!(
-        world.job_events(job).await,
-        vec!["cancel_requested", "cancel_requested", "cancelled"]
+        events,
+        vec![
+            "cancel_requested",
+            "cancel_requested",
+            "cancelled",
+            "queued"
+        ]
     );
     assert_eq!(
         error_code(&cancel(&world, &owner, file_id).await),
         "FILE_NOT_PROCESSING"
     );
     jobs.expect_no_command(Duration::from_millis(500)).await;
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_cancel_that_crosses_a_steps_completion_stops_the_chain_there() {
+    // Given: a two-step rule, and a file whose first step's runner reported done
+    let world = World::start("pod-cancel-crossed").await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let owner = passport(Uuid::now_v7());
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    ok(&create_ruleset(
+        &world,
+        &manager,
+        RuleSpec {
+            name: "render then index",
+            trigger: "UPLOAD",
+            media_types: &["text/plain"],
+            steps: &[
+                (RENDER, serde_json::json!({})),
+                (INDEX, serde_json::json!({})),
+            ],
+            is_default: true,
+        },
+    )
+    .await);
+    let drive = world.create_workspace(&owner, "library").await;
+    let file_id = upload(
+        &world,
+        &owner,
+        &UploadRequest::text(drive, "", "crossed.txt", BYTES),
+    )
+    .await;
+    let first = jobs.await_create(file_id).await.job_id;
+    ok(&report(
+        &world,
+        &runner,
+        file_id,
+        Report {
+            job_id: first,
+            pages: vec![(1, "done")],
+            origin: None,
+            indexer: None,
+            done: true,
+        },
+    )
+    .await);
+    jobs.await_finish(first).await;
+
+    // When: the owner cancels while Jobs finishes the job — Jobs refuses to
+    // cancel a job it already finished and says nothing — then Jobs completes it
+    jobs.drop_cancels(true);
+    ok(&cancel(&world, &owner, file_id).await);
+    jobs.await_cancel(first).await;
+    let mut files = drive_subscription(&world, &owner, drive).await;
+    jobs.complete(first).await;
+
+    // Then: the chain stops there: FAILED `cancelled`, no second job asked for
+    let failed = next_drive_delta(&mut files, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingFailed"
+    })
+    .await;
+    assert_eq!(failed["cause"]["reason"], "cancelled");
+    assert_eq!(failed["view"]["processingError"], "cancelled");
+    assert_eq!(failed["view"]["affordances"]["process"]["allowed"], true);
+    jobs.expect_no_command(Duration::from_secs(1)).await;
+    let log = world.job_log(file_id).await;
+    assert_eq!(log.len(), 2, "the step never started is recorded as such");
+    assert_eq!(log[1].1, 1);
+    assert_eq!(log[1].2.len(), 1);
+    assert_eq!(log[1].2[0]["kind"], "cancelled");
+    assert_eq!(
+        world.file_pages(&owner, file_id).await.len(),
+        1,
+        "the first step's work stays"
+    );
 
     world.cleanup().await;
 }
@@ -285,6 +420,47 @@ async fn a_create_refused_for_a_forgotten_live_job_cancels_it_and_a_reprocess_ge
     assert!(!jobs.is_live(stray));
 
     // And: a reprocess gets a job Jobs accepts at once, and lands READY
+    ok(&world
+        .gql(&owner, PROCESS, serde_json::json!({ "f": file_id }))
+        .await);
+    let accepted = jobs.await_create(file_id).await.job_id;
+    done(&world, &jobs, &runner, file_id, accepted).await;
+    world.await_state(&owner, file_id, "READY").await;
+    jobs.expect_no_command(Duration::from_secs(1)).await;
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn every_duplicate_rejection_cancels_the_forgotten_job_again_until_one_takes() {
+    // Given: a file trapped by a forgotten job whose first cancel Jobs drops
+    let world = World::start("pod-duplicate-again").await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let owner = passport(Uuid::now_v7());
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    install_render_rule(&world, &manager).await;
+    let drive = world.create_workspace(&owner, "library").await;
+    jobs.drop_cancels(true);
+    let (file_id, stray) = trapped(&world, &jobs, &owner, drive).await;
+    jobs.await_cancel(stray).await;
+    world.await_state(&owner, file_id, "FAILED").await;
+    assert!(jobs.is_live(stray));
+    jobs.drop_cancels(false);
+
+    // When: the owner reprocesses while the stray is still live
+    ok(&world
+        .gql(&owner, PROCESS, serde_json::json!({ "f": file_id }))
+        .await);
+
+    // Then: Jobs refuses again, naming the same job, and it is cancelled again
+    let (_, refusal) = jobs.await_refused_create(file_id).await;
+    assert_eq!(refusal.params["activeJobId"], stray.to_string());
+    jobs.await_cancel(stray).await;
+    world.await_state(&owner, file_id, "FAILED").await;
+    assert!(!jobs.is_live(stray));
+
+    // And: the next reprocess gets through to READY
     ok(&world
         .gql(&owner, PROCESS, serde_json::json!({ "f": file_id }))
         .await);
@@ -395,6 +571,9 @@ async fn a_late_fact_of_an_old_job_changes_nothing() {
     jobs.start(current, run).await;
     jobs.declare_plan(current, run, &["read", "write"]).await;
     jobs.start_step(current, run, 0, "read").await;
+    crate::poll_until!(Duration::from_secs(15), {
+        (world.job_events(current).await.len() == 4).then_some(())
+    });
     let progress = crate::poll_until!(Duration::from_secs(15), {
         let file = world.file(&owner, file_id).await;
         (file["progress"]["currentLabel"] == "read"
@@ -415,22 +594,21 @@ async fn a_late_fact_of_an_old_job_changes_nothing() {
 
     // Then: they are logged on the old job only — each fact type rides its own
     // durable, so their arrival order is the broker's — and the file does not move
-    let mut late = vec![
+    let mut expected = vec![
+        "queued",
+        "cancel_requested",
+        "cancelled",
         "completed",
         "failed",
         "plan_declared",
         "started",
         "step_started",
     ];
-    late.sort_unstable();
+    expected.sort_unstable();
     crate::poll_until!(Duration::from_secs(15), {
-        let events = world.job_events(old).await;
-        let settled = events.len() == 7 && events[..2] == ["cancel_requested", "cancelled"] && {
-            let mut rest: Vec<&str> = events[2..].iter().map(String::as_str).collect();
-            rest.sort_unstable();
-            rest == late
-        };
-        settled.then_some(())
+        let mut events = world.job_events(old).await;
+        events.sort_unstable();
+        (events == expected).then_some(())
     });
     refute_delta(
         &mut files,
@@ -454,7 +632,7 @@ async fn a_late_fact_of_an_old_job_changes_nothing() {
     current_events.sort_unstable();
     assert_eq!(
         current_events,
-        vec!["plan_declared", "started", "step_started"],
+        vec!["plan_declared", "queued", "started", "step_started"],
         "the current job's log is untouched by the old job's facts"
     );
     jobs.expect_no_command(Duration::from_millis(500)).await;

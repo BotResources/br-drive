@@ -393,15 +393,15 @@ pub(crate) fn file_changed<H: DriveHost>(
     ops.impact_caused::<File, _>(&file.id, cause)
 }
 
-/// Stages an impact on `file` without a cause: its views and its host object
-/// recompute, and a live session receives a delta only if what it shows
-/// changed — for a job log entry that may or may not show (a queued job, a
-/// late fact of an old job).
+/// Stages an impact on `file` without a cause: its views recompute, and a live
+/// session receives a delta only if what it shows changed — for a job log
+/// entry that may or may not show (a queued job, a late fact of an old job).
+/// The host object is not touched: such an entry never changes the file's
+/// state, so never the drive's counts.
 pub(crate) fn file_touched<H: DriveHost>(
     ops: &mut service_engine::pipeline::Ops<'_>,
     file: &FileRow<H>,
 ) -> Result<(), service_engine::error::EngineError> {
-    crate::owner::touch::<H>(ops, file.drive_id)?;
     ops.impact::<File>(&file.id, service_engine::impact::Dims::ALL)
 }
 

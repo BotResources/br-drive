@@ -57,6 +57,17 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
         .await?;
         rows += done.rows_affected();
     }
+    // Lock the files whose jobs name the person first: a chain advancing at
+    // the same moment copies the initiator into its next job under that lock,
+    // so the rewrites below — new statements, after the lock — see that job.
+    sqlx::query(
+        "SELECT id FROM drive.file WHERE id IN \
+           (SELECT file_id FROM drive.file_job WHERE triggered_by ->> 'id' = $1::text) \
+         ORDER BY id FOR UPDATE",
+    )
+    .bind(person)
+    .execute(&mut *conn)
+    .await?;
     let done = sqlx::query(
         "UPDATE drive.file_job SET triggered_by = jsonb_set(triggered_by, '{id}', to_jsonb($2::text)) \
          WHERE triggered_by ->> 'id' = $1::text",

@@ -6,8 +6,11 @@
 -- order, each entry `{kind, at, ...the fact's payload as received}`: every Jobs
 -- fact about the job (`queued`, `creation_rejected`, `started`,
 -- `plan_declared`, `step_started`, `completed`, `failed`, `cancelled`), plus
--- the two entries the library writes itself where Jobs says nothing
--- (`cancel_requested`, and a `failed` carrying a `reason`).
+-- what the library writes itself where Jobs says nothing: `cancel_requested`
+-- (a user's cancel), and the `cancelled` of a step never started because the
+-- user's cancel crossed the previous step's completion (a row of its own,
+-- never sent to Jobs). The backfill below writes `failed` entries carrying a
+-- `reason`.
 --
 -- `outcome` is the FIRST terminal entry of the log (`completed`, `failed`,
 -- `cancelled`, `creation_rejected`), maintained by Postgres on every write:
@@ -20,6 +23,9 @@
 -- fails), whatever the gestures' own row locks do.
 CREATE TABLE drive.file_job (
     job_id       uuid        PRIMARY KEY,
+    -- The order jobs were recorded in, assigned by Postgres: "last job" never
+    -- depends on the pods' wall clocks.
+    seq          bigint      GENERATED ALWAYS AS IDENTITY,
     file_id      uuid        NOT NULL REFERENCES drive.file (id) ON DELETE CASCADE,
     step_index   integer     NOT NULL CHECK (step_index >= 0),
     triggered_by jsonb,
@@ -33,7 +39,7 @@ CREATE TABLE drive.file_job (
     created_at   timestamptz NOT NULL
 );
 
-CREATE INDEX file_job_file_idx ON drive.file_job (file_id, created_at, job_id);
+CREATE INDEX file_job_file_idx ON drive.file_job (file_id, seq);
 CREATE UNIQUE INDEX file_job_one_live_idx ON drive.file_job (file_id) WHERE outcome IS NULL;
 
 -- NULL while the upload is not confirmed.
@@ -44,7 +50,8 @@ ALTER TABLE drive.file ADD COLUMN committed_at timestamptz;
 -- fact of that job lands in it); a failed file keeps its error as a synthetic
 -- `failed` entry of a synthetic job, never sent to Jobs. A PROCESSING file
 -- without a job cannot come out of 0.1; should one exist, it lands FAILED
--- `interrupted` and can be reprocessed.
+-- `interrupted` and can be reprocessed. Synthetic ids are v4: never sent to
+-- Jobs, never compared with a Jobs id.
 UPDATE drive.file SET committed_at = updated_at WHERE processing_state <> 'pending';
 
 INSERT INTO drive.file_job (job_id, file_id, step_index, triggered_by, events, created_at)
@@ -56,7 +63,7 @@ INSERT INTO drive.file_job (job_id, file_id, step_index, triggered_by, events, c
 SELECT gen_random_uuid(), id, COALESCE(step_index, 0), triggered_by,
        jsonb_build_array(jsonb_build_object(
            'kind', 'failed',
-           'at', to_jsonb(updated_at),
+           'at', to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
            'reason', CASE
                WHEN processing_state = 'failed' THEN COALESCE(processing_error, 'failed')
                ELSE 'interrupted'
@@ -101,7 +108,8 @@ CREATE INDEX file_drive_committed_idx ON drive.file (drive_id, committed_at);
 --                                          that entry
 --   no outcome yet (any other entry, or none)    -> processing
 -- The last job's own columns ride along for the library's reads (its
--- identity, step, initiator and log).
+-- identity, step, initiator, and its log while it runs — a settled job's log
+-- is never read back through the view).
 CREATE VIEW drive.file_status AS
 SELECT f.id AS file_id,
        CASE
@@ -123,13 +131,13 @@ SELECT f.id AS file_id,
        j.job_id AS last_job_id,
        j.step_index AS last_job_step,
        j.triggered_by AS last_job_triggered_by,
-       j.events AS last_job_events,
+       CASE WHEN j.outcome IS NULL THEN j.events END AS last_job_events,
        j.created_at AS last_job_created_at
 FROM drive.file f
 LEFT JOIN LATERAL (
     SELECT fj.job_id, fj.step_index, fj.triggered_by, fj.events, fj.outcome, fj.created_at
     FROM drive.file_job fj
     WHERE fj.file_id = f.id
-    ORDER BY fj.created_at DESC, fj.job_id DESC
+    ORDER BY fj.seq DESC
     LIMIT 1
 ) j ON true;

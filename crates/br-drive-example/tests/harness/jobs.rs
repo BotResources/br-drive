@@ -308,6 +308,22 @@ async fn drain(
             }
             _ => None,
         };
+        // Jobs queues every job it accepts, and says so.
+        if subject == CMD_JOB_CREATE_V1 && rejection.is_none() {
+            let create: CreateJob =
+                serde_json::from_value(payload.clone()).expect("a job.create decodes");
+            publish_fact(
+                &js,
+                actor,
+                evt_job_queued_v1_coords().unwrap(),
+                EVENT_TYPE_QUEUED,
+                JobQueued {
+                    job_id: create.job_id,
+                    runner_type: create.runner_type,
+                },
+            )
+            .await;
+        }
         if let Some(rejection) = rejection {
             publish_fact(
                 &js,
@@ -386,11 +402,19 @@ impl JobsStandIn {
 
     /// Jobs retires `runner_type`: it refuses every new job of it at creation.
     pub fn retire_runner_type(&self, runner_type: &str) {
-        self.ledger
-            .lock()
-            .expect("the ledger lock")
-            .retired
-            .insert(runner_type.to_string());
+        let mut ledger = self.ledger.lock().expect("the ledger lock");
+        let live = ledger.jobs.values().any(|held| {
+            !held.terminal
+                && held
+                    .declared
+                    .as_ref()
+                    .is_some_and(|create| create.runner_type == runner_type)
+        });
+        assert!(
+            !live,
+            "Jobs refuses to retire a runner type with live jobs (runner_type_has_non_terminal_jobs)"
+        );
+        ledger.retired.insert(runner_type.to_string());
     }
 
     /// A settled job an administrator deleted from Jobs' ledger (Jobs never

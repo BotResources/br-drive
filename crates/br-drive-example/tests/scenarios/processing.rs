@@ -519,6 +519,7 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
     .await;
 
     reprocess_rule(&world, &manager).await;
+    jobs.retire_runner_type(RENDER);
     ok(&world
         .gql(
             &owner,
@@ -526,17 +527,13 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
             serde_json::json!({ "f": file_id }),
         )
         .await);
-    let restarted = next_drive_delta(&mut files, |node| {
+    next_drive_delta(&mut files, |node| {
         node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingStarted"
     })
     .await;
-    assert_eq!(
-        restarted["view"]["progress"]["stepCount"], 1,
-        "a default reprocess rule wins over the snapshot"
-    );
-    let job_b = jobs.await_create(file_id).await.job_id;
-    assert_ne!(job_b, job_a);
-    jobs.reject_creation(job_b, "runner_type_retired").await;
+    let (create_b, refusal) = jobs.await_refused_create(file_id).await;
+    assert_ne!(create_b.job_id, job_a);
+    assert_eq!(refusal.reason_code, "runner_type_retired");
     let rejected = next_drive_delta(&mut files, |node| {
         node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingFailed"
     })
@@ -544,6 +541,13 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
     assert_eq!(
         rejected["view"]["processingError"], "runner_type_retired",
         "a creation Jobs rejects fails the file with Jobs' own code"
+    );
+    assert_eq!(
+        world.file(&owner, file_id).await["steps"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "a default reprocess rule wins over the snapshot"
     );
 
     world.cleanup().await;

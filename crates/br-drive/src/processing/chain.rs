@@ -120,7 +120,9 @@ async fn launch_step<H: DriveHost>(
         id: file.created_by,
         display_name: None,
     });
-    insert_job(cx.connection(), file.id, &job).await?;
+    insert_job(cx.connection(), file.id, &job)
+        .await
+        .map_err(live_job_taken)?;
     // The chain is a host-side sequence correlated by the file id: no step names
     // a parent. Jobs refuses a terminal parent, and a live one would make the
     // step the parent runner's work instead of the host's.
@@ -142,6 +144,18 @@ async fn launch_step<H: DriveHost>(
     Ok(Some(job_id))
 }
 
+/// A second unsettled job for one file violates `file_job_one_live_idx`: the
+/// file is already processing. The gestures' row lock prevents it; this keeps
+/// the answer a code should it ever happen.
+fn live_job_taken(error: EngineError) -> DriveFault {
+    match &error {
+        EngineError::Db(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            DriveFault::Refused(codes::FILE_PROCESSING)
+        }
+        _ => DriveFault::Engine(error),
+    }
+}
+
 pub async fn start_chain<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
@@ -160,13 +174,20 @@ pub async fn start_chain<H: DriveHost>(
 }
 
 /// The file's last job completed: the next step is launched, or the chain is
-/// over and the file is READY (its last job's outcome is `completed`).
+/// over and the file is READY (its last job's outcome is `completed`). A
+/// user's cancel that crossed the completion (Jobs refuses to cancel a job it
+/// already finished, and says nothing) stops the chain there: the next step is
+/// recorded as never started, `cancelled`, and no job is asked for.
 pub(crate) async fn advance<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
     completed: &FileJob,
 ) -> Result<(), DriveFault> {
     let next = usize::try_from(completed.step_index).unwrap_or(0) + 1;
+    let has_next = file.steps.as_ref().is_some_and(|steps| next < steps.len());
+    if completed.cancel_requested() && has_next {
+        return stop_before(cx, file, next, completed).await;
+    }
     let cause = match launch_step(cx, file, next, completed.triggered_by.clone()).await? {
         Some(job_id) => FileCause::ProcessingStarted {
             job_id,
@@ -177,6 +198,42 @@ pub(crate) async fn advance<H: DriveHost>(
     file.updated_at = cx.now().as_datetime();
     cx.save(file).await?;
     crate::file::file_changed::<H>(cx, file, cause)?;
+    Ok(())
+}
+
+/// Records step `next` as cancelled before it started: a row of its own, never
+/// sent to Jobs, whose only entry is the library's `cancelled`.
+async fn stop_before<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    file: &mut FileRow<H>,
+    next: usize,
+    completed: &FileJob,
+) -> Result<(), DriveFault> {
+    let now = cx.now().as_datetime();
+    let stopped = FileJob {
+        job_id: Uuid::now_v7(),
+        step_index: i32::try_from(next).unwrap_or(i32::MAX),
+        triggered_by: completed.triggered_by.clone(),
+        events: vec![super::log::entry(
+            super::log::kind::CANCELLED,
+            now,
+            serde_json::json!({ "before_start": true }),
+        )?],
+        created_at: now,
+    };
+    insert_job(cx.connection(), file.id, &stopped)
+        .await
+        .map_err(live_job_taken)?;
+    refresh_status(cx, file).await?;
+    file.updated_at = now;
+    cx.save(file).await?;
+    crate::file::file_changed::<H>(
+        cx,
+        file,
+        FileCause::ProcessingFailed {
+            reason: super::CANCELLED.to_string(),
+        },
+    )?;
     Ok(())
 }
 

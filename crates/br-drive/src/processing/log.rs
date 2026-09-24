@@ -11,8 +11,10 @@ use uuid::Uuid;
 
 use super::commands::Initiator;
 
-/// The kinds of the log's entries: the eight Jobs facts, plus the two the
-/// library writes itself where Jobs says nothing.
+/// The kinds of the log's entries: the eight Jobs facts, plus
+/// `cancel_requested`, which only the library writes. The library also writes
+/// `cancelled` itself on the row of a step it never started because a user's
+/// cancel crossed the previous step's completion.
 pub mod kind {
     pub const QUEUED: &str = "queued";
     pub const CREATION_REJECTED: &str = "creation_rejected";
@@ -59,6 +61,13 @@ fn entries_of<'a>(
 }
 
 impl FileJob {
+    /// Whether a user asked to cancel this job.
+    pub fn cancel_requested(&self) -> bool {
+        entries_of(&self.events, kind::CANCEL_REQUESTED)
+            .next()
+            .is_some()
+    }
+
     /// The plan of the last `plan_declared`, and the latest `step_started` —
     /// by its start instant, then by index — whatever order they arrived in.
     pub fn progress(&self) -> RunProgress {
@@ -89,20 +98,6 @@ impl FileJob {
             current_label: step.as_ref().map(|(_, _, label)| label.clone()),
             at: step.map(|(at, _, _)| at),
         }
-    }
-
-    /// The kind of the job's first terminal entry — a job settles once — as
-    /// `drive.file_job.outcome` computes it.
-    pub fn outcome(&self) -> Option<&str> {
-        self.events
-            .iter()
-            .filter_map(|entry| entry.get("kind").and_then(serde_json::Value::as_str))
-            .find(|kind| {
-                matches!(
-                    *kind,
-                    kind::COMPLETED | kind::FAILED | kind::CANCELLED | kind::CREATION_REJECTED
-                )
-            })
     }
 }
 
@@ -245,22 +240,5 @@ mod tests {
         assert_eq!(progress.current_label.as_deref(), Some("b"));
         assert_eq!(progress.at, Some(late));
         assert_eq!(job(vec![]).progress().current_index, None);
-    }
-
-    #[test]
-    fn the_outcome_is_the_first_terminal_entry_whatever_comes_after() {
-        assert_eq!(job(vec![]).outcome(), None);
-        let log = job(vec![
-            serde_json::json!({ "kind": "queued" }),
-            serde_json::json!({ "kind": "cancel_requested" }),
-        ]);
-        assert_eq!(log.outcome(), None, "a cancel request is not an outcome");
-        let log = job(vec![
-            serde_json::json!({ "kind": "started" }),
-            serde_json::json!({ "kind": "completed" }),
-            serde_json::json!({ "kind": "step_started" }),
-            serde_json::json!({ "kind": "failed" }),
-        ]);
-        assert_eq!(log.outcome(), Some("completed"));
     }
 }

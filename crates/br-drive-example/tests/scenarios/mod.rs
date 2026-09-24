@@ -9,6 +9,7 @@ mod hosts;
 mod imports;
 mod jobs_double;
 mod labels;
+mod migration;
 mod pages;
 mod processing;
 mod replay;

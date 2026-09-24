@@ -90,7 +90,9 @@ single git tag `v{version}` releases the set. Format follows
   its own job, so a late fact of an older job changes nothing; a job settles
   on its first terminal fact, so a step fact arriving after the completion
   (the facts ride separate durables) changes nothing either. A partial
-  unique index keeps at most one unsettled job per file.
+  unique index keeps at most one unsettled job per file; "last job" follows
+  an identity sequence, never the pods' clocks. An erase locks the files
+  whose jobs name the person before rewriting the jobs' initiators.
 - The chain advances only on Jobs' `completed`, which Jobs publishes only
   after the owner's `job.finish` — sent with the runner's `done` report. A
   `completed` that "arrives before the report" cannot happen; the branch that
@@ -135,7 +137,10 @@ single git tag `v{version}` releases the set. Format follows
   `CancelRequested { job_id }`) and `job.cancel.v2` is staged; the file stays
   `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to
   a reprocess. It may be asked again (a cancel Jobs consumed before the job's
-  creation is dropped). The example host exposes it to a workspace's owner.
+  creation is dropped). A cancel that crosses a step's completion stops the
+  chain there: the next step is recorded as never started (`cancelled`, a
+  row of the library's own, never sent to Jobs). The example host exposes it
+  to a workspace's owner.
 - `<p>ImportCommit(fileId)`: commits a pending upload **without processing**
   — the file lands `READY` and no rule runs, even when an `upload` rule
   matches — so a host that declared its processing rules before migrating a

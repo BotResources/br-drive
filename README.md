@@ -429,10 +429,15 @@ The chain, one step at a time, in the library's own transactions:
    arrive after the completion) — is logged and changes nothing;
 3. the runner's `done: true` report stages `job.finish.v2`; Jobs marks a job
    completed only on its owner's finish, so its `completed` fact is what
-   advances the chain — the chain never moves on a report alone.
+   advances the chain — the chain never moves on a report alone. A user's
+   cancel that crossed the completion (Jobs refuses to cancel a finished job
+   and says nothing) stops the chain there: the next step is recorded as a
+   job row of its own, never sent to Jobs, whose only entry is the library's
+   `cancelled`, and the file lands `FAILED` `cancelled`.
 
 The state is **computed, never stored**. The `drive.file_status` view reads
-each file's last job: no job and no `committed_at` → `PENDING`; no job and
+each file's last job (the last recorded, by an identity sequence Postgres
+assigns — never by the pods' clocks): no job and no `committed_at` → `PENDING`; no job and
 `committed_at` set → `READY`; a last job whose first terminal entry is
 `completed` → `READY` (the next step's job is appended in the transaction that
 logs the completion, so a completed last job means the chain is over);
@@ -454,7 +459,11 @@ it accepts a runner type it does not know and never dispatches its job — as it
 never fails a job no live runner picks up. Such a file waits in `PROCESSING`
 until someone cancels it; Jobs' `cancelled` then lands it `FAILED`, and a
 reprocess (a fixed rule, a started runner) starts over. The library keeps no
-copy of the runner-type catalogue: a rule may name any runner type.
+copy of the runner-type catalogue: a rule may name any runner type. The
+cancel relies on Jobs answering: a job Jobs holds as settled or does not know
+at all (a host or Jobs database restored to an earlier point, a job deleted
+in Jobs) never gets a `cancelled`, and its file stays `PROCESSING` — deleting
+the file is then the way out (see Follow-ups).
 
 A `creation_rejected` `duplicate_active_entity` means Jobs still holds a live
 job on the file that the library does not count as live (a lost
@@ -533,6 +542,10 @@ before migration `9121000007` keeps its stored error, and one found
   the job's first terminal fact (`FAILED`), later facts are logged only, and
   the runner of the retried run is refused `JOB_NOT_ACTIVE`; the user
   reprocesses instead.
+- A file whose running job Jobs holds as settled or does not know (a restored
+  database, a job deleted in Jobs) stays `PROCESSING`: the cancel is sent and
+  never confirmed. A host-privileged gesture settling such a job locally is
+  not written yet; deleting the file is the way out.
 - A runner report the library refuses (an invalid batch, say) is a refused
   mutation: its transaction rolls back, so nothing is logged on the job and
   the runner decides whether to fail its run with Jobs.
