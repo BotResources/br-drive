@@ -598,6 +598,35 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
         )
         .await;
     assert_eq!(error_code(&partial), "INDEXER_FIELDS_TOGETHER");
+    let estimate_alone = world
+        .gql(
+            &runner,
+            "mutation($f:UUID!,$j:UUID!){workspaceRunnerReport(fileId:$f,jobId:$j,estimatedTokens:12){success}}",
+            serde_json::json!({ "f": file_id, "j": job_id }),
+        )
+        .await;
+    assert_eq!(
+        error_code(&estimate_alone),
+        "INDEXER_FIELDS_TOGETHER",
+        "a token estimate only rides along with a summary and a page count"
+    );
+    ok(&world
+        .gql(
+            &runner,
+            "mutation($f:UUID!,$j:UUID!){workspaceRunnerReport(fileId:$f,jobId:$j,summary:\"Re-indexed.\",pageCount:3){success}}",
+            serde_json::json!({ "f": file_id, "j": job_id }),
+        )
+        .await);
+    let reindexed = next_drive_delta(&mut files, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ReportStored"
+    })
+    .await;
+    assert_eq!(reindexed["view"]["summary"], "Re-indexed.");
+    assert_eq!(reindexed["view"]["pageCount"], 3);
+    assert!(
+        reindexed["view"]["estimatedTokens"].is_null(),
+        "an indexing without an estimate is accepted and clears the previous one"
+    );
     let negative = report(
         &world,
         &runner,

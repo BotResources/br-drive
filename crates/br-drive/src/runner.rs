@@ -297,12 +297,10 @@ fn validate(input: &RunnerReport) -> Result<(), DriveFault> {
     {
         return Err(DriveFault::Refused(codes::INVALID_PAGE));
     }
-    let indexer = [
-        input.summary.is_some(),
-        input.page_count.is_some(),
-        input.estimated_tokens.is_some(),
-    ];
-    if indexer.iter().any(|given| *given) && !indexer.iter().all(|given| *given) {
+    // The summary and the page count move together; the token estimate is
+    // optional, and only ever rides along with them.
+    let indexed = input.summary.is_some();
+    if indexed != input.page_count.is_some() || (input.estimated_tokens.is_some() && !indexed) {
         return Err(DriveFault::Refused(codes::INDEXER_FIELDS_TOGETHER));
     }
     if input.page_count.is_some_and(|count| count < 0)
@@ -310,7 +308,7 @@ fn validate(input: &RunnerReport) -> Result<(), DriveFault> {
     {
         return Err(DriveFault::Refused(codes::INVALID_INDEXER_VALUE));
     }
-    if input.pages.is_empty() && !indexer[0] && !input.done {
+    if input.pages.is_empty() && !indexed && !input.done {
         return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
     }
     Ok(())
@@ -373,16 +371,17 @@ pub fn runner_report<'m, H: DriveHost>(
         }
         let mut dirty = false;
         let mut cause = None;
-        if let (Some(summary), Some(page_count), Some(estimated_tokens)) =
-            (input.summary, input.page_count, input.estimated_tokens)
-        {
+        if let (Some(summary), Some(page_count)) = (input.summary, input.page_count) {
+            // An indexer that gives no estimate clears a previous one: the
+            // three fields describe one indexing, never two.
+            let estimated_tokens = input.estimated_tokens;
             let changed = file.summary.as_deref() != Some(summary.as_str())
                 || file.page_count != Some(page_count)
-                || file.estimated_tokens != Some(estimated_tokens);
+                || file.estimated_tokens != estimated_tokens;
             if changed {
                 file.summary = Some(summary);
                 file.page_count = Some(page_count);
-                file.estimated_tokens = Some(estimated_tokens);
+                file.estimated_tokens = estimated_tokens;
                 dirty = true;
                 cause = Some(FileCause::ReportStored {
                     job_id: input.job_id,

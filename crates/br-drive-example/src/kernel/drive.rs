@@ -15,6 +15,7 @@ use crate::kernel::{AppPrincipal, OWNERSHIP_DEP};
 pub const NOT_THE_OWNER: Reason = Reason::new("NOT_THE_WORKSPACE_OWNER");
 pub const UNRENDERABLE_MEDIA_TYPE: Reason = Reason::new("UNRENDERABLE_MEDIA_TYPE");
 pub const FORBIDDEN_FOLDER: Reason = Reason::new("FORBIDDEN_FOLDER");
+pub const NOT_THE_UPLOADER: Reason = Reason::new("NOT_THE_UPLOADER");
 
 pub const UNRENDERABLE: &str = "application/x-unrenderable";
 pub const FORBIDDEN_PREFIX: &str = "forbidden";
@@ -60,6 +61,15 @@ impl DriveHost for AppPrincipal {
                     Gate::allowed()
                 };
             }
+            // The catalogue is for the people of the host, never for a runner.
+            DriveRequest::ReadLabels => {
+                return if self.is_service() {
+                    Gate::blocked(NOT_THE_OWNER)
+                } else {
+                    Gate::allowed()
+                };
+            }
+
             _ => {}
         }
         let owned = request
@@ -69,10 +79,16 @@ impl DriveHost for AppPrincipal {
             DriveRequest::UpdateFile { target_drive, .. } => self.owns_workspace(*target_drive),
             _ => true,
         };
-        if owned && owned_target {
-            Gate::allowed()
-        } else {
-            Gate::blocked(NOT_THE_OWNER)
+        if !(owned && owned_target) {
+            return Gate::blocked(NOT_THE_OWNER);
+        }
+        match request {
+            // Only the person who uploaded a file may confirm it, even in a
+            // workspace that changed hands in between.
+            DriveRequest::CommitUpload { file } if file.created_by != self.id().as_uuid() => {
+                Gate::blocked(NOT_THE_UPLOADER)
+            }
+            _ => Gate::allowed(),
         }
     }
 

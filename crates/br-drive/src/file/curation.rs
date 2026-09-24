@@ -4,7 +4,7 @@ use uuid::Uuid;
 use super::aggregate::{File, FileCause, FileRow};
 use super::store;
 use crate::fault::{DriveFault, codes};
-use crate::host::DriveHost;
+use crate::host::{DriveHost, DriveRequest};
 
 pub async fn drive_of(ops: &mut Ops<'_>, file_id: Uuid) -> Result<Option<Uuid>, DriveFault> {
     Ok(store::drive_of(ops.connection(), file_id).await?)
@@ -29,8 +29,11 @@ pub async fn set_protected<H: DriveHost>(
     Ok(())
 }
 
+/// Writes the host's free JSON on a file, asking the host's gate
+/// (`DriveRequest::SetMetadata`) on behalf of `principal` first.
 pub async fn set_metadata<H: DriveHost>(
     ops: &mut Ops<'_>,
+    principal: &H,
     file_id: Uuid,
     metadata: serde_json::Value,
 ) -> Result<(), DriveFault> {
@@ -38,6 +41,9 @@ pub async fn set_metadata<H: DriveHost>(
         .load::<FileRow<H>>(&file_id)
         .await?
         .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
+    principal
+        .drive_gate(&DriveRequest::SetMetadata { file: &file })
+        .require()?;
     if file.metadata == metadata {
         return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
     }

@@ -36,6 +36,30 @@ single git tag `v{version}` releases the set. Format follows
   is accepted), a number is never padded wider than it needs, an index is
   never zero.
 
+- The host's gate is asked before the file's state: `process`, `editPage`,
+  `regeneratePage`, `download`, the protected-file refusals and the commit
+  answer a principal the host refuses with the host's code instead of
+  `FILE_PROCESSING` / `FILE_NOT_READY` / `FILE_NOT_PENDING` /
+  `FILE_PROTECTED`, which disclosed the existence and state of a file the
+  principal may not see.
+- `CommitUpload` asks the host a request of its own, `CommitUpload { file }`,
+  carrying the pending row and its `created_by`, instead of re-asking
+  `CreateFile` without the row: in a shared drive any principal allowed to
+  create files passed the commit gate for somebody else's pending upload.
+  `FileRow::as_create_request` is gone; `FileRow::commit_gate` replaces it.
+- The label catalogue is gated: `<p>Labels` and `<p>LabelsChanged` consult
+  the new `DriveRequest::ReadLabels`, mirroring `ReadRulesets`, instead of
+  serving every principal of the host, the runner included.
+- `br_drive::set_metadata` asks the host's gate
+  (`DriveRequest::SetMetadata { file }`) for the principal it now takes:
+  `set_metadata(ops, principal, file_id, metadata)`.
+
+### Changed
+
+- The token estimate of a runner report is optional: `summary` and
+  `pageCount` still move together, `estimatedTokens` may be absent (it may not
+  come alone). An indexing without an estimate clears a previous one.
+
 ### Added
 
 - `DriveHost::STEP_TIMEOUT` (default 24 h): a step still running past it has
@@ -52,7 +76,9 @@ single git tag `v{version}` releases the set. Format follows
   entity — and answers `creation_rejected` itself, with a regression scenario
   for the double; new scenarios for the step timeout, the duplicate-job trap
   and the deferred launch. The example host can boot without its catalogue
-  watch (`BootOptions::watch_catalogue`) and start it later.
+  watch (`BootOptions::watch_catalogue`) and start it later; its gate reserves
+  a commit to the uploader, keeps service principals out of the label
+  catalogue, and its metadata mutation relies on the library's gate.
 
 ## 0.1.0 — 2026-09-23
 

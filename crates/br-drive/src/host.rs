@@ -24,6 +24,11 @@ pub enum DriveRequest<'a, H> {
         media_type: &'a MediaType,
         size: u64,
     },
+    /// Confirming a pending upload: the row carries its uploader
+    /// (`created_by`), so a host can reserve the commit to them.
+    CommitUpload {
+        file: &'a FileRow<H>,
+    },
     ReadFile {
         file: &'a FileRow<H>,
     },
@@ -59,6 +64,12 @@ pub enum DriveRequest<'a, H> {
     SetFileLabels {
         file: &'a FileRow<H>,
     },
+    /// Reading the host's label catalogue, live included.
+    ReadLabels,
+    /// Writing a file's free `metadata` through `br_drive::set_metadata`.
+    SetMetadata {
+        file: &'a FileRow<H>,
+    },
 }
 
 impl<H> DriveRequest<'_, H> {
@@ -67,14 +78,18 @@ impl<H> DriveRequest<'_, H> {
             Self::CreateFile { drive, .. }
             | Self::MoveFolder { drive, .. }
             | Self::DeleteFolder { drive, .. } => Some(*drive),
-            Self::ReadFile { file }
+            Self::CommitUpload { file }
+            | Self::ReadFile { file }
+            | Self::SetMetadata { file }
             | Self::UpdateFile { file, .. }
             | Self::DeleteFile { file }
             | Self::Process { file }
             | Self::EditPage { file }
             | Self::RegeneratePage { file, .. }
             | Self::SetFileLabels { file } => Some(file.drive_id),
-            Self::ManageRulesets | Self::ReadRulesets | Self::ManageLabels => None,
+            Self::ManageRulesets | Self::ReadRulesets | Self::ManageLabels | Self::ReadLabels => {
+                None
+            }
         }
     }
 }

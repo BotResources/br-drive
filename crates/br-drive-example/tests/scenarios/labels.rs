@@ -118,7 +118,10 @@ async fn labels_are_a_host_catalogue_managed_by_its_managers_and_read_live_by_ev
         listed[0].get("createdBy").is_none(),
         "the creator's id is not on the wire"
     );
-    assert_eq!(world.labels(&runner).await.len(), 3);
+    assert!(
+        world.labels(&runner).await.is_empty(),
+        "the host's ReadLabels gate keeps the runner out of the catalogue"
+    );
 
     ok(&world
         .gql(
