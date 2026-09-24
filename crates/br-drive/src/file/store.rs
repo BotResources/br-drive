@@ -18,7 +18,7 @@ pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, title, protecte
      processing_state, processing_error, metadata, summary, page_count, estimated_tokens, \
      ruleset_id, steps, step_index, step_count, step_runner_type, job_id, plan, \
      progress_index, progress_label, progress_at, triggered_by, done_at, completed_at, \
-     step_entered_at, step_alive_at, stray_job_id, created_by, created_at, updated_at";
+     step_entered_at, step_alive_at, run_started_at, stray_job_id, created_by, created_at, updated_at";
 
 /// The library is the only writer of these columns; a value that does not
 /// decode is reported and read as absent rather than breaking the file's view.
@@ -104,6 +104,7 @@ pub(crate) fn row_to_file_prefixed<H>(
         completed_at: row.get(column("completed_at").as_str()),
         step_entered_at: row.get(column("step_entered_at").as_str()),
         step_alive_at: row.get(column("step_alive_at").as_str()),
+        run_started_at: row.get(column("run_started_at").as_str()),
         stray_job_id: row.get(column("stray_job_id").as_str()),
         created_by: row.get(column("created_by").as_str()),
         created_at: row.get(column("created_at").as_str()),
@@ -182,7 +183,8 @@ impl<H: DriveHost> Persistence for FileStore<H> {
                    step_runner_type = $17, job_id = $18, plan = $19, progress_index = $20, \
                    progress_label = $21, progress_at = $22, triggered_by = $23, \
                    done_at = $24, completed_at = $25, step_entered_at = $26, \
-                   stray_job_id = $27, step_alive_at = $28, title = $29 \
+                   stray_job_id = $27, step_alive_at = $28, title = $29, \
+                   run_started_at = $30 \
                  WHERE id = $1",
             )
             .bind(file.id)
@@ -217,6 +219,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.stray_job_id)
             .bind(file.step_alive_at)
             .bind(file.title.as_str())
+            .bind(file.run_started_at)
             .execute(conn)
             .await?;
             Ok(())
@@ -233,7 +236,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
                 "INSERT INTO drive.file ({FILE_COLUMNS}) VALUES \
                  ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                   $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, \
-                  $30, $31, $32, $33, $34, $35)"
+                  $30, $31, $32, $33, $34, $35, $36)"
             ))
             .bind(file.id)
             .bind(file.drive_id)
@@ -269,6 +272,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.completed_at)
             .bind(file.step_entered_at)
             .bind(file.step_alive_at)
+            .bind(file.run_started_at)
             .bind(file.stray_job_id)
             .bind(file.created_by)
             .bind(file.created_at)

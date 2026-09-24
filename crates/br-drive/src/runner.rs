@@ -340,8 +340,10 @@ pub fn runner_report<'m, H: DriveHost>(
         file.require_active_job(input.job_id)?;
         let by = cx.principal().id().as_uuid();
         let now = cx.now().as_datetime();
-        // A report is a sign of life: the step's deadline moves back.
-        file.step_alive_at = Some(now);
+        // A report is a sign of life of a started run: the step's deadline
+        // moves back (and the pickup stage is over, should the started fact
+        // come late).
+        crate::processing::run_alive(&mut file, now);
 
         let mut dropped = Vec::new();
         if input.origin == PageOrigin::Regenerated {

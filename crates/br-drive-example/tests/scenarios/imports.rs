@@ -290,6 +290,129 @@ async fn an_import_is_the_hosts_privilege_on_a_ready_file_and_obeys_every_rendit
     world.cleanup().await;
 }
 
+const IMPORT_COMMIT: &str = "mutation($f:UUID!){workspaceImportCommit(fileId:$f){success}}";
+
+async fn import_commit(world: &World, passport: &str, file_id: Uuid) -> serde_json::Value {
+    world
+        .gql(passport, IMPORT_COMMIT, serde_json::json!({ "f": file_id }))
+        .await
+}
+
+#[tokio::test]
+async fn a_migration_commits_an_upload_without_processing_under_an_upload_rule_then_imports_it() {
+    // Given: the host already declared an upload rule for text files, the
+    // host's migration account holding the import scope, and the owner watching
+    let world = World::start("pod-import-commit").await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let owner = passport(Uuid::now_v7());
+    let importer = service_passport(&[IMPORT_SCOPE]);
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    let human_importer = manager_passport_with_scopes(Uuid::now_v7(), "Ada", &[IMPORT_SCOPE]);
+    install_render_rule(&world, &jobs, &manager).await;
+    let drive = world.create_workspace(&owner, "library").await;
+    let mut files = drive_subscription(&world, &owner, drive).await;
+    quiet(&mut files).await;
+
+    // When: the migration account uploads a legacy text file
+    let file_id = Uuid::now_v7();
+    let legacy = UploadRequest::text(drive, "legacy", "minutes.txt", BYTES);
+    let upload_ticket = ticket(&request(&world, &importer, file_id, &legacy).await);
+
+    // Then: committing it without processing needs the import right, and the
+    // bytes — refused before anything moves
+    for principal in [&owner, &runner, &human_importer] {
+        assert_eq!(
+            error_code(&import_commit(&world, principal, file_id).await),
+            "IMPORT_SCOPE_REQUIRED"
+        );
+    }
+    assert_eq!(
+        error_code(&import_commit(&world, &importer, file_id).await),
+        "UPLOAD_NOT_LANDED"
+    );
+    assert_eq!(
+        error_code(&import_commit(&world, &importer, Uuid::now_v7()).await),
+        "FILE_NOT_FOUND"
+    );
+    // (a file entering the window arrives through the window's repopulation,
+    // without a cause)
+    let pending = next_drive_delta(&mut files, |node| {
+        node["__typename"] == "DriveUpsert" && node["view"]["id"] == file_id.to_string()
+    })
+    .await;
+    assert_eq!(pending["view"]["processingState"], "PENDING");
+    files.expect_silence(Duration::from_millis(600)).await;
+
+    // When: the bytes land and the importer commits without processing
+    let status = post_bytes(&world, &upload_ticket, BYTES, legacy.name).await;
+    assert!((200..300).contains(&status), "{status}");
+    ok(&import_commit(&world, &importer, file_id).await);
+
+    // Then: the file is READY at once, with no chain and no job asked of Jobs,
+    // although the upload rule matches it
+    let committed = next_drive_delta(&mut files, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "UploadCommitted"
+    })
+    .await;
+    assert_eq!(committed["view"]["id"], file_id.to_string());
+    assert_eq!(committed["view"]["processingState"], "READY");
+    assert!(committed["view"]["rulesetId"].is_null());
+    assert!(committed["view"]["progress"].is_null());
+    jobs.expect_no_command(Duration::from_secs(2)).await;
+    refute_delta(
+        &mut files,
+        "workspaceDriveChanged",
+        Duration::from_millis(600),
+        |node| {
+            node["view"]["processingState"] != "READY"
+                || matches!(
+                    node["cause"]["kind"].as_str(),
+                    Some("ProcessingStarted" | "LaunchDeferred" | "ProcessingFailed")
+                )
+        },
+    )
+    .await;
+
+    // And: a second commit is refused, the file stays READY
+    assert_eq!(
+        error_code(&import_commit(&world, &importer, file_id).await),
+        "FILE_NOT_PENDING"
+    );
+
+    // When: the importer writes the rendition it already holds
+    ok(&import_pages(
+        &world,
+        &importer,
+        file_id,
+        serde_json::json!([{ "number": 1, "markdown": "Minutes, as converted long ago" }]),
+        Some(("Legacy minutes.", 1)),
+    )
+    .await);
+
+    // Then: the file carries it, still READY, and Jobs heard nothing
+    let imported = next_drive_delta(&mut files, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "RenditionImported"
+    })
+    .await;
+    assert_eq!(imported["view"]["processingState"], "READY");
+    assert_eq!(imported["view"]["pageCount"], 1);
+    assert_eq!(world.file_pages(&owner, file_id).await.len(), 1);
+    jobs.expect_no_command(Duration::from_secs(1)).await;
+
+    // And: a normal commit is unchanged — the owner's own upload runs the rule
+    let fresh = upload(
+        &world,
+        &owner,
+        &UploadRequest::text(drive, "", "fresh.txt", BYTES),
+    )
+    .await;
+    jobs.await_create(fresh).await;
+    world.await_state(&owner, fresh, "PROCESSING").await;
+
+    world.cleanup().await;
+}
+
 const WORKSPACE_DELTAS: &str = "subscription{workspaceDeltas{__typename \
     ... on WorkspaceReset{views{... on WorkspaceView{id fileCount readyFileCount}}} \
     ... on WorkspaceUpsert{cause view{... on WorkspaceView{id fileCount readyFileCount}}}}}";

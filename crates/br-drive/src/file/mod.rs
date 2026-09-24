@@ -74,6 +74,7 @@ pub(crate) mod tests_support {
             completed_at: None,
             step_entered_at: Some(entered),
             step_alive_at: Some(entered),
+            run_started_at: None,
             stray_job_id: None,
             created_by: Uuid::now_v7(),
             created_at: entered,

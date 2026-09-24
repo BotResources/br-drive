@@ -7,9 +7,10 @@ mod commands;
 mod reactions;
 mod roots;
 
+pub(crate) use backstop::run_alive;
 pub use backstop::{
     LAUNCH_RETRY_AFTER, LAUNCH_RETRY_CAP, LAUNCH_RETRY_DURABLE, LaunchRetry, STEP_DEADLINE_DURABLE,
-    StepDeadline, launch_retry, retry_delay, step_deadline, step_timeout,
+    StepDeadline, launch_retry, pickup_timeout, retry_delay, step_deadline, step_timeout,
 };
 pub use chain::{
     ChainPlan, advance, cancel_active_job, finish_active_job, start_chain, wipe_rendition,
@@ -30,7 +31,8 @@ pub const RUNNER_TYPE_UNAVAILABLE: &str = "runner_type_unavailable";
     note = "no longer raised: a step fired before the first catalogue scan is deferred"
 )]
 pub const CATALOGUE_NOT_WATCHED: &str = "catalogue_not_watched";
-/// The reason a file lands FAILED when a step outlives `DriveHost::STEP_TIMEOUT`.
+/// The reason a file lands FAILED when a step outlives its deadline
+/// (`DriveHost::PICKUP_TIMEOUT` or `DriveHost::STEP_TIMEOUT`).
 pub const TIMED_OUT: &str = "timed_out";
 pub const CANCELLED: &str = "cancelled";
 

@@ -1,7 +1,10 @@
 //! The chain's contract with the real Jobs service, and the backstops that
 //! keep a file from sitting in PROCESSING for good.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use br_drive::DriveHost;
+use br_drive_example::kernel::AppPrincipal;
 
 use contract_jobs::command::TriggeredBy;
 use uuid::Uuid;
@@ -59,8 +62,14 @@ async fn cancel_then_create(jobs: &JobsStandIn, stray: Uuid, file_id: Uuid) -> U
     job_id
 }
 
+/// The example host's two deadlines: a job must be picked up within
+/// `PICKUP_TIMEOUT` of its creation, a started run may stay silent for
+/// `STEP_TIMEOUT`.
+const PICKUP_TIMEOUT: Duration = <AppPrincipal as DriveHost>::PICKUP_TIMEOUT;
+const STEP_TIMEOUT: Duration = <AppPrincipal as DriveHost>::STEP_TIMEOUT;
+
 #[tokio::test]
-async fn a_step_no_runner_ever_picks_up_times_out_cancels_its_job_and_can_be_reprocessed() {
+async fn a_job_no_runner_picks_up_times_out_at_the_pickup_deadline_and_can_be_reprocessed() {
     // Given: a render rule and a runner type that is ACTIVE but has no live instance
     let world = World::start("pod-step-timeout").await;
     let jobs = JobsStandIn::attach(&world).await;
@@ -79,8 +88,10 @@ async fn a_step_no_runner_ever_picks_up_times_out_cancels_its_job_and_can_be_rep
     )
     .await;
     let stuck = jobs.await_create(file_id).await.job_id;
+    let created = Instant::now();
 
-    // Then: past the host's step timeout the job is cancelled and the file fails `timed_out`
+    // Then: past the pickup deadline — well before the run-silence one — the
+    // job is cancelled and the file fails `timed_out`
     let timed_out = next_delta_within(
         &mut files,
         "workspaceDriveChanged",
@@ -88,6 +99,11 @@ async fn a_step_no_runner_ever_picks_up_times_out_cancels_its_job_and_can_be_rep
         |node| node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingFailed",
     )
     .await;
+    let waited = created.elapsed();
+    assert!(
+        waited + Duration::from_secs(1) >= PICKUP_TIMEOUT && waited < STEP_TIMEOUT,
+        "the pickup deadline ({PICKUP_TIMEOUT:?}) fired, not the run-silence one: {waited:?}"
+    );
     assert_eq!(timed_out["cause"]["reason"], "timed_out");
     assert_eq!(timed_out["view"]["processingState"], "FAILED");
     assert_eq!(timed_out["view"]["processingError"], "timed_out");
@@ -108,6 +124,52 @@ async fn a_step_no_runner_ever_picks_up_times_out_cancels_its_job_and_can_be_rep
     assert_ne!(retry, stuck);
     done(&world, &jobs, &runner, file_id, retry).await;
     world.await_state(&owner, file_id, "READY").await;
+    jobs.expect_no_command(Duration::from_secs(1)).await;
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_started_run_outlives_the_pickup_deadline_and_times_out_only_once_silent() {
+    // Given: a render rule and a file whose job a runner picked up
+    let world = World::start("pod-run-silence").await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let owner = passport(Uuid::now_v7());
+    install_render_rule(&world, &jobs, &manager).await;
+    let drive = world.create_workspace(&owner, "library").await;
+    let mut files = drive_subscription(&world, &owner, drive).await;
+    let file_id = upload(
+        &world,
+        &owner,
+        &UploadRequest::text(drive, "", "slow.txt", BYTES),
+    )
+    .await;
+    let job = jobs.await_create(file_id).await.job_id;
+
+    // When: Jobs reports the run started, and the runner then falls silent
+    jobs.start(job, Uuid::now_v7()).await;
+    let started = Instant::now();
+
+    // Then: the pickup deadline passes without failing the file; the
+    // run-silence deadline, measured from the start, cancels the job and
+    // fails it `timed_out`
+    let timed_out = next_delta_within(
+        &mut files,
+        "workspaceDriveChanged",
+        Duration::from_secs(90),
+        |node| node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingFailed",
+    )
+    .await;
+    let silent = started.elapsed();
+    assert!(
+        silent + Duration::from_secs(1) >= STEP_TIMEOUT,
+        "a started run is failed only after {STEP_TIMEOUT:?} of silence, not at the pickup \
+         deadline ({PICKUP_TIMEOUT:?}): {silent:?}"
+    );
+    assert_eq!(timed_out["cause"]["reason"], "timed_out");
+    assert_eq!(timed_out["view"]["processingError"], "timed_out");
+    jobs.await_cancel(job).await;
     jobs.expect_no_command(Duration::from_secs(1)).await;
 
     world.cleanup().await;

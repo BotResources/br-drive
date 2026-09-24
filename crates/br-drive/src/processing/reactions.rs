@@ -10,7 +10,7 @@ use service_engine::pipeline::Reaction;
 use uuid::Uuid;
 
 use super::CANCELLED;
-use super::backstop::schedule_retry;
+use super::backstop::{run_alive, schedule_retry};
 use super::chain::{advance, file_of_job, mark_failed};
 use super::commands::JobCancel;
 use crate::fault::DriveReactionFault;
@@ -140,8 +140,8 @@ pub fn on_queued<'r, H: DriveHost>(
     })
 }
 
-/// A run of the file's job started: a sign of life, which pushes the step's
-/// deadline back.
+/// A run of the file's job started: the pickup deadline gives way to the
+/// run-silence deadline, measured from now.
 pub fn on_started<'r, H: DriveHost>(
     cx: &'r mut Reaction<'r>,
     fact: StartedFact,
@@ -151,7 +151,7 @@ pub fn on_started<'r, H: DriveHost>(
             return Ok(());
         };
         tracing::debug!(file = %file.id, job = %fact.0.job_id, run = %fact.0.run_id, "job started");
-        file.step_alive_at = Some(cx.now().as_datetime());
+        run_alive(&mut file, cx.now().as_datetime());
         cx.save(&file).await?;
         Ok(())
     })
@@ -226,7 +226,7 @@ pub fn on_plan_declared<'r, H: DriveHost>(
             return Ok(());
         }
         file.plan = Some(fact.0.steps);
-        file.step_alive_at = Some(cx.now().as_datetime());
+        run_alive(&mut file, cx.now().as_datetime());
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
         crate::file::file_changed::<H>(cx, &file, FileCause::ProgressChanged)?;
@@ -259,7 +259,7 @@ pub fn on_step_started<'r, H: DriveHost>(
         file.progress_index = Some(index);
         file.progress_label = Some(fact.0.label);
         file.progress_at = Some(started_at);
-        file.step_alive_at = Some(cx.now().as_datetime());
+        run_alive(&mut file, cx.now().as_datetime());
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
         crate::file::file_changed::<H>(cx, &file, FileCause::ProgressChanged)?;

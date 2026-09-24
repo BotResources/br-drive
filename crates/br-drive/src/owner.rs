@@ -3,13 +3,15 @@
 //! by the drive's id; every file impact the library stages then also
 //! impacts that key, so the host's views bound to its own noun — an object
 //! carrying file counts, say — recompute and republish. The library never
-//! calls the host.
+//! calls the host. A drive is created from its host object and takes its key
+//! (`create_drive`), so the two ids cannot differ.
 
 use std::collections::HashMap;
 
 use service_engine::error::EngineError;
 use service_engine::impact::Dims;
 use service_engine::name::NounName;
+use service_engine::persistence::{Aggregate, Persistence};
 use service_engine::pipeline::Ops;
 use service_engine::wire::Noun;
 use sqlx::{PgConnection, Row};
@@ -20,10 +22,45 @@ use crate::host::DriveHost;
 
 /// A host noun whose objects are keyed by a drive's id — the object a drive
 /// hangs off. Named by `DriveHost::DriveOwner`, typed, so the compiler checks
-/// both the noun and its key; the host writes `impl DriveOwnerNoun for Its {}`.
+/// both the noun and its key; the host writes
+/// `impl DriveOwnerNoun for Its { type Object = ItsRow; }`.
 pub trait DriveOwnerNoun: Noun<Key = Uuid> {
+    /// The host object a drive hangs off: `create_drive` takes one and the
+    /// drive takes its key, so a drive's id is its host object's id by
+    /// construction. `NoDriveOwner` names `Unowned`, which has no value: such
+    /// a host creates its drives with `create_unowned_drive`.
+    type Object: DriveOwnerObject;
+
     /// Whether the library impacts this noun at all; only `NoDriveOwner` says no.
     const REFRESHED: bool = true;
+}
+
+/// What a drive is created from: the id it takes. Every engine aggregate keyed
+/// by a UUID is one — the drive takes its key.
+pub trait DriveOwnerObject {
+    fn drive_id(&self) -> Uuid;
+}
+
+impl<A> DriveOwnerObject for A
+where
+    A: Aggregate,
+    A::Store: Persistence<Key = Uuid>,
+{
+    fn drive_id(&self) -> Uuid {
+        self.key()
+    }
+}
+
+/// The owner object of a host with no owner noun: it has no value, so such a
+/// host never calls `create_drive` and names its drives' ids itself
+/// (`create_unowned_drive`) — nothing in the library relies on them then.
+#[derive(Debug, Clone, Copy)]
+pub enum Unowned {}
+
+impl DriveOwnerObject for Unowned {
+    fn drive_id(&self) -> Uuid {
+        match *self {}
+    }
 }
 
 /// The owner noun of a host whose objects need no refresh from the drives.
@@ -35,8 +72,12 @@ impl Noun for NoDriveOwner {
 }
 
 impl DriveOwnerNoun for NoDriveOwner {
+    type Object = Unowned;
     const REFRESHED: bool = false;
 }
+
+/// The host object a drive of `H` is created from.
+pub type OwnerObject<H> = <<H as DriveHost>::DriveOwner as DriveOwnerNoun>::Object;
 
 /// Whether the host asked for its objects to refresh with their drive's files.
 pub(crate) fn refreshes<H: DriveHost>() -> bool {

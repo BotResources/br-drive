@@ -70,7 +70,9 @@ pub enum DriveRequest<'a, H> {
         file: &'a FileRow<H>,
     },
     /// Writing a rendition or an image into a READY file without a runner or
-    /// a job (`<p>ImportPages`, `<p>ImportImage`): the host decides who may.
+    /// a job (`<p>ImportPages`, `<p>ImportImage`), or committing a PENDING
+    /// upload without processing it (`<p>ImportCommit`): the host decides who
+    /// may. The file's state is in the row.
     Import {
         file: &'a FileRow<H>,
     },
@@ -131,16 +133,23 @@ pub trait DriveHost: Principal {
     /// type: its name and its UUID key are checked by the compiler.
     type DriveOwner: DriveOwnerNoun;
 
-    /// How long a step of a processing chain may stay silent before the
-    /// library cancels its job and fails the file with `timed_out`. Silence is
-    /// measured from the step's last sign of life: its entry, then each run
-    /// start, plan, step and runner report — so time spent queued counts until
-    /// the first run starts. Jobs never fails a job no live runner picked up,
-    /// so without it a file whose runner type has no live instance would sit in
-    /// PROCESSING for good. The default is Jobs' own longest run (72 h), so the
-    /// library never gives up on work Jobs still allows; a host that wants its
-    /// users to learn sooner lowers it. Checked at registration: positive and
-    /// within the scheduler's range.
+    /// How long a step's job may wait for a runner: from the job's creation
+    /// until Jobs reports its run started. A job no live instance of its runner
+    /// type picks up is never failed by Jobs (its backstops need a started
+    /// run), so past this deadline the library cancels it and the file lands
+    /// FAILED `timed_out`, open to a reprocess. Default 1 h; a host whose
+    /// fleet may queue work longer than that raises it. Checked at
+    /// registration: positive and within the scheduler's range.
+    const PICKUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+    /// How long a started run may stay silent before the library cancels its
+    /// job and fails the file with `timed_out`. Silence is measured from the
+    /// run's last sign of life: its start, then each plan, step and runner
+    /// report. The default is Jobs' own longest run (72 h), so the library
+    /// never gives up on work Jobs still allows; a host that wants its users to
+    /// learn sooner lowers it. Before the run starts, `PICKUP_TIMEOUT` applies
+    /// instead. Checked at registration: positive and within the scheduler's
+    /// range.
     const STEP_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;
@@ -148,7 +157,8 @@ pub trait DriveHost: Principal {
     fn visible_drives(&self) -> Vec<Uuid>;
 
     /// The scope a service account must hold to import a rendition into a
-    /// file (`<p>ImportPages`, `<p>ImportImage`); `None` (the default) means
+    /// file (`<p>ImportPages`, `<p>ImportImage`) or to commit an upload without
+    /// processing (`<p>ImportCommit`); `None` (the default) means
     /// the host offers no import. The host's `DriveRequest::Import` gate then
     /// decides file by file.
     const IMPORT_SCOPE: Option<&'static str> = None;

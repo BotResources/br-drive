@@ -144,6 +144,7 @@ pub fn request_upload<'m, H: DriveHost>(
             completed_at: None,
             step_entered_at: None,
             step_alive_at: None,
+            run_started_at: None,
             stray_job_id: None,
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
@@ -186,13 +187,7 @@ pub fn commit_upload<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.commit_gate(cx.principal()).require()?;
-        let landed = reader
-            .head(BlobRef(file.blob_ref))
-            .await?
-            .is_some_and(|head| head.verified() == Some(true));
-        if !landed {
-            return Err(DriveFault::Refused(codes::UPLOAD_NOT_LANDED));
-        }
+        require_landed(&reader, &file).await?;
         file.processing_state = ProcessingState::Ready;
         file.updated_at = cx.now().as_datetime();
         let ruleset = select_ruleset(
@@ -213,6 +208,23 @@ pub fn commit_upload<'m, H: DriveHost>(
         }
         Ok(())
     })
+}
+
+/// A live storage HEAD: the pending file's object is present and is the
+/// pinned bytes (`UPLOAD_NOT_LANDED` otherwise).
+pub(crate) async fn require_landed<H>(
+    reader: &BlobReader,
+    file: &FileRow<H>,
+) -> Result<(), DriveFault> {
+    let landed = reader
+        .head(BlobRef(file.blob_ref))
+        .await?
+        .is_some_and(|head| head.verified() == Some(true));
+    if landed {
+        Ok(())
+    } else {
+        Err(DriveFault::Refused(codes::UPLOAD_NOT_LANDED))
+    }
 }
 
 #[derive(Serialize, Deserialize)]

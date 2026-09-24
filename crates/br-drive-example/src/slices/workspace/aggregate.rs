@@ -20,10 +20,13 @@ impl Noun for Workspace {
     const NAME: NounName = NounName::from_static("workspace");
 }
 
-/// A workspace is the object its drive hangs off (same id): it refreshes when
-/// the drive's files change.
+/// A workspace is the object its drive hangs off: the drive is created from
+/// the row and takes its id, and the workspace refreshes when the drive's
+/// files change.
 #[cfg(feature = "drive")]
-impl br_drive::DriveOwnerNoun for Workspace {}
+impl br_drive::DriveOwnerNoun for Workspace {
+    type Object = WorkspaceRow;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
