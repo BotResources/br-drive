@@ -41,7 +41,7 @@ pub fn create_workspace<'m>(
         };
         cx.create(&workspace).await?;
         #[cfg(feature = "drive")]
-        br_drive::create_drive(cx, workspace.id, owner).await?;
+        br_drive::create_drive::<AppPrincipal>(cx, &workspace, owner).await?;
         cx.impact_caused::<Workspace, _>(&workspace.id, WorkspaceCause::Created)?;
         cx.impact_principal_facts(PrincipalId::from(owner), ownership_dep());
         Ok(())

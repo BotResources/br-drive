@@ -10,6 +10,7 @@ use crate::fault::{DriveFault, codes};
 use crate::file::{FileCause, FileRow, store};
 use crate::folders::{delete_rows, impact_rows};
 use crate::host::DriveHost;
+use crate::owner::{DriveOwnerObject, NoDriveOwner, OwnerObject};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveRow {
@@ -123,7 +124,33 @@ impl Aggregate for DriveRow {
     }
 }
 
-pub async fn create_drive(ops: &mut Ops<'_>, id: Uuid, created_by: Uuid) -> Result<(), DriveFault> {
+/// Creates the drive of a host object, in the host's transaction: the drive
+/// takes the object's key, so a host view keyed by that object refreshes when
+/// the drive's files change (`DriveHost::DriveOwner`). A host whose owner is
+/// `NoDriveOwner` has no such object and calls `create_unowned_drive`.
+pub async fn create_drive<H: DriveHost>(
+    ops: &mut Ops<'_>,
+    owner: &OwnerObject<H>,
+    created_by: Uuid,
+) -> Result<(), DriveFault> {
+    insert_drive(ops, owner.drive_id(), created_by).await
+}
+
+/// Creates a drive of a host that declared no owner noun
+/// (`type DriveOwner = NoDriveOwner`), under an id the host chooses: nothing
+/// is refreshed from it, so nothing relies on it matching another object.
+pub async fn create_unowned_drive<H>(
+    ops: &mut Ops<'_>,
+    id: Uuid,
+    created_by: Uuid,
+) -> Result<(), DriveFault>
+where
+    H: DriveHost<DriveOwner = NoDriveOwner>,
+{
+    insert_drive(ops, id, created_by).await
+}
+
+async fn insert_drive(ops: &mut Ops<'_>, id: Uuid, created_by: Uuid) -> Result<(), DriveFault> {
     let drive = DriveRow {
         id,
         created_by,

@@ -62,16 +62,24 @@ The engine's "library slice" path, exactly as `example-lib-roster` does it:
    a `CatalogueWatch` the host stops at shutdown (milestone 4, see "Processing
    rules").
 4. Create and delete drives from the host's own mutations, in the host's own
-   transaction: `br_drive::create_drive(cx, id, created_by)` and
-   `br_drive::delete_drive::<AppPrincipal>(cx, id)` (cascades to the files and
-   releases their blobs). A drive has no name and no row of its own on the wire:
-   its id is the host object's id, it is the unit of visibility and the root of
-   the cascade, nothing else. `br_drive::set_protected` marks a file the users
+   transaction: `br_drive::create_drive::<AppPrincipal>(cx, &workspace_row,
+   created_by)` and `br_drive::delete_drive::<AppPrincipal>(cx, id)` (cascades
+   to the files and releases their blobs). A drive has no name and no row of
+   its own on the wire: it is created **from** its host object and takes that
+   object's key, so its id is the host object's id by construction (there is
+   no id parameter to get wrong); it is the unit of visibility and the root of
+   the cascade, nothing else. A host whose `DriveOwner` is
+   `br_drive::NoDriveOwner` has no host object to refresh and calls
+   `br_drive::create_unowned_drive::<AppPrincipal>(cx, id, created_by)` with an
+   id of its choosing instead — nothing in the library relies on it then.
+   `br_drive::set_protected` marks a file the users
    may neither rename, move nor delete, `br_drive::set_metadata(ops, principal,
    file_id, metadata)` writes the host's free JSON on a file after asking the
    host's gate for that principal (`SetMetadata { file }`; both refuse an
    unchanged value with `NOTHING_TO_CHANGE`), and `br_drive::drive_of` answers which drive a file
-   belongs to.
+   belongs to. `set_protected` is a host-internal function with no library
+   gate: the host checks its own permission before calling it (the example
+   host's `workspaceProtectFile` reserves it to the workspace owner).
 
 Every root field the library contributes is prefixed by the host; the value
 types (`DriveFile`, `DriveDelta`, …) keep their names in every embed, so a
@@ -83,13 +91,13 @@ rolls them together. The host never writes to the `drive` schema directly.
 
 1. **Compose**: `slice drive ["drive"] from br_drive::drive_slice { query = drive::DriveQuery, mutation = drive::DriveMutation, subscription = drive::DriveSubscription }` under the host's `prefix`; every root below appears at that prefix.
 2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and both of the library's self-commands arrive as a service actor, and a resolver that rejects services parks all ten reactions.
-3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `IMPORT_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `STEP_TIMEOUT`, `drive_gate`, `visible_drives` (never a service principal), `display_name`, `upload_window`, `erase_mode`, the two folder hooks.
+3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `IMPORT_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `PICKUP_TIMEOUT`, `STEP_TIMEOUT`, `drive_gate`, `visible_drives` (never a service principal), `display_name`, `upload_window`, `erase_mode`, the two folder hooks.
 4. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
 5. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
 6. **Catalogue watch**: `br_drive::watch_runner_types(engine.nats().clone(), pool.clone())` after boot, `CatalogueWatch::stop` at shutdown; the `PUBLISHED_LANGUAGE` bucket must exist on the broker.
 7. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
 8. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
-9. **Drives**: created and deleted from the host's own mutations (`create_drive`, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_protected`, `set_metadata`, `drive_of` for curation.
+9. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_protected`, `set_metadata`, `drive_of` for curation.
 
 ### The `DriveHost` seam
 
@@ -100,6 +108,8 @@ impl DriveHost for AppPrincipal {
     const VISIBILITY_DEPS: Deps = Deps::from_bits(1 << OWNERSHIP_DEP);
     const IMPORT_SCOPE: Option<&'static str> = Some("workspace:import"); // default None: no import
     type DriveOwner = Workspace;                        // or br_drive::NoDriveOwner
+    const PICKUP_TIMEOUT: Duration = …;                 // default 1 h
+    const STEP_TIMEOUT: Duration = …;                   // default 72 h
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate { … }
     fn visible_drives(&self) -> Vec<Uuid> { … }
@@ -123,7 +133,7 @@ every `RequestUpload`.
   `UpdateFile { file, target_drive }` (a cross-drive move names both drives),
   `DeleteFile { file }`, `MoveFolder { drive, old_prefix, new_prefix }`,
   `DeleteFolder { drive, prefix }`, `Process { file }`, `EditPage { file }`,
-  `RegeneratePage { file, number }`, `RetitleFile { file }`, `Import { file }`, `ManageRulesets`, `ReadRulesets`,
+  `RegeneratePage { file, number }`, `RetitleFile { file }`, `Import { file }`, `ImportCommit { file }`, `ManageRulesets`, `ReadRulesets`,
   `ManageLabels`, `ReadLabels`, `SetFileLabels { file }`,
   `SetMetadata { file }`. The host answers `Gate::allowed()`
   or `Gate::blocked(<its own reason code>)` — to refuse a media type it cannot
@@ -145,11 +155,27 @@ every `RequestUpload`.
   principal's facts are loaded when the request arrives, so a host whose
   rule depends on a fact that may change concurrently (an ownership
   transfer, say) re-checks it under its own lock when that matters.
-  `MoveFolder` / `DeleteFolder` are drive-level decisions: the host is asked
-  about the folder, not about each file under it.
+  `MoveFolder` / `DeleteFolder` ask the host about the folder first, then,
+  for **every file under the prefix**, the very decision the per-file gesture
+  asks — `UpdateFile { file, target_drive }` for a move, `DeleteFile { file }`
+  for a delete, `FILE_PROTECTED` included — so a principal cannot move or
+  delete through a folder a file it could not move or delete on its own. All
+  or nothing: the first refusal in path order refuses the whole gesture with
+  that code (the host's, or `FILE_PROTECTED`); a refusal about a file the
+  principal cannot see (`FILE_NOT_FOUND`, above) anywhere in the folder
+  answers `FOLDER_NOT_FOUND` for the whole gesture, what a prefix holding
+  nothing answers — so an invisible file is neither named, nor placed, nor
+  told apart from an empty folder. This holds as long as the host refuses a
+  principal every file of a drive it does not see; a host that lets such a
+  principal act on some files (an uploader rule, say) lets a folder gesture
+  tell which case applied. The per-file decisions are in memory over the rows
+  the gesture already loads: they add no statement.
 - `type DriveOwner` — the host's own noun whose objects are keyed by the
-  drive's id (the convention above: a drive's id is its host object's id),
-  marked `impl br_drive::DriveOwnerNoun for Its {}`; or
+  drive's id, marked `impl br_drive::DriveOwnerNoun for Its { type Object =
+  ItsRow; }` (`ItsRow` the host aggregate, keyed by a UUID, that
+  `create_drive` takes — so a drive's id is the key of the object the host
+  declares, by construction rather than by convention; `DriveOwnerObject` is
+  sealed); or
   `br_drive::NoDriveOwner` for a host with nothing to refresh. The noun is a
   type, so its name and its UUID key are checked by the compiler. Every file
   change the library stages — a file requested, committed, processed,
@@ -164,7 +190,8 @@ every `RequestUpload`.
   statement, served by an index. Cost: each such impact re-runs the window
   query of every live session holding a window on the host noun.
 - `IMPORT_SCOPE` (default `None`): the scope a service account must hold to
-  import a rendition (`<p>ImportPages`, `<p>ImportImage`). `None` means the
+  import a rendition (`<p>ImportPages`, `<p>ImportImage`) or commit an upload
+  without processing (`<p>ImportCommit`). `None` means the
   host offers no import at all: the library refuses with
   `IMPORT_SCOPE_REQUIRED` before any gate, as it does for the runner scope.
 - `visible_drives` is the cohort membership of the reactive views (dimension
@@ -208,8 +235,8 @@ renders it, is committed at
 | `<p>UpdateFile(fileId, name?, path?, driveId?): MutationAck!` | rename, move, or move to another drive of the same host; both drives are locked before the sibling check, so a concurrent collision answers `NAME_TAKEN`, never a database error; `NOTHING_TO_CHANGE` when nothing differs, `FILE_PROTECTED` on a protected file. |
 | `<p>RetitleFile(fileId, title): MutationAck!` | gate `RetitleFile { file }` (affordance `retitle`); changes the title and nothing else — never the name, the path, the drive or the state, and `UpdateFile` never touches the title; `INVALID_TITLE`, `NOTHING_TO_CHANGE` for the same title; the host decides whether a `protected` file may be retitled (the row is in the request). |
 | `<p>DeleteFile(fileId): MutationAck!` | cascade; the source blob is released in the same transaction. |
-| `<p>MoveFolder(driveId, oldPrefix, newPrefix): MutationAck!` | bulk pipeline: one `UPDATE` on the prefix (the rows are locked first), then `folder_moved`; `FOLDER_NOT_FOUND`, `FOLDER_INTO_ITSELF`, `NAME_TAKEN` (refused as a whole), `FILE_PROTECTED` if any file under the prefix is protected, `INVALID_PATH` for the root or a rebased path over 1024 bytes. |
-| `<p>DeleteFolder(driveId, prefix): MutationAck!` | bulk pipeline: one `DELETE` for every file under the prefix, one blob release per file, then `folder_deleted`. |
+| `<p>MoveFolder(driveId, oldPrefix, newPrefix): MutationAck!` | gate `MoveFolder`, then the `move` decision of every file under the prefix (all or nothing: the first refusal's code, `FILE_PROTECTED` included; `FOLDER_NOT_FOUND` for a file the caller cannot see); bulk pipeline: one `UPDATE` on the prefix (the rows are locked first), then `folder_moved`; `FOLDER_NOT_FOUND`, `FOLDER_INTO_ITSELF`, `NAME_TAKEN` (refused as a whole), `INVALID_PATH` for the root or a rebased path over 1024 bytes. |
+| `<p>DeleteFolder(driveId, prefix): MutationAck!` | gate `DeleteFolder`, then the `delete` decision of every file under the prefix (same all-or-nothing rule); bulk pipeline: one `DELETE` for every file under the prefix, one blob release per file, then `folder_deleted`. |
 | `<p>File(fileId): DriveFile` | the file as the caller sees it, or `null`. |
 | `<p>DriveFiles(driveId): [DriveFile!]!` | the drive's files as the caller sees them (the tree is a path prefix; empty folders do not exist). |
 | `<p>Pages(fileId): [DrivePage!]!` | the file's rendition, page by page (milestone 3); empty when the caller cannot read the file. |
@@ -295,6 +322,7 @@ runner reports and never interprets a media type.
 | `<p>RunnerRequestImageUpload(fileId, jobId, name, mediaType, size: ByteCount, sha256): UploadTicket!` | a verified presigned POST for a `drive_image` blob (the runner hashes first; `FILE_TOO_LARGE` past `DriveHost::IMAGE_MAX_BYTES`) and the `file_image` row, unique per file by name. An existing name is **replaced only when the new object lands**: until then the old image stays readable and a failed replacement upload changes nothing; when it lands, the row swaps and the old object is released in the same transaction. A re-request for a name whose upload is still in flight is refused with `IMAGE_UPLOAD_PENDING` (the first ticket stands, one blob per request — the same posture as the source's `KEY_REUSED`); past the host's `upload_window` a re-request replaces the abandoned blob. |
 | `<p>ImportPages(fileId, pages: [ImportedPageInput!]!, summary, pageCount, estimatedTokens): MutationAck!` | the host-privileged import of an existing rendition: a service account holding the host's `IMPORT_SCOPE` (`IMPORT_SCOPE_REQUIRED` otherwise, before anything else), then the gate `Import { file }`, then a `READY` file (`FILE_PROCESSING`, `FILE_NOT_READY` otherwise) — no job, no runner scope. Pages `{ number, markdown, origin? }` (`RUNNER` by default; `EDITED` keeps a page a person had corrected; `REGENERATED` is refused, `INVALID_PAGE_ORIGIN`; an imported page records the importer and the import time as its `updatedBy` / `updatedAt`) are upserted by number under the same rules as a report (≤ 512 per call, numbers ≥ 1 and distinct, the indexing pair together, the estimate optional); each reaches `<p>FilePages` (`Imported { origin }`), an indexing reaches the file (`RenditionImported`); the file stays `READY`; `NOTHING_TO_CHANGE` for an empty import. For a downstream project moving an existing corpus in without re-running its conversions. |
 | `<p>ImportImage(fileId, name, mediaType, size: ByteCount, sha256): UploadTicket!` | same scope, gate and state; the runner's verified image path (page-scoped name, replacement on landing) without its job. |
+| `<p>ImportCommit(fileId): MutationAck!` | commits a pending upload **without processing**: the same scope as an import (`IMPORT_SCOPE_REQUIRED` first, before any file is looked at), then the host's own gate `ImportCommit { file }` on the pending row (its uploader included — the example host reserves it to the migration account's own uploads), then `FILE_NOT_PENDING`, then the same live storage HEAD as `CommitUpload` (`UPLOAD_NOT_LANDED`); the file lands `READY` (`UploadCommitted`) and no rule runs, even when an `upload` rule matches — no chain, no `job.create`. For a host that declared its processing rules before migrating its corpus: upload, `ImportCommit`, then `ImportPages` / `ImportImage`. A normal `CommitUpload` is unchanged. |
 | `<p>RunnerReport(fileId, jobId, pages: [ReportedPageInput!], origin: PageOrigin, summary, pageCount, estimatedTokens, done): MutationAck!` | pages in one or several batches of at most `MAX_REPORT_PAGES` (512, `BATCH_TOO_LARGE`), **upserted by number** (a replayed batch changes nothing; a number twice in one batch is `INVALID_PAGE`); each page reaches `<p>FilePages` on its own key (`Reported { job_id, origin }`) and the file row is touched only by the indexer's triple. `origin` `RUNNER` (default) or `REGENERATED` — on a regenerated page the images of that page that its new markdown no longer references (matched on the whole name, `![…](p001-img01.png)`, never as a substring) are dropped and released (`ImagesDropped { names }` on the file); `summary` and `pageCount` are the indexer's pair and move together, `estimatedTokens` is optional and only rides along with them (`INDEXER_FIELDS_TOGETHER` otherwise, `INVALID_INDEXER_VALUE` when negative; an indexing without an estimate clears a previous one; `ReportStored { job_id, done }` on the file when any of the three changes); an empty report is `NOTHING_TO_CHANGE` unless `done`; `done: true` records `done_at` and stages `job.finish.v2` (see "Processing rules"). |
 
 The job. Every runner root validates `jobId` against the File's own `job_id`
@@ -373,16 +401,27 @@ watch has not scanned yet is kept, every step reported in
 The chain, one step at a time, in the library's own transactions:
 
 1. the file enters the step (`PROCESSING`, `progress { stepIndex, stepCount,
-   runnerType }`) and a `step-deadline` message is scheduled. The deadline
-   measures **silence**: `DriveHost::STEP_TIMEOUT` (default 72 h, Jobs' own
-   longest run) after the step's last sign of life — its entry, then every
-   run start, plan, step and runner report — so time spent queued counts until
-   the first run starts. A step silent that long has its job cancelled
+   runnerType }`) and a `step-deadline` message is scheduled. The deadline has
+   two stages. **Pickup**: `DriveHost::PICKUP_TIMEOUT` (default 1 h) from the
+   creation of the step's job until Jobs reports its run started — a runner
+   type with no live instance, whose job Jobs never dispatches, fails the file
+   within the hour instead of three days later. **Run silence**:
+   `DriveHost::STEP_TIMEOUT` (default 72 h, Jobs' own longest run) after the
+   run's last sign of life — its start, then every plan, step and runner
+   report (a report or a plan also ends the pickup stage, should the `started`
+   fact come late). A step past either has its job cancelled
    (`job.cancel.v2`) and the file lands `FAILED` `timed_out`, open to a
    reprocess. Jobs never fails a job no live runner picks up — its backstops
-   need a started run — so without it a runner type with no live instance
-   would hold the file in `PROCESSING` for good. The timeout is checked at
-   registration (positive, within the scheduler's range);
+   need a started run — so without it that file would sit in `PROCESSING` for
+   good. A host whose fleet may keep work queued longer than an hour raises
+   `PICKUP_TIMEOUT`. The pickup clock starts at the step's **first** job: a
+   launch deferred until the first catalogue scan does not eat into it, a
+   relaunch after a crossed cancel does not restart it. It starts when the job
+   is staged, so a Jobs or broker outage longer than `PICKUP_TIMEOUT` fails
+   the steps entered during it; and Jobs reports only a job's first run as
+   started, so a retry after a failed attempt waits under `STEP_TIMEOUT`.
+   Both are checked at registration (positive, within the scheduler's range,
+   and `PICKUP_TIMEOUT` ≤ `STEP_TIMEOUT`);
 2. the step's runner type must be `ACTIVE` in the mirrored catalogue, else
    `FAILED` with `processingError = runner_type_unavailable` before any job
    (Jobs would not refuse an unknown type — it would wait). On a host whose
@@ -390,8 +429,8 @@ The chain, one step at a time, in the library's own transactions:
    the launch is **deferred**, not failed: the file waits in the step and a
    `launch-retry` message asks again after `LAUNCH_RETRY_AFTER` (5 s), then
    twice as long each time up to `LAUNCH_RETRY_CAP` (5 min), until the scan
-   lands — one warning at the first deferral — the step deadline bounding the
-   wait;
+   lands — one warning at the first deferral — the pickup deadline bounding
+   the wait (it starts over when the step's first job is finally created);
 3. a `job_id` is minted on the File and `integration.cmd.jobs.job.create.v1`
    is staged through the engine outbox: `producer`, `source_bc` and
    `config.host` are the host service, `source_entity_id` is the file (so Jobs
@@ -546,8 +585,11 @@ drive hangs off, owner-only gate: `workspaceCreate` / `workspaceDelete` /
 `workspaceTransfer` / `workspaceProtectFile`; the `workspace:manage` scope on
 a human passport is its `ManageRulesets` gate, any human reads the rules), the
 embedded `drive` slice, the catalogue watch started at boot (or later, for
-the scenarios that model a fresh host), a 30 s `STEP_TIMEOUT` so the timeout
-scenarios run in the suite, `src/bin/service.rs` handing everything to the engine boot kit, and `tests/`
+the scenarios that model a fresh host), a 20 s `PICKUP_TIMEOUT` and a 30 s
+`STEP_TIMEOUT` so the timeout scenarios run in the suite, a
+`{"hold": true}` metadata rule refusing to move or delete a file (the per-file
+rule the folder scenarios meet), a `workspace:sweep` scope allowed folder
+gestures but no file, `src/bin/service.rs` handing everything to the engine boot kit, and `tests/`
 — the harness spawns real PostgreSQL roles, `nats-server` and `minio`, boots
 the host in process and drives it over GraphQL and a real
 `graphql-transport-ws` socket. Jobs is played by a stand-in that publishes the

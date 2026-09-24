@@ -9,7 +9,7 @@ use crate::file::{
 };
 use crate::folders::{self, DeleteFolder, MoveFolder};
 use crate::host::DriveHost;
-use crate::import::{self, ImportImage, ImportPages};
+use crate::import::{self, ImportCommit, ImportImage, ImportPages};
 use crate::label::{
     CreateLabel, DeleteLabel, DriveLabels, SetFileLabels, UpdateLabel, create_label, delete_label,
     set_file_labels, update_label,
@@ -33,7 +33,7 @@ pub fn register<H: DriveHost>(
     prefix: &'static str,
 ) -> Result<(), EngineError> {
     processing::declare_roots::<H>(prefix)?;
-    processing::step_timeout::<H>()?;
+    processing::check_timeouts::<H>()?;
     if !engine.blobs_configured() {
         return Err(EngineError::Config(
             "br-drive needs object storage: configure EngineConfig::with_blob_storage before \
@@ -68,6 +68,10 @@ pub fn register<H: DriveHost>(
     engine.register_mutation::<RunnerReport, _>(runner_report::<H>)?;
     engine.register_mutation::<ImportPages, _>(import::import_pages::<H>)?;
     engine.register_mutation::<ImportImage, _>(import::import_image::<H>)?;
+    let reader = engine.blob_reader();
+    engine.register_mutation::<ImportCommit, _>(move |cx, input| {
+        import::import_commit::<H>(cx, input, reader.clone())
+    })?;
     engine.register_bulk::<MoveFolder, _>(folders::move_folder::<H>)?;
     engine.register_bulk::<DeleteFolder, _>(folders::delete_folder::<H>)?;
     engine.register_bulk::<DeleteLabel, _>(delete_label::<H>)?;

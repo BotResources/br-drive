@@ -27,7 +27,7 @@ use service_engine::LibraryMigrations;
 
 pub use blob::{DriveImage as DriveImageBlob, DriveSource};
 pub use catalogue::{CatalogueWatch, watch_runner_types};
-pub use drive::{DriveDeleted, create_drive, delete_drive};
+pub use drive::{DriveDeleted, create_drive, create_unowned_drive, delete_drive};
 pub use erase::{DriveErasure, EraseMode, REDACTED_PERSON};
 pub use fault::{DriveFault, DriveReactionFault, codes};
 pub use file::{
@@ -42,13 +42,15 @@ pub use file::{
 pub use folders::{DeleteFolder, MoveFolder};
 pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
 pub use image::{ImageName, InvalidImageName, MAX_IMAGE_NAME_BYTES};
-pub use import::{ImportImage, ImportPages, ImportedPage, ImportedPageInput};
+pub use import::{ImportCommit, ImportImage, ImportPages, ImportedPage, ImportedPageInput};
 pub use label::{
     CreateLabel, DeleteLabel, DriveLabel, DriveLabels, Label, LabelCause, LabelRow, LabelWindow,
     MAX_LABEL_DESCRIPTION_BYTES, MAX_LABEL_NAME_CHARS, SetFileLabels, UpdateLabel,
 };
 pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
-pub use owner::{DriveOwnerNoun, FileCounts, NoDriveOwner, file_counts};
+pub use owner::{
+    DriveOwnerNoun, DriveOwnerObject, FileCounts, NoDriveOwner, OwnerObject, Unowned, file_counts,
+};
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
 #[allow(deprecated)]
 pub use processing::{

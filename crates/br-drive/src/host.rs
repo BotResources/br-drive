@@ -74,6 +74,12 @@ pub enum DriveRequest<'a, H> {
     Import {
         file: &'a FileRow<H>,
     },
+    /// Committing a PENDING upload without processing it (`<p>ImportCommit`),
+    /// by a principal holding `IMPORT_SCOPE`: the pending row carries its
+    /// uploader, so a host can reserve it to the uploads its migration made.
+    ImportCommit {
+        file: &'a FileRow<H>,
+    },
     /// Reading the host's label catalogue, live included.
     ReadLabels,
     /// Writing a file's free `metadata` through `br_drive::set_metadata`.
@@ -95,6 +101,7 @@ impl<H> DriveRequest<'_, H> {
             | Self::DeleteFile { file }
             | Self::RetitleFile { file }
             | Self::Import { file }
+            | Self::ImportCommit { file }
             | Self::Process { file }
             | Self::EditPage { file }
             | Self::RegeneratePage { file, .. }
@@ -123,24 +130,36 @@ pub trait DriveHost: Principal {
 
     const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
-    /// The host's own noun whose objects are keyed by the drive's id (the
-    /// documented convention: a drive's id is its host object's id), or
+    /// The host's own noun whose objects are keyed by the drive's id (a drive
+    /// is created from its `DriveOwnerNoun::Object` and takes its key), or
     /// `br_drive::NoDriveOwner`. Every file change the library stages also
     /// impacts that key, so a host view bound to its own noun — an object
     /// showing file counts, say — recomputes and republishes. The noun is a
     /// type: its name and its UUID key are checked by the compiler.
     type DriveOwner: DriveOwnerNoun;
 
-    /// How long a step of a processing chain may stay silent before the
-    /// library cancels its job and fails the file with `timed_out`. Silence is
-    /// measured from the step's last sign of life: its entry, then each run
-    /// start, plan, step and runner report — so time spent queued counts until
-    /// the first run starts. Jobs never fails a job no live runner picked up,
-    /// so without it a file whose runner type has no live instance would sit in
-    /// PROCESSING for good. The default is Jobs' own longest run (72 h), so the
-    /// library never gives up on work Jobs still allows; a host that wants its
-    /// users to learn sooner lowers it. Checked at registration: positive and
-    /// within the scheduler's range.
+    /// How long a step's job may wait for a runner: from the job's creation
+    /// until Jobs reports its run started. A job no live instance of its runner
+    /// type picks up is never failed by Jobs (its backstops need a started
+    /// run), so past this deadline the library cancels it and the file lands
+    /// FAILED `timed_out`, open to a reprocess. Default 1 h; a host whose
+    /// fleet may queue work longer than that raises it. Checked at
+    /// registration: positive and within the scheduler's range.
+    /// Not above `STEP_TIMEOUT` (refused at registration). The clock starts
+    /// when the step's first job is staged, not when Jobs queues it, so a Jobs
+    /// or broker outage longer than this fails the steps entered during it;
+    /// and Jobs reports only a job's first run as started, so a retry waiting
+    /// for a runner after a failed attempt is bounded by `STEP_TIMEOUT`.
+    const PICKUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+    /// How long a started run may stay silent before the library cancels its
+    /// job and fails the file with `timed_out`. Silence is measured from the
+    /// run's last sign of life: its start, then each plan, step and runner
+    /// report. The default is Jobs' own longest run (72 h), so the library
+    /// never gives up on work Jobs still allows; a host that wants its users to
+    /// learn sooner lowers it. Before the run starts, `PICKUP_TIMEOUT` applies
+    /// instead. Checked at registration: positive and within the scheduler's
+    /// range.
     const STEP_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;
@@ -148,7 +167,8 @@ pub trait DriveHost: Principal {
     fn visible_drives(&self) -> Vec<Uuid>;
 
     /// The scope a service account must hold to import a rendition into a
-    /// file (`<p>ImportPages`, `<p>ImportImage`); `None` (the default) means
+    /// file (`<p>ImportPages`, `<p>ImportImage`) or to commit an upload without
+    /// processing (`<p>ImportCommit`); `None` (the default) means
     /// the host offers no import. The host's `DriveRequest::Import` gate then
     /// decides file by file.
     const IMPORT_SCOPE: Option<&'static str> = None;

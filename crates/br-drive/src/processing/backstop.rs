@@ -1,5 +1,6 @@
 //! The two scheduled messages that keep a chain from sitting in PROCESSING
-//! forever: the step deadline, and the retry of a launch deferred until the
+//! forever: the step deadline (a pickup stage until the run starts, then a
+//! run-silence stage), and the retry of a launch deferred until the
 //! host's first catalogue scan. Both name the step they were scheduled for by
 //! its index and the instant it was entered, so a message outliving its step is
 //! a no-op, redelivered or not.
@@ -44,15 +45,88 @@ pub fn retry_delay(attempt: u32) -> Duration {
 /// `DriveHost::STEP_TIMEOUT` as a delta the scheduler accepts, checked once at
 /// registration so a launch never meets an unusable value.
 pub fn step_timeout<H: DriveHost>() -> Result<TimeDelta, EngineError> {
-    TimeDelta::from_std(H::STEP_TIMEOUT)
+    schedulable(H::STEP_TIMEOUT, "STEP_TIMEOUT")
+}
+
+/// `DriveHost::PICKUP_TIMEOUT` as a delta the scheduler accepts, checked once
+/// at registration like `step_timeout`.
+pub fn pickup_timeout<H: DriveHost>() -> Result<TimeDelta, EngineError> {
+    schedulable(H::PICKUP_TIMEOUT, "PICKUP_TIMEOUT")
+}
+
+/// Both deadlines, checked together at registration: each schedulable, and
+/// the pickup no longer than the run silence — the one scheduled message
+/// only ever moves later, so a run starting under a longer pickup would keep
+/// the pickup's due date past its silence.
+pub fn check_timeouts<H: DriveHost>() -> Result<(), EngineError> {
+    if pickup_timeout::<H>()? > step_timeout::<H>()? {
+        return Err(EngineError::Config(
+            "DriveHost::PICKUP_TIMEOUT must not exceed DriveHost::STEP_TIMEOUT".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn schedulable(timeout: Duration, name: &str) -> Result<TimeDelta, EngineError> {
+    TimeDelta::from_std(timeout)
         .ok()
         .filter(|timeout| *timeout > TimeDelta::zero())
         .filter(|timeout| Utc::now().checked_add_signed(*timeout).is_some())
         .ok_or_else(|| {
-            EngineError::Config(
-                "DriveHost::STEP_TIMEOUT must be positive and fit a scheduled deadline".into(),
-            )
+            EngineError::Config(format!(
+                "DriveHost::{name} must be positive and fit a scheduled deadline"
+            ))
         })
+}
+
+/// When the step `file` is in times out: `PICKUP_TIMEOUT` after its job was
+/// created while no run has started, `STEP_TIMEOUT` after its last sign of
+/// life once one has. Both measure from `step_alive_at` — the job's creation
+/// until the run starts, then every sign of life.
+fn step_due<H: DriveHost>(
+    file: &FileRow<H>,
+    entered_at: DateTime<Utc>,
+) -> Result<DateTime<Utc>, EngineError> {
+    Ok(due_after(
+        file,
+        entered_at,
+        pickup_timeout::<H>()?,
+        step_timeout::<H>()?,
+    ))
+}
+
+fn due_after<H>(
+    file: &FileRow<H>,
+    entered_at: DateTime<Utc>,
+    pickup: TimeDelta,
+    silence: TimeDelta,
+) -> DateTime<Utc> {
+    let alive = file.step_alive_at.unwrap_or(entered_at);
+    if file.run_started_at.is_some() {
+        alive + silence
+    } else {
+        alive + pickup
+    }
+}
+
+/// The step's job was just created. The pickup deadline runs from the step's
+/// **first** job: a launch deferred until the first catalogue scan does not
+/// eat into it (no job existed yet, `step_alive_at` is still the entry), but a
+/// relaunch after a crossed cancel does not restart it — else a relaunch loop
+/// would never time out.
+pub(super) fn job_created<H>(file: &mut FileRow<H>, now: DateTime<Utc>) {
+    let no_job_yet = file.step_alive_at.is_none() || file.step_alive_at == file.step_entered_at;
+    if no_job_yet && file.run_started_at.is_none() {
+        file.step_alive_at = Some(now);
+    }
+}
+
+/// A sign of life from a started run of the step's job — a `started` fact, a
+/// plan, a step, a runner report: the run-silence deadline takes over from the
+/// pickup deadline, and restarts from now.
+pub(crate) fn run_alive<H>(file: &mut FileRow<H>, now: DateTime<Utc>) {
+    file.step_alive_at = Some(now);
+    file.run_started_at.get_or_insert(now);
 }
 
 fn coordinates<H: DriveHost>(verb: &'static str) -> ReactionCoordinates {
@@ -155,8 +229,7 @@ pub(super) fn schedule_retry<H: DriveHost>(
     )
 }
 
-/// The deadline of the step `file` just entered: `STEP_TIMEOUT` after its last
-/// sign of life (its entry, until Jobs or the runner says more).
+/// The deadline of the step `file` is in (`step_due`).
 pub(super) fn schedule_deadline<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &FileRow<H>,
@@ -166,18 +239,19 @@ pub(super) fn schedule_deadline<H: DriveHost>(
             "a deadline is scheduled only for a file inside a step".into(),
         ));
     };
-    let alive = file.step_alive_at.unwrap_or(entered_at);
     cx.schedule_at(
-        Timestamp::from_utc(alive + step_timeout::<H>()?),
+        Timestamp::from_utc(step_due(file, entered_at)?),
         StepDeadline::<H>::new(file.id, step, entered_at),
     )
 }
 
-/// The step fell silent for `DriveHost::STEP_TIMEOUT`: whatever job it holds is
-/// cancelled and the file lands FAILED `timed_out`, open to a reprocess. Jobs
-/// never fails a job no live runner picked up, so this is the way out of that
-/// state. A step that showed a sign of life since the message was scheduled
-/// gets a later deadline instead.
+/// The step outlived its deadline — no run started within `PICKUP_TIMEOUT` of
+/// its job's creation, or a started run fell silent for `STEP_TIMEOUT`:
+/// whatever job it holds is cancelled and the file lands FAILED `timed_out`,
+/// open to a reprocess. Jobs never fails a job no live runner picked up, so
+/// this is the way out of that state. A step whose deadline moved since the
+/// message was scheduled (a run started, a sign of life, a new job) gets a
+/// later message instead.
 pub fn step_deadline<'r, H: DriveHost>(
     cx: &'r mut Reaction<'r>,
     message: StepDeadline<H>,
@@ -189,8 +263,7 @@ pub fn step_deadline<'r, H: DriveHost>(
         if !names_the_step(&file, message.step, message.entered_at) {
             return Ok(());
         }
-        let alive = file.step_alive_at.unwrap_or(message.entered_at);
-        if cx.now().as_datetime() < alive + step_timeout::<H>()? {
+        if cx.now().as_datetime() < step_due(&file, message.entered_at)? {
             schedule_deadline(cx, &file)?;
             return Ok(());
         }
@@ -270,6 +343,63 @@ mod tests {
             file.processing_state = state;
             assert!(!names_the_step(&file, 1, entered), "{state:?}");
         }
+    }
+
+    #[test]
+    fn a_step_waits_for_its_pickup_until_a_run_starts_then_for_silence() {
+        let entered = Utc::now().trunc_subsecs(6);
+        let (pickup, silence) = (TimeDelta::hours(1), TimeDelta::hours(72));
+        let mut file = crate::file::tests_support::processing_file::<()>(0, entered);
+        assert_eq!(
+            due_after(&file, entered, pickup, silence),
+            entered + pickup,
+            "queued: the pickup deadline, from the job's creation"
+        );
+        let created = entered + TimeDelta::minutes(10);
+        file.step_alive_at = Some(created);
+        assert_eq!(
+            due_after(&file, entered, pickup, silence),
+            created + pickup,
+            "a later job (a deferred or relaunched step) restarts the pickup clock"
+        );
+        let started = created + TimeDelta::minutes(50);
+        run_alive(&mut file, started);
+        assert_eq!(
+            due_after(&file, entered, pickup, silence),
+            started + silence
+        );
+        let later = started + TimeDelta::hours(5);
+        run_alive(&mut file, later);
+        assert_eq!(
+            file.run_started_at,
+            Some(started),
+            "the run started once; later signs of life only move the silence clock"
+        );
+        assert_eq!(due_after(&file, entered, pickup, silence), later + silence);
+    }
+
+    #[test]
+    fn the_pickup_clock_starts_at_the_first_job_and_ignores_relaunches() {
+        let entered = Utc::now().trunc_subsecs(6);
+        let pickup = TimeDelta::hours(1);
+        let silence = TimeDelta::hours(72);
+        let mut file = crate::file::tests_support::processing_file::<()>(0, entered);
+        // A launch deferred for ten minutes, then its first job.
+        let first = entered + TimeDelta::minutes(10);
+        job_created(&mut file, first);
+        assert_eq!(due_after(&file, entered, pickup, silence), first + pickup);
+        // Two relaunches after crossed commands keep the first job's clock.
+        for minutes in [11, 12] {
+            job_created(&mut file, entered + TimeDelta::minutes(minutes));
+        }
+        assert_eq!(due_after(&file, entered, pickup, silence), first + pickup);
+        // A job created at the very instant the step was entered.
+        let mut fresh = crate::file::tests_support::processing_file::<()>(0, entered);
+        job_created(&mut fresh, entered);
+        assert_eq!(
+            due_after(&fresh, entered, pickup, silence),
+            entered + pickup
+        );
     }
 
     use chrono::SubsecRound;

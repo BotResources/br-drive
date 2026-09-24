@@ -430,6 +430,18 @@ macro_rules! drive_slice {
                     .await
                 }
 
+                async fn [<$prefix _import_commit>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::ImportCommit>(
+                        ctx,
+                        $crate::ImportCommit { file_id },
+                    )
+                    .await
+                }
+
                 async fn [<$prefix _import_pages>](
                     &self,
                     ctx: &::async_graphql::Context<'_>,

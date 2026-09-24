@@ -74,6 +74,20 @@ single git tag `v{version}` releases the set. Format follows
 - The label and ruleset live windows follow the principal's facts: a
   principal who gains or loses `ReadLabels` / `ReadRulesets` sees the window
   repopulate at once instead of at the next catalogue change.
+- `MoveFolder` and `DeleteFolder` ask, after the folder-level gate, the
+  per-file decision of every file under the prefix — the `UpdateFile` /
+  `DeleteFile` request the per-file gesture asks, `FILE_PROTECTED` included —
+  all or nothing: in a drive shared by several people a principal could move
+  or delete other people's files through a folder although the host refused
+  them the same gesture on each file. The first refusal in path order answers
+  (the host's code or `FILE_PROTECTED`); a file the principal cannot see
+  answers `FOLDER_NOT_FOUND`, as an empty prefix does. The decisions run in
+  memory over the rows the bulk path already loads, past the reset threshold
+  too.
+- A file no runner picks up no longer stays `PROCESSING` for three days: the
+  step deadline has a pickup stage, `DriveHost::PICKUP_TIMEOUT` (default 1 h)
+  from the creation of the step's job until Jobs reports its run started,
+  before the run-silence stage (`STEP_TIMEOUT`, 72 h).
 
 ### Changed
 
@@ -83,6 +97,21 @@ single git tag `v{version}` releases the set. Format follows
 
 ### Added
 
+- `<p>ImportCommit(fileId)`: commits a pending upload **without processing**
+  — the file lands `READY` and no rule runs, even when an `upload` rule
+  matches — so a host that declared its processing rules before migrating a
+  corpus can still import into it. The same right as an import
+  (`IMPORT_SCOPE`), then a gate of its own, the new
+  `DriveRequest::ImportCommit { file }` on the pending row (its uploader
+  included), then `FILE_NOT_PENDING` and the commit's storage check
+  (`UPLOAD_NOT_LANDED`). `CommitUpload` is unchanged.
+- `DriveHost::PICKUP_TIMEOUT` (default 1 h, checked at registration, not
+  above `STEP_TIMEOUT`): the pickup stage of the step deadline (see Fixed),
+  counted from the step's first job. Migration `9121000009` adds
+  `drive.file.run_started_at`, set by the first sign of a started run (a
+  `started` fact, a plan, a step, a runner report).
+- `br_drive::create_unowned_drive::<H>(ops, id, created_by)`, for a host whose
+  `DriveOwner` is `NoDriveOwner` only.
 - A host-privileged **import** of an existing rendition:
   `<p>ImportPages(fileId, pages, summary?, pageCount?, estimatedTokens?)` and
   `<p>ImportImage(fileId, name, mediaType, size, sha256)`, gated by the new
@@ -118,13 +147,14 @@ single git tag `v{version}` releases the set. Format follows
   cause `Retitled`); renaming or moving never touches the title, retitling
   never moves the file.
 - `DriveHost::STEP_TIMEOUT` (default 72 h, Jobs' longest run; checked at
-  registration): a step silent that long — measured from its last sign of
-  life: entry, run start, plan, step, runner report — has its job cancelled
-  and its file lands `FAILED` `timed_out` (`br_drive::TIMED_OUT`). Jobs never
+  registration): a started run silent that long — measured from its last
+  sign of life: run start, plan, step, runner report — has its job cancelled
+  and its file lands `FAILED` `timed_out` (`br_drive::TIMED_OUT`). Before the
+  run starts, `PICKUP_TIMEOUT` (1 h) bounds the wait the same way: Jobs never
   fails a job no live runner picks up, so this is the way out for a runner
   type with no live instance. One `step-deadline` message per step on a
-  `{service}-drive-step-deadline` durable, rescheduled when the step showed
-  life since.
+  `{service}-drive-step-deadline` durable, rescheduled when the step's
+  deadline moved since.
 - Migration `9121000006`: `drive.file.step_entered_at` (the running step's
   identity; the deadline and the deferred launch key on it),
   `drive.file.step_alive_at` (its last sign of life) and
@@ -145,6 +175,14 @@ single git tag `v{version}` releases the set. Format follows
 ### Changed
 
 - `FileCause` is `#[non_exhaustive]`; new variant `LaunchDeferred { step }`.
+- `DriveHost::STEP_TIMEOUT` now bounds the silence of a **started** run only;
+  before the run starts, `PICKUP_TIMEOUT` applies.
+- `br_drive::create_drive::<H>(ops, owner, created_by)` takes the host object
+  the drive hangs off (`&<H::DriveOwner as DriveOwnerNoun>::Object`) and gives
+  the drive its key, instead of a free id: a drive's id is its host object's
+  id by construction, which the host refresh (`DriveOwner`) relies on.
+  `DriveOwnerNoun` gains `type Object` (a host aggregate keyed by a UUID);
+  `NoDriveOwner`'s is `Unowned`, which has no value.
 - A chain step never names a `parent_job_id` (see Fixed).
 - Image names accept wider page and index numbers (see Fixed).
 - Engine pin `v0.3.0` → `v0.3.4`: authenticated bodies are bounded (0.3.3),
@@ -162,8 +200,10 @@ single git tag `v{version}` releases the set. Format follows
 - Migration `9121000006` adds nullable columns only. Files already
   `PROCESSING` when it is applied carry no step clock and get no deadline:
   let them finish or delete them.
-- `DriveHost::STEP_TIMEOUT` is new with a 72 h default; a host that wants its
-  users to learn sooner that no runner picked a file up lowers it.
+- `DriveHost::STEP_TIMEOUT` is new with a 72 h default: the silence a started
+  run may keep before its file fails `timed_out`; a host that wants its users
+  to learn sooner lowers it (see `PICKUP_TIMEOUT` below for a run that never
+  starts).
 - A host that matched `CATALOGUE_NOT_WATCHED` keeps compiling (deprecated);
   nothing raises it any more.
 - `DriveRequest` gains `CommitUpload { file }`, `ReadLabels` and
@@ -182,7 +222,23 @@ single git tag `v{version}` releases the set. Format follows
 - Migration `9121000007` is one-way: once applied, a pre-0.2 binary cannot
   create a file (`title` is `NOT NULL`).
 - `DriveHost` gains a required associated type, `DriveOwner`: write
-  `type DriveOwner = br_drive::NoDriveOwner;` to keep 0.1's behaviour.
+  `type DriveOwner = br_drive::NoDriveOwner;` to keep 0.1's behaviour, and
+  replace `create_drive(cx, id, created_by)` with
+  `create_unowned_drive::<H>(cx, id, created_by)`. A host that names its own
+  noun writes `impl DriveOwnerNoun for Its { type Object = ItsRow; }` and
+  creates each drive from that row: `create_drive::<H>(cx, &row, created_by)`.
+- `DriveHost::PICKUP_TIMEOUT` is new with a 1 h default: a step whose job no
+  runner starts within an hour of its creation now fails `timed_out`. A host
+  whose fleet may queue work longer raises it; `STEP_TIMEOUT` keeps bounding
+  the silence of a started run. Migration `9121000009` adds a nullable column.
+- `MoveFolder` / `DeleteFolder` now also ask the `UpdateFile` / `DeleteFile`
+  decision of each file under the prefix: a host whose per-file rule is
+  stricter than its folder rule sees folder gestures refused with that rule's
+  code where they went through before.
+- `<p>ImportCommit` is new: it needs `IMPORT_SCOPE` and the host's new
+  `DriveRequest::ImportCommit { file }` — decide it explicitly (a wildcard
+  arm answers it); the row carries the uploader. A host that sets
+  `PICKUP_TIMEOUT` above `STEP_TIMEOUT` is refused at registration.
   `DriveRequest::Import { file }` is new; an import additionally needs
   `IMPORT_SCOPE`, so a host that sets none offers no import whatever its
   gate answers.

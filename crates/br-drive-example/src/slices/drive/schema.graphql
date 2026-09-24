@@ -70,6 +70,7 @@ type DriveMutation {
 	workspaceRetitleFile(fileId: UUID!, title: String!): MutationAck!
 	workspaceDeleteFile(fileId: UUID!): MutationAck!
 	workspaceEditPage(fileId: UUID!, number: Int!, markdown: String!): MutationAck!
+	workspaceImportCommit(fileId: UUID!): MutationAck!
 	workspaceImportPages(fileId: UUID!, pages: [ImportedPageInput!]!, summary: String, pageCount: Int, estimatedTokens: Int): MutationAck!
 	workspaceImportImage(fileId: UUID!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
 	workspaceRunnerRequestImageUpload(fileId: UUID!, jobId: UUID!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!

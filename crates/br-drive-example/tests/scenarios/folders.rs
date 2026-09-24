@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 
+use std::time::Duration;
+
 use uuid::Uuid;
 
 use crate::harness::upload::{UploadRequest, upload};
-use crate::harness::{World, drive_subscription, error_code, next_drive_delta, ok, passport};
+use crate::harness::{
+    World, drive_subscription, error_code, next_drive_delta, ok, passport, quiet, service_passport,
+};
 
 const BYTES: &[u8] = b"folder bytes";
 
@@ -369,6 +373,168 @@ async fn a_protected_file_refuses_user_rename_move_and_delete_and_says_so_in_its
         true
     );
     ok(&delete_folder(&world, &owner, drive, "docs").await);
+
+    world.cleanup().await;
+}
+
+const ANNOTATE: &str =
+    "mutation($f:UUID!,$m:JSON!){workspaceAnnotateFile(fileId:$f,metadata:$m){success}}";
+const SWEEP_SCOPE: &str = "workspace:sweep";
+
+#[tokio::test]
+async fn a_folder_gesture_asks_every_file_the_per_file_rule_and_is_refused_whole() {
+    // Given: a folder holding more files than the host's bulk threshold, one of
+    // them on hold — a host rule refusing to move or delete that file
+    let world = World::start("pod-folder-per-file").await;
+    let owner = passport(Uuid::now_v7());
+    let sweeper = service_passport(&[SWEEP_SCOPE]);
+    let drive = world.create_workspace(&owner, "library").await;
+    let mut ids = seed_tree(&world, &owner, drive).await;
+    for name in ["d.txt", "e.txt"] {
+        let id = upload(
+            &world,
+            &owner,
+            &UploadRequest::text(drive, "docs", name, BYTES),
+        )
+        .await;
+        ids.insert(name, id);
+    }
+    let held = ids["b.txt"];
+    let mut sources = BTreeMap::new();
+    for (name, id) in &ids {
+        sources.insert(*name, world.source_of(*id).await);
+    }
+    let held_source = sources["b.txt"];
+    let mut sub = drive_subscription(&world, &owner, drive).await;
+    ok(&world
+        .gql(
+            &owner,
+            ANNOTATE,
+            serde_json::json!({ "f": held, "m": { "hold": true } }),
+        )
+        .await);
+    let on_hold = next_drive_delta(&mut sub, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "MetadataChanged"
+    })
+    .await;
+    for action in ["delete", "move", "rename"] {
+        assert_eq!(
+            on_hold["view"]["affordances"][action]["allowed"], false,
+            "the file itself cannot be {action}d"
+        );
+        assert_eq!(
+            on_hold["view"]["affordances"][action]["reason"],
+            "FILE_ON_HOLD"
+        );
+    }
+    let before = paths(&world.drive_files(&owner, drive).await);
+    quiet(&mut sub).await;
+
+    // When: another file of the folder, earlier in path order than the held
+    // one (docs/d.txt before docs/sub/b.txt) but later by id, is protected too
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$p:Boolean!){workspaceProtectFile(fileId:$f,protected:$p){success}}",
+            serde_json::json!({ "f": ids["d.txt"], "p": true }),
+        )
+        .await);
+    quiet(&mut sub).await;
+
+    // Then: the folder gestures answer the first refusal in path order
+    assert_eq!(
+        error_code(&move_folder(&world, &owner, drive, "docs", "archive").await),
+        "FILE_PROTECTED"
+    );
+    assert_eq!(
+        error_code(&delete_folder(&world, &owner, drive, "docs").await),
+        "FILE_PROTECTED"
+    );
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$p:Boolean!){workspaceProtectFile(fileId:$f,protected:$p){success}}",
+            serde_json::json!({ "f": ids["d.txt"], "p": false }),
+        )
+        .await);
+    quiet(&mut sub).await;
+
+    // When: the owner, whom the host lets act on the folder, moves or deletes it
+    let moved = move_folder(&world, &owner, drive, "docs", "archive").await;
+    let deleted = delete_folder(&world, &owner, drive, "docs").await;
+
+    // Then: both are refused whole with the host's own code for that file,
+    // exactly what the per-file gesture answers
+    assert_eq!(error_code(&moved), "FILE_ON_HOLD");
+    assert_eq!(error_code(&deleted), "FILE_ON_HOLD");
+    let one_by_one = world
+        .gql(
+            &owner,
+            "mutation($f:UUID!){workspaceDeleteFile(fileId:$f){success}}",
+            serde_json::json!({ "f": held }),
+        )
+        .await;
+    assert_eq!(error_code(&one_by_one), "FILE_ON_HOLD");
+    // And: nothing moved, nothing was released, the host hook never ran, no one heard a thing
+    sub.expect_silence(Duration::from_millis(800)).await;
+    assert_eq!(paths(&world.drive_files(&owner, drive).await), before);
+    for (name, source) in &sources {
+        assert_ne!(
+            world.blob_state(*source).await.as_deref(),
+            Some("orphaned"),
+            "{name} keeps its source"
+        );
+    }
+    assert!(world.folder_gestures(drive).await.is_empty());
+
+    // When: a clean-up account the host lets ask for folder gestures in any
+    // workspace, but for none of its files, tries the same folder and a folder
+    // that does not exist
+    let swept_move = move_folder(&world, &sweeper, drive, "docs", "archive").await;
+    let swept_delete = delete_folder(&world, &sweeper, drive, "docs").await;
+    let swept_nowhere = delete_folder(&world, &sweeper, drive, "nowhere").await;
+
+    // Then: it learns nothing about files it cannot see — the same
+    // `FOLDER_NOT_FOUND` a prefix holding nothing answers — and nothing changes
+    assert_eq!(error_code(&swept_move), "FOLDER_NOT_FOUND");
+    assert_eq!(error_code(&swept_delete), "FOLDER_NOT_FOUND");
+    assert_eq!(error_code(&swept_nowhere), "FOLDER_NOT_FOUND");
+    sub.expect_silence(Duration::from_millis(800)).await;
+    assert_eq!(paths(&world.drive_files(&owner, drive).await), before);
+    assert!(world.folder_gestures(drive).await.is_empty());
+
+    // When: the hold is lifted, the owner's folder gestures go through the bulk path
+    ok(&world
+        .gql(
+            &owner,
+            ANNOTATE,
+            serde_json::json!({ "f": held, "m": { "hold": false } }),
+        )
+        .await);
+    ok(&move_folder(&world, &owner, drive, "docs", "archive").await);
+
+    // Then: past the threshold the session is reset with every path rewritten
+    let reset = next_drive_delta(&mut sub, |node| node["__typename"] == "DriveReset").await;
+    let rewritten: Vec<&str> = reset["views"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|view| view["name"] != "c.txt")
+        .map(|view| view["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(rewritten.len(), 4);
+    assert!(rewritten.iter().all(|path| path.starts_with("archive")));
+    ok(&delete_folder(&world, &owner, drive, "archive").await);
+    assert_eq!(
+        world.blob_state(held_source).await.as_deref(),
+        Some("orphaned")
+    );
+    assert_eq!(
+        paths(&world.drive_files(&owner, drive).await)
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["c.txt"]
+    );
 
     world.cleanup().await;
 }

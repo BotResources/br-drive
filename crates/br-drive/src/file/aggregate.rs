@@ -152,6 +152,9 @@ pub struct FileRow<H> {
     pub completed_at: Option<DateTime<Utc>>,
     pub step_entered_at: Option<DateTime<Utc>>,
     pub step_alive_at: Option<DateTime<Utc>>,
+    /// When the step's current job first showed a started run: the pickup
+    /// deadline gives way to the run-silence deadline from then on.
+    pub run_started_at: Option<DateTime<Utc>>,
     pub stray_job_id: Option<Uuid>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
@@ -193,6 +196,7 @@ impl<H> Clone for FileRow<H> {
             completed_at: self.completed_at,
             step_entered_at: self.step_entered_at,
             step_alive_at: self.step_alive_at,
+            run_started_at: self.run_started_at,
             stray_job_id: self.stray_job_id,
             created_by: self.created_by,
             created_at: self.created_at,
@@ -361,6 +365,20 @@ impl<H: DriveHost> FileRow<H> {
     /// running chain nor lands on an upload that is not confirmed.
     pub fn import_gate(&self, principal: &H) -> Gate {
         ready(self, principal, DriveRequest::Import { file: self })
+    }
+
+    /// The host's `ImportCommit` gate, then a PENDING file: committing an
+    /// upload without processing is an import's privilege (`<p>ImportCommit`).
+    pub fn import_commit_gate(&self, principal: &H) -> Gate {
+        host_then(
+            self,
+            principal,
+            DriveRequest::ImportCommit { file: self },
+            || {
+                (self.processing_state != ProcessingState::Pending)
+                    .then_some(codes::FILE_NOT_PENDING)
+            },
+        )
     }
 
     pub fn read_gate(&self, principal: &H) -> Gate {

@@ -67,6 +67,7 @@ fn clear_run<H>(file: &mut FileRow<H>) {
     file.step_runner_type = None;
     file.step_entered_at = None;
     file.step_alive_at = None;
+    file.run_started_at = None;
     file.plan = None;
     file.progress_index = None;
     file.progress_label = None;
@@ -205,6 +206,7 @@ pub(super) async fn stage_job<H: DriveHost>(
         "options": step.options,
     });
     file.job_id = Some(job_id);
+    super::backstop::job_created(file, cx.now().as_datetime());
     // The chain is a host-side sequence correlated by the file id: no step names
     // a parent. Jobs refuses a terminal parent, and a live one would make the
     // step the parent runner's work instead of the host's.

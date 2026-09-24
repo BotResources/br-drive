@@ -17,8 +17,17 @@ pub const UNRENDERABLE_MEDIA_TYPE: Reason = Reason::new("UNRENDERABLE_MEDIA_TYPE
 pub const FORBIDDEN_FOLDER: Reason = Reason::new("FORBIDDEN_FOLDER");
 pub const NOT_THE_UPLOADER: Reason = Reason::new("NOT_THE_UPLOADER");
 pub const NOT_AN_IMPORTER: Reason = Reason::new("NOT_AN_IMPORTER");
-/// The scope of the host's migration account: it may import into any file.
+/// The scope of the host's migration account: it may upload into any
+/// workspace and import into any file.
 pub const IMPORT_SCOPE: &str = "workspace:import";
+/// The scope of a host clean-up account: it may ask for a folder gesture in
+/// any workspace, but no single file is its to move or delete — so the
+/// library refuses its folder gestures whole.
+pub const SWEEP_SCOPE: &str = "workspace:sweep";
+/// The host's own per-file rule, beside the library's `protected`: a file
+/// whose metadata says `{"hold": true}` may be neither moved nor deleted.
+pub const FILE_ON_HOLD: Reason = Reason::new("FILE_ON_HOLD");
+pub const HOLD_KEY: &str = "hold";
 
 pub const UNRENDERABLE: &str = "application/x-unrenderable";
 pub const FORBIDDEN_PREFIX: &str = "forbidden";
@@ -40,6 +49,10 @@ impl DriveHost for AppPrincipal {
     const IMAGE_MAX_BYTES: u64 = 1 << 20;
 
     const BULK_RESET_THRESHOLD: usize = 3;
+
+    /// Short enough for the timeout scenarios to run in the suite; the pickup
+    /// deadline stays below the run-silence one, as the defaults do (1 h / 72 h).
+    const PICKUP_TIMEOUT: Duration = Duration::from_secs(20);
 
     const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -70,6 +83,30 @@ impl DriveHost for AppPrincipal {
                 } else {
                     Gate::allowed()
                 };
+            }
+            // A migration account (a service account holding the import
+            // scope, never a person) uploads into any workspace, then imports.
+            DriveRequest::CreateFile { .. } if self.is_importer() => {
+                return Gate::allowed();
+            }
+            // It commits only the uploads it made itself — the normal way,
+            // or without processing.
+            DriveRequest::CommitUpload { file }
+                if self.is_importer() && file.created_by == self.id().as_uuid() =>
+            {
+                return Gate::allowed();
+            }
+            DriveRequest::ImportCommit { file } => {
+                return if self.is_importer() && file.created_by == self.id().as_uuid() {
+                    Gate::allowed()
+                } else {
+                    Gate::blocked(NOT_THE_UPLOADER)
+                };
+            }
+            DriveRequest::MoveFolder { .. } | DriveRequest::DeleteFolder { .. }
+                if self.is_service() && self.holds_scope(SWEEP_SCOPE) =>
+            {
+                return Gate::allowed();
             }
             // Imports are a migration's privilege, whoever owns the workspace.
             DriveRequest::Import { .. } => {
@@ -105,6 +142,14 @@ impl DriveHost for AppPrincipal {
             // workspace that changed hands in between.
             DriveRequest::CommitUpload { file } if file.created_by != self.id().as_uuid() => {
                 Gate::blocked(NOT_THE_UPLOADER)
+            }
+            // A file on hold stays where it is — and so does every folder
+            // holding it: the library asks this rule for each file of a folder
+            // gesture too.
+            DriveRequest::UpdateFile { file, .. } | DriveRequest::DeleteFile { file }
+                if file.metadata.get(HOLD_KEY) == Some(&serde_json::Value::Bool(true)) =>
+            {
+                Gate::blocked(FILE_ON_HOLD)
             }
             _ => Gate::allowed(),
         }
