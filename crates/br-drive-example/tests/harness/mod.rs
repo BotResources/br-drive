@@ -357,6 +357,52 @@ impl World {
             .expect("read the blob row")
     }
 
+    /// Delivers a `drive_file.{verb}` command to the host as its scheduler or
+    /// the broker would — a redelivery, or a message outliving its step.
+    pub async fn send_file_command(&self, verb: &str, payload: serde_json::Value) {
+        use br_core_integration::{Actor, EventMetadata, IntegrationCommand, ServiceAccountId};
+        let command = IntegrationCommand::new(
+            Uuid::now_v7(),
+            format!("drive_file.{verb}"),
+            1,
+            chrono::Utc::now(),
+            EventMetadata::new(
+                Actor::Service(ServiceAccountId::from(Uuid::now_v7())),
+                Uuid::now_v7(),
+            ),
+            payload,
+        );
+        let bytes = serde_json::to_vec(&command).expect("the command encodes");
+        let client = async_nats::connect(self.nats_server.url())
+            .await
+            .expect("dial the ephemeral broker");
+        let js = async_nats::jetstream::new(client);
+        js.publish(
+            format!(
+                "integration.cmd.{}.drive_file.{verb}.v1",
+                br_drive_example::SERVICE
+            ),
+            bytes.into(),
+        )
+        .await
+        .expect("publish the command")
+        .await
+        .expect("the stream acks the command");
+    }
+
+    /// The step a file is in and the instant it was entered — what a step
+    /// message names.
+    pub async fn step_clock(
+        &self,
+        file_id: Uuid,
+    ) -> (Option<i32>, Option<chrono::DateTime<chrono::Utc>>) {
+        sqlx::query_as("SELECT step_index, step_entered_at FROM drive.file WHERE id = $1")
+            .bind(file_id)
+            .fetch_one(&self.db.app)
+            .await
+            .expect("the file row carries its step clock")
+    }
+
     pub async fn send_upload_deadline(&self, file_id: Uuid) {
         use br_core_integration::{Actor, EventMetadata, IntegrationCommand, ServiceAccountId};
         let command = IntegrationCommand::new(

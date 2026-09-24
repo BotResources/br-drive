@@ -8,8 +8,8 @@ mod reactions;
 mod roots;
 
 pub use backstop::{
-    LAUNCH_RETRY_AFTER, LAUNCH_RETRY_DURABLE, LaunchRetry, STEP_DEADLINE_DURABLE, StepDeadline,
-    launch_retry, step_deadline,
+    LAUNCH_RETRY_AFTER, LAUNCH_RETRY_CAP, LAUNCH_RETRY_DURABLE, LaunchRetry, STEP_DEADLINE_DURABLE,
+    StepDeadline, launch_retry, retry_delay, step_deadline, step_timeout,
 };
 pub use chain::{
     ChainPlan, advance, cancel_active_job, finish_active_job, start_chain, wipe_rendition,
@@ -25,8 +25,10 @@ pub use reactions::{
 pub use roots::{RootNames, declare_roots};
 
 pub const RUNNER_TYPE_UNAVAILABLE: &str = "runner_type_unavailable";
-/// No longer raised: since 0.2 a step whose host has not scanned the catalogue
-/// yet is deferred, not failed. Kept so a host matching on it still compiles.
+#[deprecated(
+    since = "0.2.0",
+    note = "no longer raised: a step fired before the first catalogue scan is deferred"
+)]
 pub const CATALOGUE_NOT_WATCHED: &str = "catalogue_not_watched";
 /// The reason a file lands FAILED when a step outlives `DriveHost::STEP_TIMEOUT`.
 pub const TIMED_OUT: &str = "timed_out";

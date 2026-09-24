@@ -98,7 +98,10 @@ impl<H: DriveHost> Projector for RunnerSources<H> {
             return Ok(Population::Keys(BTreeSet::new()));
         }
         let mut conn = cx.pool().acquire().await.map_err(EngineError::from)?;
-        let keys = if store::holds_active_job(&mut conn, file_id, job_id).await? {
+        let active = <FileStore<H> as Persistence>::load(&mut conn, &file_id)
+            .await?
+            .is_some_and(|file| file.require_active_job(job_id).is_ok());
+        let keys = if active {
             BTreeSet::from([file_id])
         } else {
             BTreeSet::new()
@@ -118,7 +121,11 @@ tokio::task_local! {
 /// Runs `presign` with the runner source population scoped to `file_id` and
 /// `job_id`. The engine asks a view's population without the key it is about
 /// to serve, so the runner context resolver names the job's own file here
-/// rather than letting the population cover every in-flight file.
+/// rather than letting the population cover every in-flight file. Engine 0.3.0
+/// polls the population inside the `download` future itself (no spawned
+/// task); were it ever to move to another task, the population would read no
+/// scope and be empty — the runner would get `SOURCE_NOT_AVAILABLE`, never a
+/// wider presign. Not a host API: the `drive_slice!` expansion calls it.
 #[doc(hidden)]
 pub async fn scoped_to_job<F: std::future::Future>(
     file_id: Uuid,
@@ -328,6 +335,8 @@ pub fn runner_report<'m, H: DriveHost>(
         file.require_active_job(input.job_id)?;
         let by = cx.principal().id().as_uuid();
         let now = cx.now().as_datetime();
+        // A report is a sign of life: the step's deadline moves back.
+        file.step_alive_at = Some(now);
 
         let mut dropped = Vec::new();
         if input.origin == PageOrigin::Regenerated {
@@ -406,10 +415,12 @@ pub fn runner_report<'m, H: DriveHost>(
             }
             crate::processing::finish_active_job(cx, &file)?;
         }
+        // Saved every time for the step's sign of life; `updated_at` moves only
+        // with what the file shows.
         if dirty {
             file.updated_at = now;
-            cx.save(&file).await?;
         }
+        cx.save(&file).await?;
         if let Some(cause) = cause {
             cx.impact_caused::<File, _>(&file.id, cause)?;
         }
