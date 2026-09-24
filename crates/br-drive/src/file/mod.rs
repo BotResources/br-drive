@@ -13,8 +13,8 @@ pub use aggregate::{
 pub use curation::{drive_of, set_metadata, set_protected};
 pub use delta::{DriveDelta, DriveRemove, DriveReset, DriveUpsert, DriveView};
 pub use gestures::{
-    DeleteFile, EditPage, Process, RegeneratePage, UpdateFile, delete_file, edit_page, process,
-    regenerate_page, update_file,
+    DeleteFile, EditPage, Process, RegeneratePage, RetitleFile, UpdateFile, delete_file, edit_page,
+    process, regenerate_page, retitle_file, update_file,
 };
 pub use images::{
     IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded,

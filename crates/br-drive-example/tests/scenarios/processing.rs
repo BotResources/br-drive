@@ -360,6 +360,7 @@ async fn a_variant_is_picked_by_id_the_catch_all_serves_other_media_types_and_mi
                     name,
                     media_type,
                     bytes: BYTES,
+                    title: None,
                 },
             )
             .await,

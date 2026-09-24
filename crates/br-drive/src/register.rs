@@ -4,8 +4,8 @@ use service_engine::error::EngineError;
 use crate::erase::DriveErasure;
 use crate::file::images::{IMAGE_LANDED_DURABLE, ImageLanded, image_landed};
 use crate::file::{
-    DeleteFile, DriveFiles, DrivePages, EditPage, Process, RegeneratePage, UpdateFile, delete_file,
-    edit_page, process, regenerate_page, update_file,
+    DeleteFile, DriveFiles, DrivePages, EditPage, Process, RegeneratePage, RetitleFile, UpdateFile,
+    delete_file, edit_page, process, regenerate_page, retitle_file, update_file,
 };
 use crate::folders::{self, DeleteFolder, MoveFolder};
 use crate::host::DriveHost;
@@ -51,6 +51,7 @@ pub fn register<H: DriveHost>(
         upload::commit_upload::<H>(cx, input, reader.clone())
     })?;
     engine.register_mutation::<UpdateFile, _>(update_file::<H>)?;
+    engine.register_mutation::<RetitleFile, _>(retitle_file::<H>)?;
     engine.register_mutation::<DeleteFile, _>(delete_file::<H>)?;
     engine.register_mutation::<EditPage, _>(edit_page::<H>)?;
     engine.register_mutation::<Process, _>(process::<H>)?;

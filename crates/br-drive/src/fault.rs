@@ -18,6 +18,7 @@ pub mod codes {
     pub const INVALID_MEDIA_TYPE: Reason = Reason::new("INVALID_MEDIA_TYPE");
     pub const INVALID_PATH: Reason = Reason::new("INVALID_PATH");
     pub const INVALID_NAME: Reason = Reason::new("INVALID_NAME");
+    pub const INVALID_TITLE: Reason = Reason::new("INVALID_TITLE");
     pub const NAME_TAKEN: Reason = Reason::new("NAME_TAKEN");
     pub const FOLDER_INTO_ITSELF: Reason = Reason::new("FOLDER_INTO_ITSELF");
     pub const NOTHING_TO_CHANGE: Reason = Reason::new("NOTHING_TO_CHANGE");

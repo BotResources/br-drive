@@ -12,8 +12,9 @@ use super::aggregate::{FileRow, PageOrigin, ProcessingState};
 use crate::host::{DRIVE_DIM, DriveHost};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
+use crate::title::FileTitle;
 
-pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, protected, media_type, size_bytes, sha256, blob_ref, \
+pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, title, protected, media_type, size_bytes, sha256, blob_ref, \
      processing_state, processing_error, metadata, summary, page_count, estimated_tokens, \
      ruleset_id, steps, step_index, step_count, step_runner_type, job_id, plan, \
      progress_index, progress_label, progress_at, triggered_by, done_at, completed_at, \
@@ -66,12 +67,14 @@ pub(crate) fn row_to_file_prefixed<H>(
     let state: String = row.get(column("processing_state").as_str());
     let path: String = row.get(column("path").as_str());
     let name: String = row.get(column("name").as_str());
+    let title: String = row.get(column("title").as_str());
     let media_type: String = row.get(column("media_type").as_str());
     Ok(FileRow {
         id: row.get(column("id").as_str()),
         drive_id: row.get(column("drive_id").as_str()),
         path: DrivePath::parse(&path).map_err(config_error)?,
         name: FileName::parse(&name).map_err(config_error)?,
+        title: FileTitle::parse(&title).map_err(config_error)?,
         protected: row.get(column("protected").as_str()),
         media_type: MediaType::parse(&media_type).map_err(config_error)?,
         size_bytes: row.get(column("size_bytes").as_str()),
@@ -178,7 +181,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
                    step_runner_type = $17, job_id = $18, plan = $19, progress_index = $20, \
                    progress_label = $21, progress_at = $22, triggered_by = $23, \
                    done_at = $24, completed_at = $25, step_entered_at = $26, \
-                   stray_job_id = $27 \
+                   stray_job_id = $27, title = $28 \
                  WHERE id = $1",
             )
             .bind(file.id)
@@ -211,6 +214,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.completed_at)
             .bind(file.step_entered_at)
             .bind(file.stray_job_id)
+            .bind(file.title.as_str())
             .execute(conn)
             .await?;
             Ok(())
@@ -227,12 +231,13 @@ impl<H: DriveHost> Persistence for FileStore<H> {
                 "INSERT INTO drive.file ({FILE_COLUMNS}) VALUES \
                  ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                   $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, \
-                  $30, $31, $32, $33)"
+                  $30, $31, $32, $33, $34)"
             ))
             .bind(file.id)
             .bind(file.drive_id)
             .bind(file.path.as_str())
             .bind(file.name.as_str())
+            .bind(file.title.as_str())
             .bind(file.protected)
             .bind(file.media_type.as_str())
             .bind(file.size_bytes)

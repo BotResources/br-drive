@@ -62,6 +62,15 @@ single git tag `v{version}` releases the set. Format follows
 
 ### Added
 
+- A file's **title**: `drive.file.title` (migration `9121000007`, at most 255
+  characters, existing files backfilled with their name without its
+  extension), projected as `DriveFile.title`. `RequestUpload` takes an
+  optional `title` (the `FileTitle` value object: trimmed, 1–255 characters,
+  no control character, `INVALID_TITLE`); absent, it is the requested name
+  without its extension. `<p>RetitleFile(fileId, title)` changes it through
+  the new `DriveRequest::RetitleFile { file }` gate (affordance `retitle`,
+  cause `Retitled`); renaming or moving never touches the title, retitling
+  never moves the file.
 - `DriveHost::STEP_TIMEOUT` (default 24 h): a step still running past it has
   its job cancelled and its file lands `FAILED` `timed_out`
   (`br_drive::TIMED_OUT`). Jobs never fails a job no live runner picks up, so

@@ -16,6 +16,7 @@ type DriveFile {
 	driveId: UUID!
 	path: String!
 	name: String!
+	title: String!
 	protected: Boolean!
 	mediaType: String!
 	sizeBytes: ByteCount!
@@ -54,7 +55,7 @@ type DriveLabel {
 }
 
 type DriveMutation {
-	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
+	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!, title: String): UploadTicket!
 	workspaceCommitUpload(fileId: UUID!, rulesetId: UUID): MutationAck!
 	workspaceProcess(fileId: UUID!, rulesetId: UUID): MutationAck!
 	workspaceRegeneratePage(fileId: UUID!, number: Int!, comment: String, rulesetId: UUID): MutationAck!
@@ -66,6 +67,7 @@ type DriveMutation {
 	workspaceSetFileLabels(fileId: UUID!, labelIds: [UUID!]!): MutationAck!
 	workspaceDeleteRuleset(id: UUID!): MutationAck!
 	workspaceUpdateFile(fileId: UUID!, name: String, path: String, driveId: UUID): MutationAck!
+	workspaceRetitleFile(fileId: UUID!, title: String!): MutationAck!
 	workspaceDeleteFile(fileId: UUID!): MutationAck!
 	workspaceEditPage(fileId: UUID!, number: Int!, markdown: String!): MutationAck!
 	workspaceRunnerRequestImageUpload(fileId: UUID!, jobId: UUID!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!

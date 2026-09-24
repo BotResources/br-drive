@@ -13,5 +13,6 @@ mod replay;
 mod rulesets;
 mod runner;
 mod smoke;
+mod titles;
 mod upload;
 mod visibility;

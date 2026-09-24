@@ -15,6 +15,7 @@ mod register;
 mod ruleset;
 mod runner;
 mod slice;
+mod title;
 mod upload;
 
 use std::ops::RangeInclusive;
@@ -32,8 +33,8 @@ pub use file::{
     EditPage, File, FileCause, FileRow, FileVisibility, IMAGE_LANDED_AGGREGATE,
     IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded, ImageRecord, Page, PageCause,
     PageKey, PageOrigin, PageWindow, Process, ProcessingState, REGENERATE_PAGE_ACTION,
-    RegeneratePage, RunnerPage, UnknownDbValue, UpdateFile, drive_of, references_image,
-    set_metadata, set_protected,
+    RegeneratePage, RetitleFile, RunnerPage, UnknownDbValue, UpdateFile, drive_of,
+    references_image, set_metadata, set_protected,
 };
 pub use folders::{DeleteFolder, MoveFolder};
 pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
@@ -59,6 +60,7 @@ pub use runner::{
     RunnerRequestImageUpload, RunnerSource, RunnerSources, RunnerWindow, runner_context,
     scoped_to_job,
 };
+pub use title::{FileTitle, InvalidTitle, MAX_TITLE_CHARS};
 pub use upload::{CommitUpload, RequestUpload, UploadTicket};
 
 pub const NAME: &str = "drive";

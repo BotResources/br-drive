@@ -16,6 +16,7 @@ use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
 use crate::processing::Initiator;
 use crate::ruleset::RulesetStep;
+use crate::title::FileTitle;
 
 pub struct File;
 
@@ -96,6 +97,7 @@ pub enum FileCause {
     UploadAbandoned,
     SourceAvailable,
     Renamed,
+    Retitled,
     Moved { from_drive: Uuid },
     FolderMoved,
     ProtectionChanged { protected: bool },
@@ -121,6 +123,7 @@ pub struct FileRow<H> {
     pub drive_id: Uuid,
     pub path: DrivePath,
     pub name: FileName,
+    pub title: FileTitle,
     pub protected: bool,
     pub media_type: MediaType,
     pub size_bytes: i64,
@@ -160,6 +163,7 @@ impl<H> Clone for FileRow<H> {
             drive_id: self.drive_id,
             path: self.path.clone(),
             name: self.name.clone(),
+            title: self.title.clone(),
             protected: self.protected,
             media_type: self.media_type.clone(),
             size_bytes: self.size_bytes,
@@ -294,6 +298,9 @@ service_engine::gated! {
     }
     "setLabels" => fn set_labels_gate(this, principal) {
         principal.drive_gate(&DriveRequest::SetFileLabels { file: this })
+    }
+    "retitle" => fn retitle_gate(this, principal) {
+        principal.drive_gate(&DriveRequest::RetitleFile { file: this })
     }
 }
 
