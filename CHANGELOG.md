@@ -147,9 +147,18 @@ single git tag `v{version}` releases the set. Format follows
 - `FileCause` is `#[non_exhaustive]`; new variant `LaunchDeferred { step }`.
 - A chain step never names a `parent_job_id` (see Fixed).
 - Image names accept wider page and index numbers (see Fixed).
+- Engine pin `v0.3.0` → `v0.3.4`: authenticated bodies are bounded (0.3.3),
+  and subscriptions are served over graphql-sse on `POST /graphql`, the
+  transport the gateway uses (0.3.4). The e2e harness's owner role is
+  `BYPASSRLS`, as `migrate` now asserts (0.3.1).
 
 ### Upgrading from 0.1
 
+- Pin `br-service-engine` `v0.3.4`, the same tag as `br-drive`. The
+  owner role `migrate` runs as must be `BYPASSRLS` (engine 0.3.1 refuses
+  otherwise with `OwnerSubjectToRls`). Bodies are bounded at 16 MiB by
+  default (engine 0.3.3): a host that imports or accepts runner reports
+  larger than that raises `MultipartConfig::max_body_bytes`.
 - Migration `9121000006` adds nullable columns only. Files already
   `PROCESSING` when it is applied carry no step clock and get no deadline:
   let them finish or delete them.

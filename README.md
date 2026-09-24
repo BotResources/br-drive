@@ -34,6 +34,7 @@ The `version` beside the `tag` is required: a tag-only git dependency carries a
 | br-drive | `br-service-engine` |
 |---|---|
 | 0.1 | `v0.3.0` |
+| 0.2 | `v0.3.4` |
 
 ## What a host writes
 
