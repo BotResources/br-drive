@@ -44,9 +44,10 @@ pub use label::{
 };
 pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
+#[allow(deprecated)]
 pub use processing::{
-    CANCELLED, CATALOGUE_NOT_WATCHED, ChainPlan, Initiator, LAUNCH_RETRY_AFTER,
-    RUNNER_TYPE_UNAVAILABLE, RootNames, TIMED_OUT, durable,
+    CANCELLED, CATALOGUE_NOT_WATCHED, ChainPlan, Initiator, LAUNCH_RETRY_AFTER, LAUNCH_RETRY_CAP,
+    RUNNER_TYPE_UNAVAILABLE, RootNames, TIMED_OUT, durable, retry_delay,
 };
 pub use register::register;
 pub use ruleset::{

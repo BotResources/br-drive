@@ -328,30 +328,37 @@ watch has not scanned yet is kept, every step reported in
 The chain, one step at a time, in the library's own transactions:
 
 1. the file enters the step (`PROCESSING`, `progress { stepIndex, stepCount,
-   runnerType }`) and a `step-deadline` message is scheduled at
-   `now + DriveHost::STEP_TIMEOUT` (default 24 h, Jobs' own inactivity
-   timeout): a step still running then has its job cancelled
+   runnerType }`) and a `step-deadline` message is scheduled. The deadline
+   measures **silence**: `DriveHost::STEP_TIMEOUT` (default 72 h, Jobs' own
+   longest run) after the step's last sign of life — its entry, then every
+   run start, plan, step and runner report — so time spent queued counts until
+   the first run starts. A step silent that long has its job cancelled
    (`job.cancel.v2`) and the file lands `FAILED` `timed_out`, open to a
    reprocess. Jobs never fails a job no live runner picks up — its backstops
    need a started run — so without it a runner type with no live instance
-   would hold the file in `PROCESSING` for good;
+   would hold the file in `PROCESSING` for good. The timeout is checked at
+   registration (positive, within the scheduler's range);
 2. the step's runner type must be `ACTIVE` in the mirrored catalogue, else
    `FAILED` with `processingError = runner_type_unavailable` before any job
    (Jobs would not refuse an unknown type — it would wait). On a host whose
    catalogue watch has not completed its first scan yet — a fresh database —
-   the launch is **deferred**, not failed: the file waits in the step
-   (`LaunchDeferred { step }`) and a `launch-retry` message asks again every
-   `LAUNCH_RETRY_AFTER` (5 s) until the scan lands, the step deadline
-   bounding the wait;
+   the launch is **deferred**, not failed: the file waits in the step and a
+   `launch-retry` message asks again after `LAUNCH_RETRY_AFTER` (5 s), then
+   twice as long each time up to `LAUNCH_RETRY_CAP` (5 min), until the scan
+   lands — one warning at the first deferral — the step deadline bounding the
+   wait;
 3. a `job_id` is minted on the File and `integration.cmd.jobs.job.create.v1`
    is staged through the engine outbox: `producer`, `source_bc` and
    `config.host` are the host service, `source_entity_id` is the file (so Jobs
-   enforces one live job per file), `triggered_by` the principal of the
-   gesture (`DriveHost::display_name`), and **no `parent_job_id`**: the chain
+   enforces one live job per file; `RequestUpload` refuses a file id that is
+   not a UUIDv7 with `INVALID_FILE_ID`, since Jobs would refuse every job of
+   it), `triggered_by` the principal of the gesture (`DriveHost::display_name`,
+   trimmed, blank as anonymous, cut at 512 characters; an erased initiator is
+   not named at all — what Jobs accepts), and **no `parent_job_id`**: the chain
    is a host-side sequence correlated by the file id, and every step is owned
    by the host (Jobs refuses a terminal parent, and a live one would make the
    step the parent runner's work);
-3. the eight `integration.evt.jobs.job.*.v1` facts are consumed on eight
+4. the eight `integration.evt.jobs.job.*.v1` facts are consumed on eight
    durables named `{service}-drive-job-…` (every durable the library binds,
    the `upload-deadline`, `image-landed`, `step-deadline` and `launch-retry`
    ones included, is namespaced by
@@ -370,10 +377,16 @@ The chain, one step at a time, in the library's own transactions:
    `delete_drive` stage `job.cancel.v2` for every file they remove while it
    is `PROCESSING`, and the later `cancelled` fact finds no file. A
    `creation_rejected` `duplicate_active_entity` means Jobs still holds a live
-   job on the file that the library lost track of (a lost `job.finish`, a
-   restored host database): the job Jobs names (`params.activeJobId`) is kept
-   on the file and cancelled at once, and the next launch cancels it again
-   before asking for its own job, so a `Process` always gets through;
+   job on the file (`params.activeJobId`, checked against the file and host
+   Jobs names). A job the library had lost track of (a lost `job.finish`, a
+   restored host database) is kept on the file as a stray and cancelled at
+   once, and the file fails; every later launch cancels the stray again
+   before asking for its job, until Jobs queues a job of the file. When the
+   job Jobs names is a stray the library already cancelled — Jobs consumes
+   `job.cancel` and `job.create` on separate durables, so they may cross — the
+   step does not fail: it waits and relaunches through `launch-retry`,
+   bounded by its deadline. A job cancelled by the deadline is kept as a stray
+   the same way;
 5. the runner's `done: true` report records `done_at` and stages
    `job.finish.v2` (or advances the chain directly when Jobs already said
    `completed`).
@@ -431,7 +444,7 @@ and changes nothing.
 
 `DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`, `FILE_PROTECTED`,
 `FILE_NOT_PENDING`, `FILE_NOT_READY`, `FILE_PROCESSING`, `FILE_TOO_LARGE`,
-`UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,
+`UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_FILE_ID`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,
 `INVALID_NAME`, `NAME_TAKEN`, `FOLDER_INTO_ITSELF`, `NOTHING_TO_CHANGE`,
 `KEY_REUSED`, `RUNNER_SCOPE_REQUIRED`, `JOB_NOT_ACTIVE`, `SOURCE_NOT_AVAILABLE`,
 `INVALID_IMAGE_NAME`, `IMAGE_UPLOAD_PENDING`, `INVALID_PAGE`,
@@ -461,6 +474,17 @@ and changes nothing.
   test-support API in 0.3.0. Since 0.2 a chain fired before the first scan is
   deferred rather than failed, so readiness is no longer what protects a fresh
   host; a readiness reason for the watch still needs the engine hook.
+- A deferred launch is woken by its own backed-off retry, not by the first
+  catalogue scan: the watch runs outside the engine's pipelines and stages no
+  impact. Waking the deferred files from the scan would need the watch to
+  publish one `launch-retry` per waiting file.
+- Files already `PROCESSING` when migration `9121000006` is applied carry no
+  step clock and get no deadline; a host upgrading with chains in flight lets
+  them finish (or deletes them) — the deadline covers every step entered
+  after the upgrade.
+- The Jobs double serializes the commands it reads, so the crossing of a
+  `job.cancel` and a `job.create` staged together (separate durables in
+  Jobs) is handled in the library but not reproduced by the suite.
 - Engine 0.3.0's `Query::download` populates the projector with its default
   window and then asks membership by key, so the runner's source presign
   cannot be told which file it is about through the window. The runner
@@ -482,11 +506,13 @@ embedded `drive` slice, the catalogue watch started at boot,
 the host in process and drives it over GraphQL and a real
 `graphql-transport-ws` socket. Jobs is played by a stand-in that publishes the
 real `contract-jobs` DTOs on the real subjects and reads the commands the host
-stages for `jobs`. It judges every `job.create` the way Jobs does — a terminal,
-deleted or unknown parent is refused, and so is a second live job on one
-source entity (`duplicate_active_entity`, naming the live job) — answering
-`creation_rejected` on its own, so a contract violation fails the suite
-instead of passing it; the fake runner exercises the three runner roots.
+stages for `jobs`. It judges every `job.create` the way Jobs does, in Jobs' order — the inputs
+`svc-jobs` refuses before its domain (non-v7 ids, a blank or over-long display
+name, a source not named by its producer), a reused id, a second live job on
+one source entity (`duplicate_active_entity`, naming the live job), a
+self-named, terminal, deleted or unknown parent — answering
+`creation_rejected` on its own and `cancelled` for a live job it cancels, so a
+contract violation fails the suite instead of passing it; the fake runner exercises the three runner roots.
 
 ## Running the example's suite
 

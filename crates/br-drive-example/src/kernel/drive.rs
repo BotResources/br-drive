@@ -37,7 +37,7 @@ impl DriveHost for AppPrincipal {
 
     const BULK_RESET_THRESHOLD: usize = 3;
 
-    const STEP_TIMEOUT: Duration = Duration::from_secs(20);
+    const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate {
         if let DriveRequest::CreateFile { media_type, .. } = request
