@@ -142,6 +142,15 @@ pub fn delete_label<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::LABEL_NOT_FOUND))?;
         let detached = files_with_label(cx.connection(), label.id).await?;
+        for drive in crate::file::store::drives_of(cx.connection(), &detached).await? {
+            crate::owner::touch::<H, _>(
+                cx,
+                drive,
+                FileCause::LabelsChanged {
+                    detached: Some(label.id),
+                },
+            )?;
+        }
         cx.delete(&label).await?;
         cx.impact_caused::<Label, _>(&label.id, LabelCause::Deleted)?;
         if detached.len() > H::BULK_RESET_THRESHOLD {
@@ -198,7 +207,7 @@ pub fn set_file_labels<'m, H: DriveHost>(
         let by = cx.principal().id().as_uuid();
         let now = cx.now().as_datetime();
         replace_file_labels(cx.connection(), file.id, &wanted, by, now).await?;
-        cx.impact_caused::<File, _>(&file.id, FileCause::LabelsChanged { detached: None })?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::LabelsChanged { detached: None })?;
         Ok(())
     })
 }

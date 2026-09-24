@@ -8,7 +8,7 @@ use service_engine::blobs::{Sha256Digest, UploadExpectation};
 use service_engine::error::EngineError;
 use service_engine::name::ProjectorName;
 use service_engine::persistence::Persistence;
-use service_engine::pipeline::{Mutation, MutationInput, OneShot};
+use service_engine::pipeline::{Mutation, MutationInput, OneShot, Ops};
 use service_engine::population::Population;
 use service_engine::view::{Populate, Projector};
 use service_engine::visibility::Unrestricted;
@@ -198,49 +198,68 @@ pub fn runner_request_image_upload<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.require_active_job(input.job_id)?;
-        let key = ImageKey {
-            file_id: file.id,
-            name: name.as_str().to_string(),
-        };
-        let now = cx.now().as_datetime();
-        let existing = cx.load::<ImageRecord<H>>(&key).await?;
-        if existing
-            .as_ref()
-            .is_some_and(|image| image.is_landing(now, cx.principal().upload_window()))
-        {
-            return Err(DriveFault::Refused(codes::IMAGE_UPLOAD_PENDING));
-        }
-        let blob = cx.blob_verified::<DriveImage>(
-            name.as_str().to_string(),
-            media_type.as_str().to_string(),
-            UploadExpectation::new(input.size, digest),
-        )?;
-        let facts = BlobFacts {
-            blob_ref: blob.reference().as_uuid(),
-            media_type,
-            size_bytes,
-            sha256: *digest.as_bytes(),
-        };
-        match existing {
-            Some(mut image) => {
-                for reference in image.request_replacement(facts, now) {
-                    cx.release_blob(BlobRef(reference))?;
-                }
-                cx.save(&image).await?;
-            }
-            None => {
-                let image = ImageRecord::<H>::new(file.id, name.clone(), facts, now);
-                cx.create(&image).await?;
-            }
-        }
-        cx.impact_caused::<File, _>(
-            &file.id,
-            FileCause::ImageRequested {
-                name: name.as_str().to_string(),
-            },
-        )?;
-        Ok(OneShot(UploadTicket::new(file.id, blob.upload_url())))
+        let window = cx.principal().upload_window();
+        let ticket = stage_image(cx, &file, name, media_type, size_bytes, digest, window).await?;
+        Ok(OneShot(ticket))
     })
+}
+
+/// Stages a verified image upload on `file`: a new row, or the replacement of
+/// an existing name that swaps only when the new object lands. Shared by the
+/// runner's image ticket and the host's import.
+pub(crate) async fn stage_image<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    file: &FileRow<H>,
+    name: ImageName,
+    media_type: MediaType,
+    size_bytes: i64,
+    digest: Sha256Digest,
+    window: std::time::Duration,
+) -> Result<UploadTicket, DriveFault> {
+    let key = ImageKey {
+        file_id: file.id,
+        name: name.as_str().to_string(),
+    };
+    let now = cx.now().as_datetime();
+    let existing = cx.load::<ImageRecord<H>>(&key).await?;
+    if existing
+        .as_ref()
+        .is_some_and(|image| image.is_landing(now, window))
+    {
+        return Err(DriveFault::Refused(codes::IMAGE_UPLOAD_PENDING));
+    }
+    let size = u64::try_from(size_bytes).map_err(|_| DriveFault::Refused(codes::FILE_TOO_LARGE))?;
+    let blob = cx.blob_verified::<DriveImage>(
+        name.as_str().to_string(),
+        media_type.as_str().to_string(),
+        UploadExpectation::new(size, digest),
+    )?;
+    let facts = BlobFacts {
+        blob_ref: blob.reference().as_uuid(),
+        media_type,
+        size_bytes,
+        sha256: *digest.as_bytes(),
+    };
+    match existing {
+        Some(mut image) => {
+            for reference in image.request_replacement(facts, now) {
+                cx.release_blob(BlobRef(reference))?;
+            }
+            cx.save(&image).await?;
+        }
+        None => {
+            let image = ImageRecord::<H>::new(file.id, name.clone(), facts, now);
+            cx.create(&image).await?;
+        }
+    }
+    crate::file::file_changed::<H>(
+        cx,
+        file,
+        FileCause::ImageRequested {
+            name: name.as_str().to_string(),
+        },
+    )?;
+    Ok(UploadTicket::new(file.id, blob.upload_url()))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -282,32 +301,69 @@ impl MutationInput for RunnerReport {
     const NAME: &'static str = "drive_runner_report";
 }
 
+/// The rules every rendition write obeys, from a runner or from an import:
+/// at most `MAX_REPORT_PAGES` pages, numbered from 1 and distinct; the summary
+/// and the page count together, the token estimate optional and only with
+/// them, none negative. Answers whether the write carries an indexing.
+pub(crate) fn validate_rendition(
+    numbers: &[i32],
+    summary: Option<&str>,
+    page_count: Option<i32>,
+    estimated_tokens: Option<i64>,
+) -> Result<bool, DriveFault> {
+    if numbers.len() > MAX_REPORT_PAGES {
+        return Err(DriveFault::Refused(codes::BATCH_TOO_LARGE));
+    }
+    let mut seen = HashSet::with_capacity(numbers.len());
+    if numbers
+        .iter()
+        .any(|number| *number < 1 || !seen.insert(*number))
+    {
+        return Err(DriveFault::Refused(codes::INVALID_PAGE));
+    }
+    let indexed = summary.is_some();
+    if indexed != page_count.is_some() || (estimated_tokens.is_some() && !indexed) {
+        return Err(DriveFault::Refused(codes::INDEXER_FIELDS_TOGETHER));
+    }
+    if page_count.is_some_and(|count| count < 0)
+        || estimated_tokens.is_some_and(|tokens| tokens < 0)
+    {
+        return Err(DriveFault::Refused(codes::INVALID_INDEXER_VALUE));
+    }
+    Ok(indexed)
+}
+
+/// Records an indexing on the file; `true` when it changed anything. An
+/// indexing without an estimate clears a previous one: the three fields
+/// describe one indexing, never two.
+pub(crate) fn apply_indexing<H>(
+    file: &mut FileRow<H>,
+    summary: String,
+    page_count: i32,
+    estimated_tokens: Option<i64>,
+) -> bool {
+    let changed = file.summary.as_deref() != Some(summary.as_str())
+        || file.page_count != Some(page_count)
+        || file.estimated_tokens != estimated_tokens;
+    if changed {
+        file.summary = Some(summary);
+        file.page_count = Some(page_count);
+        file.estimated_tokens = estimated_tokens;
+    }
+    changed
+}
+
 fn validate(input: &RunnerReport) -> Result<(), DriveFault> {
     if input.origin == PageOrigin::Edited {
         return Err(DriveFault::Refused(codes::INVALID_PAGE_ORIGIN));
     }
-    if input.pages.len() > MAX_REPORT_PAGES {
-        return Err(DriveFault::Refused(codes::BATCH_TOO_LARGE));
-    }
-    let mut numbers = HashSet::with_capacity(input.pages.len());
-    if input
-        .pages
-        .iter()
-        .any(|page| page.number < 1 || !numbers.insert(page.number))
-    {
-        return Err(DriveFault::Refused(codes::INVALID_PAGE));
-    }
-    // The summary and the page count move together; the token estimate is
-    // optional, and only ever rides along with them.
-    let indexed = input.summary.is_some();
-    if indexed != input.page_count.is_some() || (input.estimated_tokens.is_some() && !indexed) {
-        return Err(DriveFault::Refused(codes::INDEXER_FIELDS_TOGETHER));
-    }
-    if input.page_count.is_some_and(|count| count < 0)
-        || input.estimated_tokens.is_some_and(|tokens| tokens < 0)
-    {
-        return Err(DriveFault::Refused(codes::INVALID_INDEXER_VALUE));
-    }
+    let numbers: Vec<i32> = input.pages.iter().map(|page| page.number).collect();
+    let indexed = validate_rendition(
+        &numbers,
+        input.summary.as_deref(),
+        input.page_count,
+        input.estimated_tokens,
+    )?;
     if input.pages.is_empty() && !indexed && !input.done {
         return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
     }
@@ -367,27 +423,18 @@ pub fn runner_report<'m, H: DriveHost>(
             )?;
         }
         if !dropped.is_empty() {
-            cx.impact_caused::<File, _>(&file.id, FileCause::ImagesDropped { names: dropped })?;
+            crate::file::file_changed::<H>(cx, &file, FileCause::ImagesDropped { names: dropped })?;
         }
         let mut dirty = false;
         let mut cause = None;
-        if let (Some(summary), Some(page_count)) = (input.summary, input.page_count) {
-            // An indexer that gives no estimate clears a previous one: the
-            // three fields describe one indexing, never two.
-            let estimated_tokens = input.estimated_tokens;
-            let changed = file.summary.as_deref() != Some(summary.as_str())
-                || file.page_count != Some(page_count)
-                || file.estimated_tokens != estimated_tokens;
-            if changed {
-                file.summary = Some(summary);
-                file.page_count = Some(page_count);
-                file.estimated_tokens = estimated_tokens;
-                dirty = true;
-                cause = Some(FileCause::ReportStored {
-                    job_id: input.job_id,
-                    done: input.done,
-                });
-            }
+        if let (Some(summary), Some(page_count)) = (input.summary, input.page_count)
+            && apply_indexing(&mut file, summary, page_count, input.estimated_tokens)
+        {
+            dirty = true;
+            cause = Some(FileCause::ReportStored {
+                job_id: input.job_id,
+                done: input.done,
+            });
         }
         if input.done && file.done_at.is_none() {
             file.done_at = Some(now);
@@ -399,7 +446,7 @@ pub fn runner_report<'m, H: DriveHost>(
                     file.updated_at = now;
                 }
                 if let Some(cause) = cause {
-                    cx.impact_caused::<File, _>(&file.id, cause)?;
+                    crate::file::file_changed::<H>(cx, &file, cause)?;
                 }
                 crate::processing::advance(cx, &mut file).await?;
                 return Ok(());
@@ -411,7 +458,7 @@ pub fn runner_report<'m, H: DriveHost>(
             cx.save(&file).await?;
         }
         if let Some(cause) = cause {
-            cx.impact_caused::<File, _>(&file.id, cause)?;
+            crate::file::file_changed::<H>(cx, &file, cause)?;
         }
         Ok(())
     })

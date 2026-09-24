@@ -5,7 +5,7 @@ use service_engine::gate::Reason;
 use service_engine::pipeline::{Mutation, MutationInput};
 use uuid::Uuid;
 
-use super::aggregate::{File, FileCause, FileRow, PageOrigin, ProcessingState};
+use super::aggregate::{FileCause, FileRow, PageOrigin, ProcessingState};
 use super::pages::{Page, PageCause, PageKey};
 use super::store::{self, PageWrite};
 use crate::drive::DriveRow;
@@ -138,7 +138,10 @@ pub fn update_file<'m, H: DriveHost>(
         file.name = target_name;
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
-        cx.impact_caused::<File, _>(&file.id, cause)?;
+        if from_drive != target_drive {
+            crate::owner::touch::<H, _>(cx, from_drive, &cause)?;
+        }
+        crate::file::file_changed::<H>(cx, &file, cause)?;
         Ok(())
     })
 }
@@ -175,7 +178,7 @@ pub fn retitle_file<'m, H: DriveHost>(
         file.title = title;
         file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
-        cx.impact_caused::<File, _>(&file.id, FileCause::Retitled)?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::Retitled)?;
         Ok(())
     })
 }
@@ -207,7 +210,7 @@ pub fn delete_file<'m, H: DriveHost>(
         for reference in images {
             cx.release_blob(BlobRef(reference))?;
         }
-        cx.impact_caused::<File, _>(&file.id, FileCause::Deleted)?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::Deleted)?;
         Ok(())
     })
 }

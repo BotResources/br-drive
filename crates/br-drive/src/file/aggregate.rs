@@ -106,6 +106,7 @@ pub enum FileCause {
     ImageAvailable { name: String },
     ImagesDropped { names: Vec<String> },
     ReportStored { job_id: Uuid, done: bool },
+    RenditionImported,
     ProcessingStarted { job_id: Uuid, step: i32 },
     LaunchDeferred { step: i32 },
     ProgressChanged,
@@ -304,6 +305,17 @@ service_engine::gated! {
     }
 }
 
+/// Stages the impact of a change on `file`: its own views, and the host object
+/// of its drive (`DriveHost::DRIVE_OWNER_NOUN`).
+pub(crate) fn file_changed<H: DriveHost>(
+    ops: &mut service_engine::pipeline::Ops<'_>,
+    file: &FileRow<H>,
+    cause: FileCause,
+) -> Result<(), service_engine::error::EngineError> {
+    crate::owner::touch::<H, _>(ops, file.drive_id, &cause)?;
+    ops.impact_caused::<File, _>(&file.id, cause)
+}
+
 impl<H: DriveHost> FileRow<H> {
     pub fn require_pending(&self) -> Result<(), Reason> {
         if self.processing_state == ProcessingState::Pending {
@@ -329,6 +341,12 @@ impl<H: DriveHost> FileRow<H> {
         host_then(principal, DriveRequest::CommitUpload { file: self }, || {
             (self.processing_state != ProcessingState::Pending).then_some(codes::FILE_NOT_PENDING)
         })
+    }
+
+    /// The host's `Import` gate, then a READY file: an import never races a
+    /// running chain nor lands on an upload that is not confirmed.
+    pub fn import_gate(&self, principal: &H) -> Gate {
+        ready(self, principal, DriveRequest::Import { file: self })
     }
 
     pub fn read_gate(&self, principal: &H) -> Gate {

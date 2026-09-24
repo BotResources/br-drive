@@ -16,6 +16,9 @@ pub const NOT_THE_OWNER: Reason = Reason::new("NOT_THE_WORKSPACE_OWNER");
 pub const UNRENDERABLE_MEDIA_TYPE: Reason = Reason::new("UNRENDERABLE_MEDIA_TYPE");
 pub const FORBIDDEN_FOLDER: Reason = Reason::new("FORBIDDEN_FOLDER");
 pub const NOT_THE_UPLOADER: Reason = Reason::new("NOT_THE_UPLOADER");
+pub const NOT_AN_IMPORTER: Reason = Reason::new("NOT_AN_IMPORTER");
+/// The scope of the host's migration account: it may import into any file.
+pub const IMPORT_SCOPE: &str = "workspace:import";
 
 pub const UNRENDERABLE: &str = "application/x-unrenderable";
 pub const FORBIDDEN_PREFIX: &str = "forbidden";
@@ -40,6 +43,8 @@ impl DriveHost for AppPrincipal {
 
     const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 
+    const DRIVE_OWNER_NOUN: Option<&'static str> = Some("workspace");
+
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate {
         if let DriveRequest::CreateFile { media_type, .. } = request
             && media_type.as_str() == UNRENDERABLE
@@ -59,6 +64,14 @@ impl DriveHost for AppPrincipal {
                     Gate::blocked(NOT_A_MANAGER)
                 } else {
                     Gate::allowed()
+                };
+            }
+            // Imports are a migration's privilege, whoever owns the workspace.
+            DriveRequest::Import { .. } => {
+                return if self.holds_scope(IMPORT_SCOPE) {
+                    Gate::allowed()
+                } else {
+                    Gate::blocked(NOT_AN_IMPORTER)
                 };
             }
             // The catalogue is for the people of the host, never for a runner.

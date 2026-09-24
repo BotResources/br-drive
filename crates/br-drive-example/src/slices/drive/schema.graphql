@@ -70,6 +70,8 @@ type DriveMutation {
 	workspaceRetitleFile(fileId: UUID!, title: String!): MutationAck!
 	workspaceDeleteFile(fileId: UUID!): MutationAck!
 	workspaceEditPage(fileId: UUID!, number: Int!, markdown: String!): MutationAck!
+	workspaceImportPages(fileId: UUID!, pages: [ImportedPageInput!]!, summary: String, pageCount: Int, estimatedTokens: Int): MutationAck!
+	workspaceImportImage(fileId: UUID!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
 	workspaceRunnerRequestImageUpload(fileId: UUID!, jobId: UUID!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
 	workspaceRunnerReport(fileId: UUID!, jobId: UUID!, pages: [ReportedPageInput!]! = [], origin: PageOrigin, summary: String, pageCount: Int, estimatedTokens: Int, done: Boolean! = false): MutationAck!
 	workspaceMoveFolder(driveId: UUID!, oldPrefix: String!, newPrefix: String!): MutationAck!
@@ -149,6 +151,15 @@ type DriveUpsert {
 }
 
 union DriveView = DriveFile | DrivePage | DriveLabel | DriveRuleset
+
+input ImportedPageInput {
+	number: Int!
+	markdown: String!
+	"""
+	`RUNNER` when absent; `EDITED` keeps a page a person had corrected.
+	"""
+	origin: PageOrigin
+}
 
 """
 A scalar that can represent any JSON value.

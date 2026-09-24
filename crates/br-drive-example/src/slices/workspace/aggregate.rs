@@ -34,6 +34,13 @@ pub struct WorkspaceRow {
     pub owner_id: Uuid,
     pub name: String,
     pub created_at: DateTime<Utc>,
+    /// Read-side only, never written: the files of the workspace's drive, and
+    /// how many are READY — refreshed live because the kernel names this noun
+    /// as `DriveHost::DRIVE_OWNER_NOUN`.
+    #[serde(default)]
+    pub file_count: i64,
+    #[serde(default)]
+    pub ready_file_count: i64,
 }
 
 service_engine::gated! {

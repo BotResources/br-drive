@@ -7,8 +7,10 @@ mod file;
 mod folders;
 mod host;
 mod image;
+mod import;
 mod label;
 mod media;
+mod owner;
 mod path;
 mod processing;
 mod register;
@@ -39,11 +41,13 @@ pub use file::{
 pub use folders::{DeleteFolder, MoveFolder};
 pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
 pub use image::{ImageName, InvalidImageName, MAX_IMAGE_NAME_BYTES};
+pub use import::{ImportImage, ImportPages, ImportedPage, ImportedPageInput};
 pub use label::{
     CreateLabel, DeleteLabel, DriveLabel, DriveLabels, Label, LabelCause, LabelRow, LabelWindow,
     MAX_LABEL_DESCRIPTION_BYTES, MAX_LABEL_NAME_CHARS, SetFileLabels, UpdateLabel,
 };
 pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
+pub use owner::{DriveOwner, FileCounts, file_counts};
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
 pub use processing::{
     CANCELLED, CATALOGUE_NOT_WATCHED, ChainPlan, Initiator, LAUNCH_RETRY_AFTER,

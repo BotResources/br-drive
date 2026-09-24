@@ -14,7 +14,7 @@ use crate::catalogue;
 use crate::fault::DriveFault;
 use crate::file::images::drop_images;
 use crate::file::store;
-use crate::file::{File, FileCause, FileRow, ProcessingState};
+use crate::file::{FileCause, FileRow, ProcessingState};
 use crate::host::DriveHost;
 use crate::ruleset::{RulesetRow, RulesetStep};
 
@@ -256,7 +256,7 @@ pub async fn start_chain<H: DriveHost>(
     file.updated_at = cx.now().as_datetime();
     let launched = launch_step(cx, file, 0).await?;
     cx.save(file).await?;
-    cx.impact_caused::<File, _>(&file.id, outcome_cause(file, launched, 0))?;
+    crate::file::file_changed::<H>(cx, file, outcome_cause(file, launched, 0))?;
     Ok(())
 }
 
@@ -270,7 +270,7 @@ pub async fn advance<H: DriveHost>(
     let launched = launch_step(cx, file, next).await?;
     file.updated_at = cx.now().as_datetime();
     cx.save(file).await?;
-    cx.impact_caused::<File, _>(&file.id, outcome_cause(file, launched, next))?;
+    crate::file::file_changed::<H>(cx, file, outcome_cause(file, launched, next))?;
     Ok(())
 }
 

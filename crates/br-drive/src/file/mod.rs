@@ -7,6 +7,7 @@ pub(crate) mod pages;
 pub(crate) mod store;
 mod view;
 
+pub(crate) use aggregate::file_changed;
 pub use aggregate::{
     File, FileCause, FileRow, FileVisibility, PageOrigin, ProcessingState, UnknownDbValue,
 };

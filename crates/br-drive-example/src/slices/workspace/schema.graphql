@@ -83,6 +83,8 @@ type WorkspaceView {
 	name: String!
 	ownerId: UUID!
 	createdAt: DateTime!
+	fileCount: Int!
+	readyFileCount: Int!
 	affordances: Affordances!
 }
 

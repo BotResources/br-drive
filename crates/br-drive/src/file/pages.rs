@@ -45,6 +45,7 @@ impl Noun for Page {
 pub enum PageCause {
     Reported { job_id: Uuid, origin: PageOrigin },
     Edited,
+    Imported { origin: PageOrigin },
 }
 
 pub struct PageRecord<H> {

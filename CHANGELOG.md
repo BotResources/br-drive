@@ -62,6 +62,22 @@ single git tag `v{version}` releases the set. Format follows
 
 ### Added
 
+- A host-privileged **import** of an existing rendition:
+  `<p>ImportPages(fileId, pages, summary?, pageCount?, estimatedTokens?)` and
+  `<p>ImportImage(fileId, name, mediaType, size, sha256)`, gated by the new
+  `DriveRequest::Import { file }` and allowed on a `READY` file only, with no
+  job and no runner scope. Pages keep their origin (`EDITED` included) and go
+  through the same upsert and the same impacts as a runner report
+  (`Imported { origin }` on the pages, `RenditionImported` on the file); the
+  image reuses the verified runner image path. The runner's image staging
+  and rendition validation are shared with it.
+- `DriveHost::DRIVE_OWNER_NOUN` (default `None`): a host names its own noun,
+  keyed by the drive id, and every file change the library stages also
+  impacts that key, so the host's views bound to its own noun — an object
+  carrying file counts — recompute and republish while files land, fail,
+  move and go. No host callback. `br_drive::file_counts` reads the file and
+  READY counts of several drives in one statement. The example host's
+  `WorkspaceView` gains `fileCount` and `readyFileCount`, live.
 - A file's **title**: `drive.file.title` (migration `9121000007`, at most 255
   characters, existing files backfilled with their name without its
   extension), projected as `DriveFile.title`. `RequestUpload` takes an

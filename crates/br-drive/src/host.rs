@@ -68,6 +68,11 @@ pub enum DriveRequest<'a, H> {
     SetFileLabels {
         file: &'a FileRow<H>,
     },
+    /// Writing a rendition or an image into a READY file without a runner or
+    /// a job (`<p>ImportPages`, `<p>ImportImage`): the host decides who may.
+    Import {
+        file: &'a FileRow<H>,
+    },
     /// Reading the host's label catalogue, live included.
     ReadLabels,
     /// Writing a file's free `metadata` through `br_drive::set_metadata`.
@@ -88,6 +93,7 @@ impl<H> DriveRequest<'_, H> {
             | Self::UpdateFile { file, .. }
             | Self::DeleteFile { file }
             | Self::RetitleFile { file }
+            | Self::Import { file }
             | Self::Process { file }
             | Self::EditPage { file }
             | Self::RegeneratePage { file, .. }
@@ -122,6 +128,13 @@ pub trait DriveHost: Principal {
     /// runner type has no live instance would sit in PROCESSING for good. The
     /// default matches Jobs' own inactivity timeout; a host whose steps may
     /// legitimately run longer raises it.
+    /// The host's own noun whose objects are keyed by the drive's id (the
+    /// documented convention: a drive's id is its host object's id). When set,
+    /// every file change the library stages also impacts that key, so a host
+    /// view bound to its own noun — an object showing file counts, say —
+    /// recomputes and republishes. `None` (the default) stages nothing.
+    const DRIVE_OWNER_NOUN: Option<&'static str> = None;
+
     const STEP_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;

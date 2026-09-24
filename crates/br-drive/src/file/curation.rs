@@ -1,7 +1,7 @@
 use service_engine::pipeline::Ops;
 use uuid::Uuid;
 
-use super::aggregate::{File, FileCause, FileRow};
+use super::aggregate::{FileCause, FileRow};
 use super::store;
 use crate::fault::{DriveFault, codes};
 use crate::host::{DriveHost, DriveRequest};
@@ -25,7 +25,7 @@ pub async fn set_protected<H: DriveHost>(
     file.protected = protected;
     file.updated_at = ops.now().as_datetime();
     ops.save(&file).await?;
-    ops.impact_caused::<File, _>(&file.id, FileCause::ProtectionChanged { protected })?;
+    crate::file::file_changed::<H>(ops, &file, FileCause::ProtectionChanged { protected })?;
     Ok(())
 }
 
@@ -50,6 +50,6 @@ pub async fn set_metadata<H: DriveHost>(
     file.metadata = metadata;
     file.updated_at = ops.now().as_datetime();
     ops.save(&file).await?;
-    ops.impact_caused::<File, _>(&file.id, FileCause::MetadataChanged)?;
+    crate::file::file_changed::<H>(ops, &file, FileCause::MetadataChanged)?;
     Ok(())
 }

@@ -151,6 +151,6 @@ pub async fn delete_drive<H: DriveHost>(
     delete_rows(cx, &files).await?;
     cx.delete(&drive).await?;
     let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
-    impact_rows(cx, &ids, FileCause::DriveDeleted)?;
+    impact_rows(cx, id, &ids, FileCause::DriveDeleted)?;
     Ok(DriveDeleted { files: files.len() })
 }

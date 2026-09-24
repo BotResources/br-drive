@@ -157,7 +157,12 @@ pub async fn request_image(
 }
 
 pub fn image_ticket(response: &serde_json::Value) -> Ticket {
-    let post = &ok(response)["workspaceRunnerRequestImageUpload"];
+    image_ticket_of(response, "workspaceRunnerRequestImageUpload")
+}
+
+/// The upload ticket a mutation root answered, whichever root it is.
+pub fn image_ticket_of(response: &serde_json::Value, root: &str) -> Ticket {
+    let post = &ok(response)[root];
     Ticket {
         file_id: Uuid::parse_str(post["fileId"].as_str().expect("the file id")).expect("a uuid"),
         url: post["url"]
