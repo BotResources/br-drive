@@ -30,7 +30,7 @@ async fn image_source(world: &World, file_id: Uuid, name: &str) -> Uuid {
 async fn rules(world: &World) -> (JobsStandIn, String) {
     let jobs = JobsStandIn::attach(world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
-    install_render_rule(world, &jobs, &manager).await;
+    install_render_rule(world, &manager).await;
     (jobs, manager)
 }
 

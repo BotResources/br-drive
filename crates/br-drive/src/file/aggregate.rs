@@ -14,7 +14,7 @@ use crate::fault::codes;
 use crate::host::{DRIVE_DIM, DriveHost, DriveRequest};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
-use crate::processing::Initiator;
+use crate::processing::FileJob;
 use crate::ruleset::RulesetStep;
 use crate::title::FileTitle;
 
@@ -99,25 +99,48 @@ pub enum FileCause {
     SourceAvailable,
     Renamed,
     Retitled,
-    Moved { from_drive: Uuid },
+    Moved {
+        from_drive: Uuid,
+    },
     FolderMoved,
-    ProtectionChanged { protected: bool },
+    ProtectionChanged {
+        protected: bool,
+    },
     MetadataChanged,
-    ImageRequested { name: String },
-    ImageAvailable { name: String },
-    ImagesDropped { names: Vec<String> },
-    ReportStored { job_id: Uuid, done: bool },
+    ImageRequested {
+        name: String,
+    },
+    ImageAvailable {
+        name: String,
+    },
+    ImagesDropped {
+        names: Vec<String>,
+    },
+    ReportStored {
+        job_id: Uuid,
+        done: bool,
+    },
     RenditionImported,
-    ProcessingStarted { job_id: Uuid, step: i32 },
+    ProcessingStarted {
+        job_id: Uuid,
+        step: i32,
+    },
     ProgressChanged,
     ProcessingFinished,
-    ProcessingFailed { reason: String },
-    LabelsChanged { detached: Option<Uuid> },
+    ProcessingFailed {
+        reason: String,
+    },
+    /// A user asked to cancel the running job; Jobs' `cancelled` follows.
+    CancelRequested {
+        job_id: Uuid,
+    },
+    LabelsChanged {
+        detached: Option<Uuid>,
+    },
     Erased,
     Deleted,
     FolderDeleted,
     DriveDeleted,
-    LaunchDeferred { step: i32 },
 }
 
 pub struct FileRow<H> {
@@ -131,35 +154,42 @@ pub struct FileRow<H> {
     pub size_bytes: i64,
     pub sha256: [u8; 32],
     pub blob_ref: Uuid,
-    pub processing_state: ProcessingState,
-    pub processing_error: Option<String>,
+    /// When the upload was confirmed; `None` while the file is PENDING.
+    pub committed_at: Option<DateTime<Utc>>,
     pub metadata: serde_json::Value,
     pub summary: Option<String>,
     pub page_count: Option<i32>,
     pub estimated_tokens: Option<i64>,
     pub ruleset_id: Option<Uuid>,
     pub steps: Option<Vec<RulesetStep>>,
-    pub step_index: Option<i32>,
-    pub step_count: Option<i32>,
-    pub step_runner_type: Option<String>,
-    pub job_id: Option<Uuid>,
-    pub plan: Option<Vec<String>>,
-    pub progress_index: Option<i32>,
-    pub progress_label: Option<String>,
-    pub progress_at: Option<DateTime<Utc>>,
-    pub triggered_by: Option<Initiator>,
-    pub done_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub step_entered_at: Option<DateTime<Utc>>,
-    pub step_alive_at: Option<DateTime<Utc>>,
-    /// When the step's current job first showed a started run: the pickup
-    /// deadline gives way to the run-silence deadline from then on.
-    pub run_started_at: Option<DateTime<Utc>>,
-    pub stray_job_id: Option<Uuid>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The file's processing status, read from `drive.file_status` when the
+    /// row is loaded — never written: the library changes it by writing the
+    /// file's job log.
+    pub(crate) status: FileStatus,
     pub(crate) host: PhantomData<fn() -> H>,
+}
+
+/// A file's processing status as `drive.file_status` computes it from the
+/// file's last job, with that job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileStatus {
+    pub state: ProcessingState,
+    pub error: Option<String>,
+    pub last_job: Option<FileJob>,
+}
+
+impl FileStatus {
+    /// A file just requested: no job, upload not confirmed.
+    pub(crate) fn pending() -> Self {
+        Self {
+            state: ProcessingState::Pending,
+            error: None,
+            last_job: None,
+        }
+    }
 }
 
 impl<H> Clone for FileRow<H> {
@@ -175,34 +205,42 @@ impl<H> Clone for FileRow<H> {
             size_bytes: self.size_bytes,
             sha256: self.sha256,
             blob_ref: self.blob_ref,
-            processing_state: self.processing_state,
-            processing_error: self.processing_error.clone(),
+            committed_at: self.committed_at,
             metadata: self.metadata.clone(),
             summary: self.summary.clone(),
             page_count: self.page_count,
             estimated_tokens: self.estimated_tokens,
             ruleset_id: self.ruleset_id,
             steps: self.steps.clone(),
-            step_index: self.step_index,
-            step_count: self.step_count,
-            step_runner_type: self.step_runner_type.clone(),
-            job_id: self.job_id,
-            plan: self.plan.clone(),
-            progress_index: self.progress_index,
-            progress_label: self.progress_label.clone(),
-            progress_at: self.progress_at,
-            triggered_by: self.triggered_by.clone(),
-            done_at: self.done_at,
-            completed_at: self.completed_at,
-            step_entered_at: self.step_entered_at,
-            step_alive_at: self.step_alive_at,
-            run_started_at: self.run_started_at,
-            stray_job_id: self.stray_job_id,
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            status: self.status.clone(),
             host: PhantomData,
         }
+    }
+}
+
+impl<H> FileRow<H> {
+    /// `PENDING | PROCESSING | READY | FAILED`, computed from the job log.
+    pub fn processing_state(&self) -> ProcessingState {
+        self.status.state
+    }
+
+    /// The reason a FAILED file failed, read from its last job's log.
+    pub fn processing_error(&self) -> Option<&str> {
+        self.status.error.as_deref()
+    }
+
+    /// The file's last job (the one running while PROCESSING), if any.
+    pub fn last_job(&self) -> Option<&FileJob> {
+        self.status.last_job.as_ref()
+    }
+
+    /// The job running now: the last job while the file is PROCESSING.
+    pub fn active_job(&self) -> Option<&FileJob> {
+        self.last_job()
+            .filter(|_| self.status.state == ProcessingState::Processing)
     }
 }
 
@@ -213,7 +251,7 @@ impl<H> std::fmt::Debug for FileRow<H> {
             .field("drive_id", &self.drive_id)
             .field("path", &self.path)
             .field("name", &self.name)
-            .field("processing_state", &self.processing_state)
+            .field("processing_state", &self.status.state)
             .finish_non_exhaustive()
     }
 }
@@ -266,7 +304,7 @@ fn unprotected<H: DriveHost>(
 }
 
 fn ready<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
-    host_then(file, principal, request, || match file.processing_state {
+    host_then(file, principal, request, || match file.status.state {
         ProcessingState::Ready => None,
         ProcessingState::Processing => Some(codes::FILE_PROCESSING),
         ProcessingState::Pending | ProcessingState::Failed => Some(codes::FILE_NOT_READY),
@@ -275,12 +313,12 @@ fn ready<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'
 
 fn landed<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
     host_then(file, principal, request, || {
-        (file.processing_state == ProcessingState::Pending).then_some(codes::FILE_NOT_READY)
+        (file.status.state == ProcessingState::Pending).then_some(codes::FILE_NOT_READY)
     })
 }
 
 fn settled<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
-    host_then(file, principal, request, || match file.processing_state {
+    host_then(file, principal, request, || match file.status.state {
         ProcessingState::Ready | ProcessingState::Failed => None,
         ProcessingState::Processing => Some(codes::FILE_PROCESSING),
         ProcessingState::Pending => Some(codes::FILE_NOT_READY),
@@ -327,7 +365,7 @@ service_engine::gated! {
     }
     "commit" => fn commit_gate(this, principal) {
         host_then(this, principal, DriveRequest::CommitUpload { file: this }, || {
-            (this.processing_state != ProcessingState::Pending).then_some(codes::FILE_NOT_PENDING)
+            (this.status.state != ProcessingState::Pending).then_some(codes::FILE_NOT_PENDING)
         })
     }
     "setMetadata" => fn set_metadata_gate(this, principal) {
@@ -335,6 +373,12 @@ service_engine::gated! {
     }
     "retitle" => fn retitle_gate(this, principal) {
         host_gate(this, principal, &DriveRequest::RetitleFile { file: this })
+    }
+    "cancelProcessing" => fn cancel_processing_gate(this, principal) {
+        host_then(this, principal, DriveRequest::CancelProcessing { file: this }, || {
+            (this.status.state != ProcessingState::Processing)
+                .then_some(codes::FILE_NOT_PROCESSING)
+        })
     }
 }
 
@@ -347,6 +391,18 @@ pub(crate) fn file_changed<H: DriveHost>(
 ) -> Result<(), service_engine::error::EngineError> {
     crate::owner::touch::<H>(ops, file.drive_id)?;
     ops.impact_caused::<File, _>(&file.id, cause)
+}
+
+/// Stages an impact on `file` without a cause: its views recompute, and a live
+/// session receives a delta only if what it shows changed — for a job log
+/// entry that may or may not show (a queued job, a late fact of an old job).
+/// The host object is not touched: such an entry never changes the file's
+/// state, so never the drive's counts.
+pub(crate) fn file_touched<H: DriveHost>(
+    ops: &mut service_engine::pipeline::Ops<'_>,
+    file: &FileRow<H>,
+) -> Result<(), service_engine::error::EngineError> {
+    ops.impact::<File>(&file.id, service_engine::impact::Dims::ALL)
 }
 
 impl<H: DriveHost> FileRow<H> {
@@ -374,10 +430,7 @@ impl<H: DriveHost> FileRow<H> {
             self,
             principal,
             DriveRequest::ImportCommit { file: self },
-            || {
-                (self.processing_state != ProcessingState::Pending)
-                    .then_some(codes::FILE_NOT_PENDING)
-            },
+            || (self.status.state != ProcessingState::Pending).then_some(codes::FILE_NOT_PENDING),
         )
     }
 
@@ -394,7 +447,7 @@ impl<H: DriveHost> FileRow<H> {
     }
 
     pub fn require_active_job(&self, job_id: Uuid) -> Result<(), Reason> {
-        if self.processing_state == ProcessingState::Processing && self.job_id == Some(job_id) {
+        if self.active_job().is_some_and(|job| job.job_id == job_id) {
             Ok(())
         } else {
             Err(codes::JOB_NOT_ACTIVE)

@@ -19,7 +19,7 @@ const IMAGE: &[u8] = b"\x89PNG fake image bytes";
 
 async fn file_with_job(world: &World, jobs: &JobsStandIn, owner: &str) -> (Uuid, Uuid, Uuid) {
     let manager = manager_passport(Uuid::now_v7(), "Ada");
-    install_render_rule(world, jobs, &manager).await;
+    install_render_rule(world, &manager).await;
     let drive = world.create_workspace(owner, "library").await;
     let file_id = upload(
         world,
@@ -27,7 +27,7 @@ async fn file_with_job(world: &World, jobs: &JobsStandIn, owner: &str) -> (Uuid,
         &UploadRequest::text(drive, "docs", "source.txt", SOURCE),
     )
     .await;
-    let job_id = world.await_job(file_id).await;
+    let job_id = jobs.await_create(file_id).await.job_id;
     (drive, file_id, job_id)
 }
 

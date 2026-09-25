@@ -1,33 +1,88 @@
-use chrono::SubsecRound;
 use contract_jobs::command::CancelJob;
 use contract_jobs::event::{
     JobCancelled, JobCompleted, JobCreationRejected, JobFailed, JobPlanDeclared, JobQueued,
     JobStarted, JobStepStarted, REASON_DUPLICATE_ACTIVE_ENTITY,
 };
 use futures_util::future::BoxFuture;
+use serde::Serialize;
 use service_engine::inbound::{ReactionCoordinates, ReactionMessage};
 use service_engine::pipeline::Reaction;
 use uuid::Uuid;
 
-use super::CANCELLED;
-use super::backstop::{run_alive, schedule_retry};
-use super::chain::{advance, file_of_job, mark_failed};
+use super::chain::{advance, refresh_status};
 use super::commands::JobCancel;
+use super::log::{self, FileJob, kind};
 use crate::fault::DriveReactionFault;
-use crate::file::{FileCause, FileRow, ProcessingState};
+use crate::file::{FileCause, FileRow};
 use crate::host::DriveHost;
 
-async fn active_file<H: DriveHost>(
+/// A fact logged on its job: the file (loaded, so locked, and its status read
+/// again after the write), the job as it stood before the entry, and whether
+/// the job is the file's last one — the only job whose facts move the file.
+struct Logged<H> {
+    file: FileRow<H>,
+    job: Option<FileJob>,
+    prior_outcome: Option<String>,
+}
+
+impl<H> Logged<H> {
+    /// The fact is the first outcome of the file's current job.
+    fn settles_the_file(&self) -> bool {
+        self.job.is_some() && self.prior_outcome.is_none()
+    }
+}
+
+/// Appends the fact to the log of its own job — never another job's — after
+/// locking the job's file. A job no file holds (a deleted file, a job the
+/// library never created) is acknowledged and ignored.
+async fn log_fact<H: DriveHost>(
     cx: &mut Reaction<'_>,
     job_id: Uuid,
-) -> Result<Option<FileRow<H>>, DriveReactionFault> {
-    let Some(file_id) = file_of_job(cx.connection(), job_id).await? else {
+    entry_kind: &str,
+    payload: impl Serialize,
+) -> Result<Option<Logged<H>>, DriveReactionFault> {
+    let Some((file_id, _)) = log::owner_of(cx.connection(), job_id).await? else {
         return Ok(None);
     };
-    let file = cx.load::<FileRow<H>>(&file_id).await?;
-    Ok(file.filter(|file| {
-        file.job_id == Some(job_id) && file.processing_state == ProcessingState::Processing
+    let Some(mut file) = cx.load::<FileRow<H>>(&file_id).await? else {
+        return Ok(None);
+    };
+    // Read under the file's lock: a concurrent fact of the same job waits.
+    let prior_outcome = log::owner_of(cx.connection(), job_id)
+        .await?
+        .and_then(|(_, outcome)| outcome);
+    let job = file.last_job().filter(|job| job.job_id == job_id).cloned();
+    let entry = log::entry(entry_kind, cx.now().as_datetime(), payload)?;
+    log::append(cx.connection(), job_id, entry).await?;
+    refresh_status(cx, &mut file).await?;
+    Ok(Some(Logged {
+        file,
+        job,
+        prior_outcome,
     }))
+}
+
+/// A fact that changes no state: the file's views recompute, and a live
+/// session hears of it only if what it shows changed — a plan or a step of
+/// the running job that moves its progress does (`ProgressChanged`); a queued
+/// job, a started run, a redelivery, or any fact of a job that is no longer
+/// running does not.
+fn progressed<H: DriveHost>(
+    cx: &mut Reaction<'_>,
+    logged: &Logged<H>,
+    shows: bool,
+) -> Result<(), DriveReactionFault> {
+    let moved = || {
+        let before = logged.job.as_ref().map(FileJob::progress);
+        let after = logged.file.active_job().map(FileJob::progress);
+        before != after
+    };
+    if shows && logged.settles_the_file() && moved() {
+        crate::file::file_changed::<H>(cx, &logged.file, FileCause::ProgressChanged)?;
+    } else {
+        crate::file::file_touched::<H>(cx, &logged.file)?;
+    }
+    Ok(())
 }
 
 macro_rules! job_fact {
@@ -104,97 +159,85 @@ pub const DURABLE_COMPLETED: &str = "job-completed";
 pub const DURABLE_FAILED: &str = "job-failed";
 pub const DURABLE_CANCELLED: &str = "job-cancelled";
 
-async fn fail_file<H: DriveHost>(
+/// A terminal fact of the file's current job lands it FAILED with `reason`;
+/// of any other job it is only logged.
+fn settled_failed<H: DriveHost>(
     cx: &mut Reaction<'_>,
-    mut file: FileRow<H>,
-    reason: &str,
+    logged: &Logged<H>,
+    reason: String,
 ) -> Result<(), DriveReactionFault> {
-    mark_failed(&mut file, reason);
-    file.updated_at = cx.now().as_datetime();
-    cx.save(&file).await?;
-    crate::file::file_changed::<H>(
-        cx,
-        &file,
-        FileCause::ProcessingFailed {
-            reason: reason.to_string(),
-        },
-    )?;
+    if !logged.settles_the_file() {
+        return progressed(cx, logged, false);
+    }
+    crate::file::file_changed::<H>(cx, &logged.file, FileCause::ProcessingFailed { reason })?;
     Ok(())
 }
 
-/// Jobs queued the file's job: a job it still held on the file before (the
-/// stray) is no longer in the way, so the file forgets it.
-pub fn on_queued<'r, H: DriveHost>(
-    cx: &'r mut Reaction<'r>,
-    fact: QueuedFact,
-) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
-    Box::pin(async move {
-        let Some(mut file) = active_file::<H>(cx, fact.0.job_id).await? else {
-            return Ok(());
-        };
-        tracing::debug!(file = %file.id, job = %fact.0.job_id, runner_type = %fact.0.runner_type, "job queued");
-        if file.stray_job_id.take().is_some() {
-            cx.save(&file).await?;
+macro_rules! progress_reaction {
+    ($(#[$doc:meta])* $name:ident, $fact:ident, $kind:expr, $shows:expr) => {
+        $(#[$doc])*
+        pub fn $name<'r, H: DriveHost>(
+            cx: &'r mut Reaction<'r>,
+            fact: $fact,
+        ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
+            Box::pin(async move {
+                let job_id = fact.0.job_id;
+                let Some(logged) = log_fact::<H>(cx, job_id, $kind, &fact.0).await? else {
+                    return Ok(());
+                };
+                progressed(cx, &logged, $shows)
+            })
         }
-        Ok(())
-    })
+    };
 }
 
-/// A run of the file's job started: the pickup deadline gives way to the
-/// run-silence deadline, measured from now.
-pub fn on_started<'r, H: DriveHost>(
-    cx: &'r mut Reaction<'r>,
-    fact: StartedFact,
-) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
-    Box::pin(async move {
-        let Some(mut file) = active_file::<H>(cx, fact.0.job_id).await? else {
-            return Ok(());
-        };
-        tracing::debug!(file = %file.id, job = %fact.0.job_id, run = %fact.0.run_id, "job started");
-        run_alive(&mut file, cx.now().as_datetime());
-        cx.save(&file).await?;
-        Ok(())
-    })
-}
+progress_reaction!(
+    /// Jobs queued the job.
+    on_queued, QueuedFact, kind::QUEUED, false
+);
+progress_reaction!(
+    /// A run of the job started.
+    on_started, StartedFact, kind::STARTED, false
+);
+progress_reaction!(
+    /// The runner declared its plan: `progress.plan`.
+    on_plan_declared, PlanDeclaredFact, kind::PLAN_DECLARED, true
+);
+progress_reaction!(
+    /// The runner started a step of its plan: `progress.currentIndex`,
+    /// `currentLabel`, `at` (the latest start wins, whatever the arrival order).
+    on_step_started, StepStartedFact, kind::STEP_STARTED, true
+);
 
+/// Jobs refused to create the job: the file lands FAILED with the code. On
+/// `duplicate_active_entity` Jobs still holds a live job on the file that the
+/// library does not know as live (a lost `job.finish`, a restored database, a
+/// cancel and a create crossed on Jobs' separate consumers): that job is
+/// cancelled, so the user's reprocess gets through; a cancel is idempotent.
 pub fn on_creation_rejected<'r, H: DriveHost>(
     cx: &'r mut Reaction<'r>,
     fact: CreationRejectedFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        let Some(mut file) = active_file::<H>(cx, fact.0.job_id).await? else {
+        let job_id = fact.0.job_id;
+        let Some(logged) = log_fact::<H>(cx, job_id, kind::CREATION_REJECTED, &fact.0).await?
+        else {
             return Ok(());
         };
-        if fact.0.reason_code == REASON_DUPLICATE_ACTIVE_ENTITY {
-            // Jobs still holds a live job on this file. Either it is one the
-            // file already asked Jobs to cancel, and the cancel and this create
-            // crossed on Jobs' separate consumers: the step waits and asks
-            // again. Or the library had lost track of it (a lost `job.finish`,
-            // a restored database, …): its id is kept, it is cancelled now, and
-            // the next launch cancels it again before asking for a new job.
-            if let Some(stray) = active_job_of::<H>(&fact.0.params, file.id) {
-                if file.stray_job_id == Some(stray) {
-                    file.job_id = None;
-                    schedule_retry(cx, &file, 0)?;
-                    file.updated_at = cx.now().as_datetime();
-                    cx.save(&file).await?;
-                    let step = file.step_index.unwrap_or(0);
-                    crate::file::file_changed::<H>(cx, &file, FileCause::LaunchDeferred { step })?;
-                    return Ok(());
-                }
-                file.stray_job_id = Some(stray);
-                cx.command(JobCancel {
-                    payload: CancelJob { job_id: stray },
-                })?;
-            } else {
-                tracing::warn!(
-                    file = %file.id,
+        if logged.settles_the_file() && fact.0.reason_code == REASON_DUPLICATE_ACTIVE_ENTITY {
+            match active_job_of::<H>(&fact.0.params, logged.file.id) {
+                Some(active) => cx.command(JobCancel {
+                    payload: CancelJob { job_id: active },
+                })?,
+                None => tracing::warn!(
+                    file = %logged.file.id,
                     params = %fact.0.params,
-                    "a duplicate_active_entity rejection names no active job; nothing to cancel"
-                );
+                    "a duplicate_active_entity rejection names no active job of this file; \
+                     nothing to cancel"
+                ),
             }
         }
-        fail_file(cx, file, &fact.0.reason_code).await
+        settled_failed(cx, &logged, fact.0.reason_code.clone())
     })
 }
 
@@ -214,79 +257,25 @@ fn active_job_of_service(params: &serde_json::Value, file: Uuid, service: &str) 
     text(ACTIVE_JOB_ID_PARAM).and_then(|id| Uuid::parse_str(id).ok())
 }
 
-pub fn on_plan_declared<'r, H: DriveHost>(
-    cx: &'r mut Reaction<'r>,
-    fact: PlanDeclaredFact,
-) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
-    Box::pin(async move {
-        let Some(mut file) = active_file::<H>(cx, fact.0.job_id).await? else {
-            return Ok(());
-        };
-        if file.plan.as_deref() == Some(fact.0.steps.as_slice()) {
-            return Ok(());
-        }
-        file.plan = Some(fact.0.steps);
-        run_alive(&mut file, cx.now().as_datetime());
-        file.updated_at = cx.now().as_datetime();
-        cx.save(&file).await?;
-        crate::file::file_changed::<H>(cx, &file, FileCause::ProgressChanged)?;
-        Ok(())
-    })
-}
-
-pub fn on_step_started<'r, H: DriveHost>(
-    cx: &'r mut Reaction<'r>,
-    fact: StepStartedFact,
-) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
-    Box::pin(async move {
-        let Some(mut file) = active_file::<H>(cx, fact.0.job_id).await? else {
-            return Ok(());
-        };
-        let index = i32::try_from(fact.0.index).unwrap_or(i32::MAX);
-        // The row stores microseconds; the wire may carry nanoseconds. Compared
-        // at the row's precision, a redelivered fact is never "newer".
-        let started_at = fact.0.started_at.trunc_subsecs(6);
-        // A later index on the same run moves the cursor forward; a newer start
-        // instant (a retry attempt restarting the plan) moves it too. Anything
-        // else is a redelivery or a stale fact.
-        let forward = match (file.progress_index, file.progress_at) {
-            (Some(current), Some(at)) => index > current || started_at > at,
-            _ => true,
-        };
-        if !forward {
-            return Ok(());
-        }
-        file.progress_index = Some(index);
-        file.progress_label = Some(fact.0.label);
-        file.progress_at = Some(started_at);
-        run_alive(&mut file, cx.now().as_datetime());
-        file.updated_at = cx.now().as_datetime();
-        cx.save(&file).await?;
-        crate::file::file_changed::<H>(cx, &file, FileCause::ProgressChanged)?;
-        Ok(())
-    })
-}
-
+/// Jobs completed the job — only ever after the library's own `job.finish`,
+/// sent with the runner's final report. The file's current job completing
+/// advances the chain (the next step's job, or READY).
 pub fn on_completed<'r, H: DriveHost>(
     cx: &'r mut Reaction<'r>,
     fact: CompletedFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        let Some(mut file) = active_file::<H>(cx, fact.0.job_id).await? else {
+        let job_id = fact.0.job_id;
+        let Some(mut logged) = log_fact::<H>(cx, job_id, kind::COMPLETED, &fact.0).await? else {
             return Ok(());
         };
-        if file.done_at.is_none() {
-            // Jobs says the job is over but the runner's final report has not
-            // landed: the fact is kept on the row and the report advances the
-            // chain when it comes.
-            if file.completed_at.is_none() {
-                file.completed_at = Some(cx.now().as_datetime());
-                cx.save(&file).await?;
+        match logged.job.clone() {
+            Some(job) if logged.settles_the_file() => {
+                advance(cx, &mut logged.file, &job).await?;
+                Ok(())
             }
-            return Ok(());
+            _ => progressed(cx, &logged, false),
         }
-        advance(cx, &mut file).await?;
-        Ok(())
     })
 }
 
@@ -295,16 +284,16 @@ pub fn on_failed<'r, H: DriveHost>(
     fact: FailedFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        let Some(file) = active_file::<H>(cx, fact.0.job_id).await? else {
+        let job_id = fact.0.job_id;
+        let Some(logged) = log_fact::<H>(cx, job_id, kind::FAILED, &fact.0).await? else {
             return Ok(());
         };
-        let reason = fact
-            .0
-            .failure_report
-            .as_ref()
-            .map(|report| report.reason_code.clone())
-            .unwrap_or(fact.0.failure_cause);
-        fail_file(cx, file, &reason).await
+        let reason = logged
+            .file
+            .processing_error()
+            .map(str::to_string)
+            .unwrap_or_else(|| fact.0.failure_cause.clone());
+        settled_failed(cx, &logged, reason)
     })
 }
 
@@ -313,10 +302,11 @@ pub fn on_cancelled<'r, H: DriveHost>(
     fact: CancelledFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        let Some(file) = active_file::<H>(cx, fact.0.job_id).await? else {
+        let job_id = fact.0.job_id;
+        let Some(logged) = log_fact::<H>(cx, job_id, kind::CANCELLED, &fact.0).await? else {
             return Ok(());
         };
-        fail_file(cx, file, CANCELLED).await
+        settled_failed(cx, &logged, super::CANCELLED.to_string())
     })
 }
 

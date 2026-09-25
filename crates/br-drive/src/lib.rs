@@ -26,18 +26,21 @@ use std::ops::RangeInclusive;
 use service_engine::LibraryMigrations;
 
 pub use blob::{DriveImage as DriveImageBlob, DriveSource};
-pub use catalogue::{CatalogueWatch, watch_runner_types};
+pub use catalogue::{
+    CatalogueWatch, DriveRunnerType, DriveRunnerTypeLifecycle, known_runner_types,
+    watch_runner_types, watch_runner_types_of,
+};
 pub use drive::{DriveDeleted, create_drive, create_unowned_drive, delete_drive};
 pub use erase::{DriveErasure, EraseMode, REDACTED_PERSON};
 pub use fault::{DriveFault, DriveReactionFault, codes};
 pub use file::{
-    ByteCount, DeleteFile, DriveDelta, DriveFile, DriveFiles, DriveImage, DrivePage, DrivePages,
-    DriveProgress, DriveRemove, DriveReset, DriveUpsert, DriveView, DriveWindow, EDIT_PAGE_ACTION,
-    EditPage, File, FileCause, FileRow, FileVisibility, IMAGE_LANDED_AGGREGATE,
-    IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded, ImageRecord, Page, PageCause,
-    PageKey, PageOrigin, PageWindow, Process, ProcessingState, REGENERATE_PAGE_ACTION,
-    RegeneratePage, RetitleFile, RunnerPage, UnknownDbValue, UpdateFile, drive_of,
-    references_image, set_metadata, set_protected,
+    ByteCount, CancelProcessing, DeleteFile, DriveDelta, DriveFile, DriveFiles, DriveImage,
+    DrivePage, DrivePages, DriveProgress, DriveRemove, DriveReset, DriveUpsert, DriveView,
+    DriveWindow, EDIT_PAGE_ACTION, EditPage, File, FileCause, FileRow, FileStatus, FileVisibility,
+    IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded,
+    ImageRecord, Page, PageCause, PageKey, PageOrigin, PageWindow, Process, ProcessingState,
+    REGENERATE_PAGE_ACTION, RegeneratePage, RetitleFile, RunnerPage, UnknownDbValue, UpdateFile,
+    drive_of, references_image, set_metadata, set_protected,
 };
 pub use folders::{DeleteFolder, MoveFolder};
 pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
@@ -52,10 +55,8 @@ pub use owner::{
     DriveOwnerNoun, DriveOwnerObject, FileCounts, NoDriveOwner, OwnerObject, Unowned, file_counts,
 };
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
-#[allow(deprecated)]
 pub use processing::{
-    CANCELLED, CATALOGUE_NOT_WATCHED, ChainPlan, Initiator, LAUNCH_RETRY_AFTER, LAUNCH_RETRY_CAP,
-    RUNNER_TYPE_UNAVAILABLE, RootNames, TIMED_OUT, durable, retry_delay,
+    CANCELLED, ChainPlan, FileJob, Initiator, RootNames, RunProgress, durable, job_event,
 };
 pub use register::register;
 pub use ruleset::{

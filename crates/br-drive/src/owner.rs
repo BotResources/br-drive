@@ -122,9 +122,10 @@ pub async fn file_counts(
     drives: &[Uuid],
 ) -> Result<HashMap<Uuid, FileCounts>, EngineError> {
     let rows = sqlx::query(
-        "SELECT drive_id, count(*) AS files, \
-                count(*) FILTER (WHERE processing_state = $2) AS ready \
-         FROM drive.file WHERE drive_id = ANY($1) GROUP BY drive_id",
+        "SELECT f.drive_id, count(*) AS files, \
+                count(*) FILTER (WHERE s.processing_state = $2) AS ready \
+         FROM drive.file f JOIN drive.file_status s ON s.file_id = f.id \
+         WHERE f.drive_id = ANY($1) GROUP BY f.drive_id",
     )
     .bind(drives)
     .bind(ProcessingState::Ready.as_str())

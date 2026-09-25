@@ -42,13 +42,8 @@ pub mod codes {
     pub const DEFAULT_ALREADY_SET: Reason = Reason::new("DEFAULT_ALREADY_SET");
     pub const RULESET_MISMATCH: Reason = Reason::new("RULESET_MISMATCH");
     pub const NO_RULESET_MATCHES: Reason = Reason::new("NO_RULESET_MATCHES");
-    pub const RUNNER_TYPE_UNAVAILABLE: Reason = Reason::new("RUNNER_TYPE_UNAVAILABLE");
     pub const FILE_PROCESSING: Reason = Reason::new("FILE_PROCESSING");
-    #[deprecated(
-        since = "0.2.0",
-        note = "no longer raised: a rule saved before the first catalogue scan is kept"
-    )]
-    pub const CATALOGUE_NOT_WATCHED: Reason = Reason::new("CATALOGUE_NOT_WATCHED");
+    pub const FILE_NOT_PROCESSING: Reason = Reason::new("FILE_NOT_PROCESSING");
     pub const LABEL_NOT_FOUND: Reason = Reason::new("LABEL_NOT_FOUND");
     pub const LABEL_NAME_TAKEN: Reason = Reason::new("LABEL_NAME_TAKEN");
     pub const INVALID_LABEL: Reason = Reason::new("INVALID_LABEL");

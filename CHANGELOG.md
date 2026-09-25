@@ -18,27 +18,13 @@ single git tag `v{version}` releases the set. Format follows
   sequence correlated by the file id.
 - A `creation_rejected` `duplicate_active_entity` no longer leaves the file
   unprocessable: the live job Jobs names (`params.activeJobId`, checked
-  against the file and host the rejection names) is kept on the file
-  (`drive.file.stray_job_id`) and cancelled at once, and every later launch
-  cancels it again before asking for its own job, until Jobs queues a job of
-  the file. When the job named is one the library already cancelled (the
-  cancel and the create crossed on Jobs' separate consumers), the step waits
-  and relaunches instead of failing. `DeleteFile`, `DeleteFolder` and
-  `delete_drive` cancel it too; an erase in `Delete` mode cannot (no outbound
-  identity in the erase pipeline).
+  against the file and host the rejection names) is cancelled at once, and
+  the user's reprocess gets through (a cancel is idempotent).
 - `job.create` carries only what Jobs accepts: `RequestUpload` refuses a file
   id that is not a UUIDv7 (`INVALID_FILE_ID`) — Jobs refuses a non-v7 source
   entity, which would fail every chain of the file — and `triggered_by` is
   trimmed, a blank display name sent as anonymous, a long one cut at 512
   characters, an erased (nil) initiator not named at all.
-- A chain fired before the host's first runner-type catalogue scan (a fresh
-  database) is deferred instead of failing the file `catalogue_not_watched`:
-  the file waits in its step and a `launch-retry` message asks again after
-  `LAUNCH_RETRY_AFTER` (5 s), backing off to `LAUNCH_RETRY_CAP` (5 min), one
-  warning at the first deferral. Saving a rule before that scan is accepted,
-  every step reported in `unknownRunnerTypes`, instead of refused with
-  `CATALOGUE_NOT_WATCHED`. Both codes stay exported, deprecated, no longer
-  raised.
 - The runner source presign is scoped to the one file the job names, while
   that job is the file's active one, instead of enumerating every file with a
   live job on each `RunnerContext` call; the population re-checks the active
@@ -84,19 +70,97 @@ single git tag `v{version}` releases the set. Format follows
   answers `FOLDER_NOT_FOUND`, as an empty prefix does. The decisions run in
   memory over the rows the bulk path already loads, past the reset threshold
   too.
-- A file no runner picks up no longer stays `PROCESSING` for three days: the
-  step deadline has a pickup stage, `DriveHost::PICKUP_TIMEOUT` (default 1 h)
-  from the creation of the step's job until Jobs reports its run started,
-  before the run-silence stage (`STEP_TIMEOUT`, 72 h).
+- A file no runner picks up no longer stays `PROCESSING` with no way out:
+  its user cancels it (`<p>CancelProcessing`, see Added), Jobs' `cancelled`
+  lands it `FAILED`, and a reprocess starts over.
 
 ### Changed
 
+- **A file's processing state is computed, never stored.** Every Jobs job the
+  library creates for a file (one per chain step) is a row of the new
+  `drive.file_job` log (migration `9121000007`): the job, its step, its
+  initiator, and the append-only list of every Jobs fact received about it
+  (`queued`, `creation_rejected`, `started`, `plan_declared`, `step_started`,
+  `completed`, `failed`, `cancelled`, each `{kind, at, ...payload}`), plus the
+  user's `cancel_requested`. The `drive.file_status` view computes
+  `PENDING | PROCESSING | READY | FAILED` and the error from the file's last
+  job and the new `drive.file.committed_at`; `processingState`,
+  `processingError` and `progress` are read from it (the SDL is unchanged),
+  and so are every gate, affordance and `file_counts`. A fact updates only
+  its own job, so a late fact of an older job changes nothing; a job settles
+  on its first terminal fact, so a step fact arriving after the completion
+  (the facts ride separate durables) changes nothing either. A partial
+  unique index keeps at most one unsettled job per file; "last job" follows
+  an identity sequence, never the pods' clocks. An erase locks the files
+  whose jobs name the person before rewriting the jobs' initiators.
+- The chain advances only on Jobs' `completed`, which Jobs publishes only
+  after the owner's `job.finish` — sent with the runner's `done` report. A
+  `completed` that "arrives before the report" cannot happen; the branch that
+  waited for it is gone.
+- `FileRow`'s `processing_state` and `processing_error` fields became
+  computed accessors, `processing_state()` / `processing_error()`, beside
+  `last_job()` / `active_job()` (`br_drive::FileJob`) and `committed_at`; the
+  step, job, plan, progress, initiator and clock fields are gone.
+- The runner-type catalogue copy is information only. `drive.known_runner_type`
+  and the optional `br_drive::watch_runner_types` / `CatalogueWatch` (the
+  example's `BootOptions::watch_catalogue`) stay; the copy is read by
+  `RulesetSaved.unknownRunnerTypes` (and `RulesetCause::Saved {
+  unknown_runner_types }`) — the steps' types not known `ACTIVE`, a warning on
+  a rule that is saved — and by the new `<p>RunnerTypes` (Added). A rule may
+  name any runner type; a step's job is created whatever the copy says, and
+  Jobs alone judges it. On a host that does not start the watch every step's
+  type is reported unknown and no type is listed; nothing else changes. Only
+  such a host's broker may lack the `PUBLISHED_LANGUAGE` bucket.
+- The catalogue watch opens its KV watch before its scan and drains it after,
+  so a put or a delete landing during the scan is no longer lost. A name over
+  the copy's 128 bytes is left out instead of faulting the watch, a value that
+  is not JSON at all only takes its type out once the watch follows the
+  bucket (the start-up scan still stops on one: see the README), and a fault
+  is retried after a pause doubling from 1 s to 1 min instead of every second.
+  `CatalogueWatch` is `#[must_use]` and gains `detach`; the new
+  `br_drive::watch_runner_types_of(&engine)` starts the watch on the engine's
+  own handles from a `BootPlan` host's `register` closure.
 - The token estimate of a runner report is optional: `summary` and
   `pageCount` still move together, `estimatedTokens` may be absent (it may not
   come alone). An indexing without an estimate clears a previous one.
 
+### Removed
+
+- Every use of the runner-type catalogue copy as a condition:
+  `drive.catalogue_scan` (the "catalogue was read" record), the deferred
+  launch (`launch-retry`, `LAUNCH_RETRY_AFTER`, `LAUNCH_RETRY_CAP`,
+  `FileCause::LaunchDeferred`), the `runner_type_unavailable` failure, the
+  `RUNNER_TYPE_UNAVAILABLE` and `CATALOGUE_NOT_WATCHED` codes. Jobs refuses at
+  creation a runner type it retired (`creation_rejected`
+  `runner_type_retired`: the file fails), and accepts one it does not know
+  without ever dispatching it: the user's cancel is the way out.
+- Both processing deadlines: `DriveHost::PICKUP_TIMEOUT`,
+  `DriveHost::STEP_TIMEOUT`, the `step-deadline` message and its durable, the
+  `timed_out` failure. The upload deadline stays, keyed on `committed_at`.
+- The stray job kept on a file after a `duplicate_active_entity` rejection,
+  and the automatic relaunch when a cancel and a create crossed.
+- The unreleased migrations of the 0.2 lots (`processing_backstops`,
+  `file_counts_index`, `run_started_at`): the chain goes from 0.1's schema to
+  the job log directly; the title migration is now `9121000006`.
+
 ### Added
 
+- `<p>RunnerTypes: [DriveRunnerType!]!` (`br_drive::known_runner_types`): the
+  whole local catalogue copy — `{ runnerType, lifecycle: ACTIVE | DEPRECATED,
+  seenAt }` in name order — for a host's rule-editing screen. Gated by the
+  host's existing `ReadRulesets` (a refused principal gets an empty list, as
+  for `<p>Rulesets`); a plain read, no live window.
+- `<p>CancelProcessing(fileId)`: the user cancels the job running on a
+  `PROCESSING` file, through the new `DriveRequest::CancelProcessing { file }`
+  gate (affordance `cancelProcessing`; `FILE_NOT_PROCESSING` otherwise). The
+  request is logged on the job (`cancel_requested`, cause
+  `CancelRequested { job_id }`) and `job.cancel.v2` is staged; the file stays
+  `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to
+  a reprocess. It may be asked again (a cancel Jobs consumed before the job's
+  creation is dropped). A cancel that crosses a step's completion stops the
+  chain there: the next step is recorded as never started (`cancelled`, a
+  row of the library's own, never sent to Jobs). The example host exposes it
+  to a workspace's owner.
 - `<p>ImportCommit(fileId)`: commits a pending upload **without processing**
   — the file lands `READY` and no rule runs, even when an `upload` rule
   matches — so a host that declared its processing rules before migrating a
@@ -105,11 +169,6 @@ single git tag `v{version}` releases the set. Format follows
   `DriveRequest::ImportCommit { file }` on the pending row (its uploader
   included), then `FILE_NOT_PENDING` and the commit's storage check
   (`UPLOAD_NOT_LANDED`). `CommitUpload` is unchanged.
-- `DriveHost::PICKUP_TIMEOUT` (default 1 h, checked at registration, not
-  above `STEP_TIMEOUT`): the pickup stage of the step deadline (see Fixed),
-  counted from the step's first job. Migration `9121000009` adds
-  `drive.file.run_started_at`, set by the first sign of a started run (a
-  `started` fact, a plan, a step, a runner report).
 - `br_drive::create_unowned_drive::<H>(ops, id, created_by)`, for a host whose
   `DriveOwner` is `NoDriveOwner` only.
 - A host-privileged **import** of an existing rendition:
@@ -130,13 +189,13 @@ single git tag `v{version}` releases the set. Format follows
   noun — an object carrying file counts — recompute and republish while files
   land, fail, move and go. No host callback; the noun and its key are
   compiler-checked. `br_drive::file_counts` reads the file and READY counts
-  of several drives in one statement, served by the new index of migration
-  `9121000008`. The example host's `WorkspaceView` gains `fileCount` and
+  of several drives in one statement, from the computed status (migration
+  `9121000007`). The example host's `WorkspaceView` gains `fileCount` and
   `readyFileCount`, live.
 - `DriveHost::IMPORT_SCOPE` (default `None`: no import): the scope a service
   account must hold to import, checked by the library before the host's gate
   (`IMPORT_SCOPE_REQUIRED`), the way the runner scope is.
-- A file's **title**: `drive.file.title` (migration `9121000007`, at most 255
+- A file's **title**: `drive.file.title` (migration `9121000006`, at most 255
   characters, existing files backfilled with their name without its
   extension), projected as `DriveFile.title`. `RequestUpload` takes an
   optional `title` (the `FileTitle` value object, built only by parsing:
@@ -146,37 +205,22 @@ single git tag `v{version}` releases the set. Format follows
   the new `DriveRequest::RetitleFile { file }` gate (affordance `retitle`,
   cause `Retitled`); renaming or moving never touches the title, retitling
   never moves the file.
-- `DriveHost::STEP_TIMEOUT` (default 72 h, Jobs' longest run; checked at
-  registration): a started run silent that long — measured from its last
-  sign of life: run start, plan, step, runner report — has its job cancelled
-  and its file lands `FAILED` `timed_out` (`br_drive::TIMED_OUT`). Before the
-  run starts, `PICKUP_TIMEOUT` (1 h) bounds the wait the same way: Jobs never
-  fails a job no live runner picks up, so this is the way out for a runner
-  type with no live instance. One `step-deadline` message per step on a
-  `{service}-drive-step-deadline` durable, rescheduled when the step's
-  deadline moved since.
-- Migration `9121000006`: `drive.file.step_entered_at` (the running step's
-  identity; the deadline and the deferred launch key on it),
-  `drive.file.step_alive_at` (its last sign of life) and
-  `drive.file.stray_job_id`.
 - The example host's Jobs stand-in judges every `job.create` the way Jobs
   does, in Jobs' order — the inputs `svc-jobs` refuses before the domain
   (non-v7 ids, a blank or over-long display name, a source not named by its
-  producer), a reused id, a second live job on a source entity, a
-  self-named, terminal, deleted or unknown parent — and answers
-  `creation_rejected` itself; it publishes `cancelled` for a live job it
-  cancels, and a create a scenario awaits fails the scenario when refused.
-  Regression scenarios for the double; new scenarios for the step timeout, the duplicate-job trap
-  and the deferred launch. The example host can boot without its catalogue
-  watch (`BootOptions::watch_catalogue`) and start it later; its gate reserves
-  a commit to the uploader, keeps service principals out of the label
-  catalogue, and its metadata mutation relies on the library's gate.
+  producer), a runner type it retired, a reused id, a second live job on a
+  source entity, a self-named, terminal, deleted or unknown parent — and
+  answers `creation_rejected` itself; it publishes `cancelled` for a live job
+  it cancels (or drops every cancel on demand), and a create a scenario
+  awaits fails the scenario when refused. Regression scenarios for the
+  double; scenarios for the duplicate-job trap, the user's cancel and late
+  facts. The example host's gate reserves a commit to the uploader, keeps
+  service principals out of the label catalogue, and its metadata mutation
+  relies on the library's gate.
 
 ### Changed
 
-- `FileCause` is `#[non_exhaustive]`; new variant `LaunchDeferred { step }`.
-- `DriveHost::STEP_TIMEOUT` now bounds the silence of a **started** run only;
-  before the run starts, `PICKUP_TIMEOUT` applies.
+- `FileCause` is `#[non_exhaustive]`; new variant `CancelRequested { job_id }`.
 - `br_drive::create_drive::<H>(ops, owner, created_by)` takes the host object
   the drive hangs off (`&<H::DriveOwner as DriveOwnerNoun>::Object`) and gives
   the drive its key, instead of a free id: a drive's id is its host object's
@@ -197,15 +241,6 @@ single git tag `v{version}` releases the set. Format follows
   otherwise with `OwnerSubjectToRls`). Bodies are bounded at 16 MiB by
   default (engine 0.3.3): a host that imports or accepts runner reports
   larger than that raises `MultipartConfig::max_body_bytes`.
-- Migration `9121000006` adds nullable columns only. Files already
-  `PROCESSING` when it is applied carry no step clock and get no deadline:
-  let them finish or delete them.
-- `DriveHost::STEP_TIMEOUT` is new with a 72 h default: the silence a started
-  run may keep before its file fails `timed_out`; a host that wants its users
-  to learn sooner lowers it (see `PICKUP_TIMEOUT` below for a run that never
-  starts).
-- A host that matched `CATALOGUE_NOT_WATCHED` keeps compiling (deprecated);
-  nothing raises it any more.
 - `DriveRequest` gains `CommitUpload { file }`, `ReadLabels` and
   `SetMetadata { file }`: decide each explicitly — a wildcard arm in
   `drive_gate` now answers them silently. A 0.1 host whose `CreateFile` rule
@@ -219,26 +254,38 @@ single git tag `v{version}` releases the set. Format follows
   wildcard arm answers it), including for a `protected` file — the library
   does not refuse a retitle on protection. `RequestUpload` takes an optional
   `title`.
-- Migration `9121000007` is one-way: once applied, a pre-0.2 binary cannot
+- Migration `9121000006` is one-way: once applied, a pre-0.2 binary cannot
   create a file (`title` is `NOT NULL`).
+- Migration `9121000007` replaces the stored processing state with the job
+  log, one-way: `committed_at` is backfilled from `updated_at` for every file
+  past `PENDING`; a job in flight becomes its file's log (empty, so the file
+  stays `PROCESSING` and the job's next fact lands in it); a `FAILED` file
+  keeps its error as a synthetic `failed` entry of a synthetic job (never
+  sent to Jobs); a `PROCESSING` file without a job, should one exist, lands
+  `FAILED` `interrupted`. Then the stored state, step, job, plan, progress,
+  initiator and clock columns and `drive.catalogue_scan` are dropped;
+  `drive.known_runner_type` is kept as it is. A database that ran this branch's
+  unreleased migrations `9121000006`–`9121000009` must be recreated.
+- `DriveRequest::CancelProcessing { file }` is new: decide it explicitly (a
+  wildcard arm answers it). A host that started `br_drive::watch_runner_types`
+  keeps it (optional, information only); one that set `PICKUP_TIMEOUT` / `STEP_TIMEOUT` drops them.
+  A host that read `file.processing_state` / `file.processing_error` calls
+  the accessors. A host that matched `RUNNER_TYPE_UNAVAILABLE`,
+  `runner_type_unavailable` or `timed_out` may meet Jobs' own
+  `runner_type_retired`, or `cancelled`.
 - `DriveHost` gains a required associated type, `DriveOwner`: write
   `type DriveOwner = br_drive::NoDriveOwner;` to keep 0.1's behaviour, and
   replace `create_drive(cx, id, created_by)` with
   `create_unowned_drive::<H>(cx, id, created_by)`. A host that names its own
   noun writes `impl DriveOwnerNoun for Its { type Object = ItsRow; }` and
   creates each drive from that row: `create_drive::<H>(cx, &row, created_by)`.
-- `DriveHost::PICKUP_TIMEOUT` is new with a 1 h default: a step whose job no
-  runner starts within an hour of its creation now fails `timed_out`. A host
-  whose fleet may queue work longer raises it; `STEP_TIMEOUT` keeps bounding
-  the silence of a started run. Migration `9121000009` adds a nullable column.
 - `MoveFolder` / `DeleteFolder` now also ask the `UpdateFile` / `DeleteFile`
   decision of each file under the prefix: a host whose per-file rule is
   stricter than its folder rule sees folder gestures refused with that rule's
   code where they went through before.
 - `<p>ImportCommit` is new: it needs `IMPORT_SCOPE` and the host's new
   `DriveRequest::ImportCommit { file }` — decide it explicitly (a wildcard
-  arm answers it); the row carries the uploader. A host that sets
-  `PICKUP_TIMEOUT` above `STEP_TIMEOUT` is refused at registration.
+  arm answers it); the row carries the uploader.
   `DriveRequest::Import { file }` is new; an import additionally needs
   `IMPORT_SCOPE`, so a host that sets none offers no import whatever its
   gate answers.

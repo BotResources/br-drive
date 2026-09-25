@@ -52,6 +52,18 @@ macro_rules! drive_slice {
                         .await
                 }
 
+                async fn [<$prefix _runner_types>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                ) -> ::async_graphql::Result<::std::vec::Vec<$crate::DriveRunnerType>> {
+                    let principal = ctx.data::<$p>()?;
+                    let state = ctx
+                        .data::<::std::sync::Arc<::service_engine::GraphqlState<$p>>>()?;
+                    $crate::known_runner_types::<$p>(state.pg(), principal)
+                        .await
+                        .map_err($crate::DriveFault::into_graphql)
+                }
+
                 async fn [<$prefix _labels>](
                     &self,
                     ctx: &::async_graphql::Context<'_>,
@@ -211,6 +223,18 @@ macro_rules! drive_slice {
                     ::service_engine::ack::<$p, $crate::Process>(
                         ctx,
                         $crate::Process { file_id, ruleset_id },
+                    )
+                    .await
+                }
+
+                async fn [<$prefix _cancel_processing>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::CancelProcessing>(
+                        ctx,
+                        $crate::CancelProcessing { file_id },
                     )
                     .await
                 }

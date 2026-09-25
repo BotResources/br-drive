@@ -61,7 +61,6 @@ pub(crate) fn apply_indexing<H>(
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
 
     use super::*;
 
@@ -123,7 +122,8 @@ mod tests {
 
     #[test]
     fn an_indexing_is_recorded_whole_and_an_absent_estimate_clears_the_previous_one() {
-        let mut file = crate::file::tests_support::processing_file::<()>(0, Utc::now());
+        let mut file =
+            crate::file::tests_support::a_file::<()>(crate::file::ProcessingState::Processing);
         assert!(apply_indexing(&mut file, "s".into(), 3, Some(99)));
         assert!(
             !apply_indexing(&mut file, "s".into(), 3, Some(99)),

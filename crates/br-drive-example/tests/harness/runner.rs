@@ -50,15 +50,9 @@ pub fn ruleset_id(response: &serde_json::Value) -> Uuid {
     .expect("a uuid")
 }
 
-/// Declares the two stand-in runner types ACTIVE and one default upload rule
-/// `text/plain → [render]`, so an uploaded text file gets one job.
-pub async fn install_render_rule(world: &World, jobs: &super::JobsStandIn, manager: &str) -> Uuid {
-    jobs.declare_runner_type(RENDER, contract_jobs::catalog::RunnerTypeLifecycle::Active)
-        .await;
-    jobs.declare_runner_type(INDEX, contract_jobs::catalog::RunnerTypeLifecycle::Active)
-        .await;
-    world.await_known_runner_type(RENDER, Some("active")).await;
-    world.await_known_runner_type(INDEX, Some("active")).await;
+/// One default upload rule `text/plain → [render]`, so an uploaded text file
+/// gets one job.
+pub async fn install_render_rule(world: &World, manager: &str) -> Uuid {
     ruleset_id(
         &create_ruleset(
             world,

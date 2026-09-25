@@ -56,6 +56,10 @@ pub enum DriveRequest<'a, H> {
     Process {
         file: &'a FileRow<H>,
     },
+    /// Cancelling the job running on a PROCESSING file (`<p>CancelProcessing`).
+    CancelProcessing {
+        file: &'a FileRow<H>,
+    },
     EditPage {
         file: &'a FileRow<H>,
     },
@@ -103,6 +107,7 @@ impl<H> DriveRequest<'_, H> {
             | Self::Import { file }
             | Self::ImportCommit { file }
             | Self::Process { file }
+            | Self::CancelProcessing { file }
             | Self::EditPage { file }
             | Self::RegeneratePage { file, .. }
             | Self::SetFileLabels { file } => Some(file.drive_id),
@@ -137,30 +142,6 @@ pub trait DriveHost: Principal {
     /// showing file counts, say — recomputes and republishes. The noun is a
     /// type: its name and its UUID key are checked by the compiler.
     type DriveOwner: DriveOwnerNoun;
-
-    /// How long a step's job may wait for a runner: from the job's creation
-    /// until Jobs reports its run started. A job no live instance of its runner
-    /// type picks up is never failed by Jobs (its backstops need a started
-    /// run), so past this deadline the library cancels it and the file lands
-    /// FAILED `timed_out`, open to a reprocess. Default 1 h; a host whose
-    /// fleet may queue work longer than that raises it. Checked at
-    /// registration: positive and within the scheduler's range.
-    /// Not above `STEP_TIMEOUT` (refused at registration). The clock starts
-    /// when the step's first job is staged, not when Jobs queues it, so a Jobs
-    /// or broker outage longer than this fails the steps entered during it;
-    /// and Jobs reports only a job's first run as started, so a retry waiting
-    /// for a runner after a failed attempt is bounded by `STEP_TIMEOUT`.
-    const PICKUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-
-    /// How long a started run may stay silent before the library cancels its
-    /// job and fails the file with `timed_out`. Silence is measured from the
-    /// run's last sign of life: its start, then each plan, step and runner
-    /// report. The default is Jobs' own longest run (72 h), so the library
-    /// never gives up on work Jobs still allows; a host that wants its users to
-    /// learn sooner lowers it. Before the run starts, `PICKUP_TIMEOUT` applies
-    /// instead. Checked at registration: positive and within the scheduler's
-    /// range.
-    const STEP_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;
 

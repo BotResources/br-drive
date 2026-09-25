@@ -50,12 +50,6 @@ impl DriveHost for AppPrincipal {
 
     const BULK_RESET_THRESHOLD: usize = 3;
 
-    /// Short enough for the timeout scenarios to run in the suite; the pickup
-    /// deadline stays below the run-silence one, as the defaults do (1 h / 72 h).
-    const PICKUP_TIMEOUT: Duration = Duration::from_secs(20);
-
-    const STEP_TIMEOUT: Duration = Duration::from_secs(30);
-
     #[cfg(feature = "workspace")]
     type DriveOwner = crate::slices::workspace::Workspace;
     #[cfg(not(feature = "workspace"))]

@@ -59,7 +59,7 @@ async fn deleting_one_file_releases_its_image_blobs_with_its_source_and_closes_i
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
     let jobs = JobsStandIn::attach(&world).await;
-    install_render_rule(&world, &jobs, &manager_passport(Uuid::now_v7(), "Ada")).await;
+    install_render_rule(&world, &manager_passport(Uuid::now_v7(), "Ada")).await;
     let drive = world.create_workspace(&owner, "library").await;
     let file_id = upload(
         &world,

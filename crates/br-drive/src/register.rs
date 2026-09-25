@@ -4,8 +4,9 @@ use service_engine::error::EngineError;
 use crate::erase::DriveErasure;
 use crate::file::images::{IMAGE_LANDED_DURABLE, ImageLanded, image_landed};
 use crate::file::{
-    DeleteFile, DriveFiles, DrivePages, EditPage, Process, RegeneratePage, RetitleFile, UpdateFile,
-    delete_file, edit_page, process, regenerate_page, retitle_file, update_file,
+    CancelProcessing, DeleteFile, DriveFiles, DrivePages, EditPage, Process, RegeneratePage,
+    RetitleFile, UpdateFile, cancel_processing, delete_file, edit_page, process, regenerate_page,
+    retitle_file, update_file,
 };
 use crate::folders::{self, DeleteFolder, MoveFolder};
 use crate::host::DriveHost;
@@ -33,7 +34,6 @@ pub fn register<H: DriveHost>(
     prefix: &'static str,
 ) -> Result<(), EngineError> {
     processing::declare_roots::<H>(prefix)?;
-    processing::check_timeouts::<H>()?;
     if !engine.blobs_configured() {
         return Err(EngineError::Config(
             "br-drive needs object storage: configure EngineConfig::with_blob_storage before \
@@ -57,6 +57,7 @@ pub fn register<H: DriveHost>(
     engine.register_mutation::<DeleteFile, _>(delete_file::<H>)?;
     engine.register_mutation::<EditPage, _>(edit_page::<H>)?;
     engine.register_mutation::<Process, _>(process::<H>)?;
+    engine.register_mutation::<CancelProcessing, _>(cancel_processing::<H>)?;
     engine.register_mutation::<RegeneratePage, _>(regenerate_page::<H>)?;
     engine.register_mutation::<CreateRuleset, _>(create_ruleset::<H>)?;
     engine.register_mutation::<UpdateRuleset, _>(update_ruleset::<H>)?;
@@ -83,14 +84,6 @@ pub fn register<H: DriveHost>(
     engine.register_reaction::<ImageLanded<H>, _, _>(
         &durable(IMAGE_LANDED_DURABLE),
         image_landed::<H>,
-    )?;
-    engine.register_reaction::<processing::StepDeadline<H>, _, _>(
-        &durable(processing::STEP_DEADLINE_DURABLE),
-        processing::step_deadline::<H>,
-    )?;
-    engine.register_reaction::<processing::LaunchRetry<H>, _, _>(
-        &durable(processing::LAUNCH_RETRY_DURABLE),
-        processing::launch_retry::<H>,
     )?;
     engine.register_reaction::<QueuedFact, _, _>(
         &durable(processing::DURABLE_QUEUED),

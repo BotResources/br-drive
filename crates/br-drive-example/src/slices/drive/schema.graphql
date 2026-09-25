@@ -58,6 +58,7 @@ type DriveMutation {
 	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!, title: String): UploadTicket!
 	workspaceCommitUpload(fileId: UUID!, rulesetId: UUID): MutationAck!
 	workspaceProcess(fileId: UUID!, rulesetId: UUID): MutationAck!
+	workspaceCancelProcessing(fileId: UUID!): MutationAck!
 	workspaceRegeneratePage(fileId: UUID!, number: Int!, comment: String, rulesetId: UUID): MutationAck!
 	workspaceCreateRuleset(id: UUID!, name: String!, trigger: Trigger!, mediaTypes: [String!]!, steps: [RulesetStepInput!]!, isDefault: Boolean! = false): RulesetSaved!
 	workspaceUpdateRuleset(id: UUID!, name: String, mediaTypes: [String!], steps: [RulesetStepInput!], isDefault: Boolean): RulesetSaved!
@@ -104,6 +105,7 @@ type DriveQuery {
 	workspaceDriveFiles(driveId: UUID!): [DriveFile!]!
 	workspacePages(fileId: UUID!): [DrivePage!]!
 	workspaceRulesets: [DriveRuleset!]!
+	workspaceRunnerTypes: [DriveRunnerType!]!
 	workspaceLabels: [DriveLabel!]!
 	workspaceFileAccess(fileId: UUID!, name: String): String
 	workspaceRunnerContext(fileId: UUID!, jobId: UUID!): RunnerContext!
@@ -131,6 +133,27 @@ type DriveRuleset {
 	createdBy: UUID!
 	createdAt: DateTime!
 	updatedAt: DateTime!
+}
+
+"""
+One runner type of the local catalogue copy, as the watch last saw it.
+"""
+type DriveRunnerType {
+	runnerType: String!
+	lifecycle: DriveRunnerTypeLifecycle!
+	"""
+	When the watch last wrote the entry (database clock).
+	"""
+	seenAt: DateTime!
+}
+
+"""
+A runner type's lifecycle as Jobs publishes it. A retired type is not
+published at all, so it is absent from the copy.
+"""
+enum DriveRunnerTypeLifecycle {
+	ACTIVE
+	DEPRECATED
 }
 
 type DriveStep {
@@ -205,6 +228,11 @@ input ReportedPageInput {
 
 type RulesetSaved {
 	id: UUID!
+	"""
+	The steps' runner types the local catalogue copy does not know as
+	`ACTIVE` (absent or deprecated) — a warning, the rule is saved; every
+	step's type on a host that does not run the catalogue watch.
+	"""
 	unknownRunnerTypes: [String!]!
 }
 
