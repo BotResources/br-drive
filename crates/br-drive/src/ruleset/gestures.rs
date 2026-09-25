@@ -9,6 +9,7 @@ use super::{
     ANY_MEDIA_TYPE, MAX_RULESET_NAME_BYTES, MAX_RULESET_STEPS, MAX_RUNNER_TYPE_BYTES, Ruleset,
     RulesetCause, RulesetRow, RulesetStep, Trigger,
 };
+use crate::catalogue;
 use crate::fault::{DriveFault, codes};
 use crate::host::{DriveHost, DriveRequest};
 use crate::media::MediaType;
@@ -16,6 +17,10 @@ use crate::media::MediaType;
 #[derive(Debug, Clone, PartialEq, Eq, async_graphql::SimpleObject)]
 pub struct RulesetSaved {
     pub id: Uuid,
+    /// The steps' runner types the local catalogue copy does not know as
+    /// `ACTIVE` (absent or deprecated) — a warning, the rule is saved; every
+    /// step's type on a host that does not run the catalogue watch.
+    pub unknown_runner_types: Vec<String>,
 }
 
 fn validate_name(name: &str) -> Result<String, DriveFault> {
@@ -155,8 +160,18 @@ pub fn create_ruleset<'m, H: DriveHost>(
             updated_at: now,
         };
         cx.create(&ruleset).await?;
-        cx.impact_caused::<Ruleset, _>(&ruleset.id, RulesetCause::Saved)?;
-        Ok(OneShot(RulesetSaved { id: ruleset.id }))
+        let unknown_runner_types =
+            catalogue::not_known_active(cx.connection(), &ruleset.runner_types()).await?;
+        cx.impact_caused::<Ruleset, _>(
+            &ruleset.id,
+            RulesetCause::Saved {
+                unknown_runner_types: unknown_runner_types.clone(),
+            },
+        )?;
+        Ok(OneShot(RulesetSaved {
+            id: ruleset.id,
+            unknown_runner_types,
+        }))
     })
 }
 
@@ -220,8 +235,18 @@ pub fn update_ruleset<'m, H: DriveHost>(
         ruleset.is_default = is_default;
         ruleset.updated_at = cx.now().as_datetime();
         cx.save(&ruleset).await?;
-        cx.impact_caused::<Ruleset, _>(&ruleset.id, RulesetCause::Saved)?;
-        Ok(OneShot(RulesetSaved { id: ruleset.id }))
+        let unknown_runner_types =
+            catalogue::not_known_active(cx.connection(), &ruleset.runner_types()).await?;
+        cx.impact_caused::<Ruleset, _>(
+            &ruleset.id,
+            RulesetCause::Saved {
+                unknown_runner_types: unknown_runner_types.clone(),
+            },
+        )?;
+        Ok(OneShot(RulesetSaved {
+            id: ruleset.id,
+            unknown_runner_types,
+        }))
     })
 }
 

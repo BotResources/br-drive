@@ -8,6 +8,7 @@ use br_core_integration::{
     Actor, EventCoords, EventMetadata, IntegrationCommand, IntegrationEvent, ServiceAccountId,
 };
 use chrono::Utc;
+use contract_jobs::catalog::{RunnerType, RunnerTypeLifecycle, runner_type_key};
 use contract_jobs::command::{CancelJob, CreateJob, FinishJob};
 use contract_jobs::event::{
     EVENT_TYPE_CANCELLED, EVENT_TYPE_COMPLETED, EVENT_TYPE_CREATION_REJECTED, EVENT_TYPE_FAILED,
@@ -25,7 +26,7 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use service_engine::nats::INTEGRATION_CMD;
+use service_engine::nats::{INTEGRATION_CMD, KV_PUBLISHED_LANGUAGE};
 use uuid::Uuid;
 
 use super::World;
@@ -400,21 +401,61 @@ impl JobsStandIn {
             .dropping_cancels = dropping;
     }
 
-    /// Jobs retires `runner_type`: it refuses every new job of it at creation.
-    pub fn retire_runner_type(&self, runner_type: &str) {
-        let mut ledger = self.ledger.lock().expect("the ledger lock");
-        let live = ledger.jobs.values().any(|held| {
-            !held.terminal
-                && held
-                    .declared
-                    .as_ref()
-                    .is_some_and(|create| create.runner_type == runner_type)
-        });
-        assert!(
-            !live,
-            "Jobs refuses to retire a runner type with live jobs (runner_type_has_non_terminal_jobs)"
-        );
-        ledger.retired.insert(runner_type.to_string());
+    /// Jobs retires `runner_type`: it refuses every new job of it at creation
+    /// and withdraws it from its published catalogue.
+    pub async fn retire_runner_type(&self, runner_type: &str) {
+        {
+            let mut ledger = self.ledger.lock().expect("the ledger lock");
+            let live = ledger.jobs.values().any(|held| {
+                !held.terminal
+                    && held
+                        .declared
+                        .as_ref()
+                        .is_some_and(|create| create.runner_type == runner_type)
+            });
+            assert!(
+                !live,
+                "Jobs refuses to retire a runner type with live jobs (runner_type_has_non_terminal_jobs)"
+            );
+            ledger.retired.insert(runner_type.to_string());
+        }
+        self.catalogue()
+            .await
+            .delete(runner_type_key(runner_type))
+            .await
+            .expect("withdraw the runner type from the catalogue");
+    }
+
+    /// Jobs publishes `runner_type` in its catalogue with `lifecycle`. The
+    /// double accepts jobs of any type it has not retired, published or not.
+    pub async fn declare_runner_type(&self, runner_type: &str, lifecycle: RunnerTypeLifecycle) {
+        let entry = RunnerType {
+            runner_type: runner_type.to_string(),
+            lifecycle,
+            version: contract_jobs::runner::WIRE_VERSION,
+        };
+        self.publish_catalogue_entry(runner_type, serde_json::to_value(&entry).unwrap())
+            .await;
+    }
+
+    /// Publishes any value under `runner_type`'s catalogue key — an entry the
+    /// library must not trust (garbled, misnamed, another wire version).
+    pub async fn publish_catalogue_entry(&self, runner_type: &str, value: Value) {
+        self.catalogue()
+            .await
+            .put(
+                runner_type_key(runner_type),
+                serde_json::to_vec(&value).unwrap().into(),
+            )
+            .await
+            .expect("publish the catalogue entry");
+    }
+
+    async fn catalogue(&self) -> async_nats::jetstream::kv::Store {
+        self.js
+            .get_key_value(KV_PUBLISHED_LANGUAGE)
+            .await
+            .expect("the published-language bucket exists")
     }
 
     /// A settled job an administrator deleted from Jobs' ledger (Jobs never

@@ -28,7 +28,7 @@ pub async fn create_ruleset(world: &World, manager: &str, spec: RuleSpec<'_>) ->
         .gql(
             manager,
             "mutation($id:UUID!,$n:String!,$t:Trigger!,$m:[String!]!,$s:[RulesetStepInput!]!,$d:Boolean!){\
-             workspaceCreateRuleset(id:$id,name:$n,trigger:$t,mediaTypes:$m,steps:$s,isDefault:$d){id}}",
+             workspaceCreateRuleset(id:$id,name:$n,trigger:$t,mediaTypes:$m,steps:$s,isDefault:$d){id unknownRunnerTypes}}",
             serde_json::json!({
                 "id": Uuid::now_v7(),
                 "n": spec.name,

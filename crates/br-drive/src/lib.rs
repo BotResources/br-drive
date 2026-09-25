@@ -1,4 +1,5 @@
 mod blob;
+mod catalogue;
 mod drive;
 mod erase;
 mod fault;
@@ -25,6 +26,10 @@ use std::ops::RangeInclusive;
 use service_engine::LibraryMigrations;
 
 pub use blob::{DriveImage as DriveImageBlob, DriveSource};
+pub use catalogue::{
+    CatalogueWatch, DriveRunnerType, DriveRunnerTypeLifecycle, known_runner_types,
+    watch_runner_types,
+};
 pub use drive::{DriveDeleted, create_drive, create_unowned_drive, delete_drive};
 pub use erase::{DriveErasure, EraseMode, REDACTED_PERSON};
 pub use fault::{DriveFault, DriveReactionFault, codes};

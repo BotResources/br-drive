@@ -36,6 +36,7 @@ pub struct World {
 pub struct WorldOptions {
     pub reaper_interval: Duration,
     pub upload_window: Duration,
+    pub watch_catalogue: bool,
 }
 
 impl Default for WorldOptions {
@@ -43,6 +44,7 @@ impl Default for WorldOptions {
         Self {
             reaper_interval: Duration::from_millis(150),
             upload_window: HostSettings::DEFAULT_UPLOAD_WINDOW,
+            watch_catalogue: true,
         }
     }
 }
@@ -77,6 +79,7 @@ impl World {
                 settings: HostSettings {
                     upload_window: options.upload_window,
                 },
+                watch_catalogue: options.watch_catalogue,
             },
         )
         .await
@@ -290,6 +293,64 @@ impl World {
             .as_array()
             .expect("a list of rulesets")
             .clone()
+    }
+
+    /// The host's known runner types, as a rule-editing screen reads them.
+    pub async fn runner_types(&self, passport: &str) -> Vec<serde_json::Value> {
+        let response = self
+            .gql(
+                passport,
+                "query{workspaceRunnerTypes{runnerType lifecycle version seenAt}}",
+                serde_json::json!({}),
+            )
+            .await;
+        ok(&response)["workspaceRunnerTypes"]
+            .as_array()
+            .expect("a list of runner types")
+            .clone()
+    }
+
+    /// Waits until the known runner types read by `passport` satisfy `holds`
+    /// — the watch copies Jobs' catalogue asynchronously.
+    pub async fn await_runner_types(
+        &self,
+        passport: &str,
+        what: &str,
+        mut holds: impl FnMut(&[serde_json::Value]) -> bool,
+    ) -> Vec<serde_json::Value> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let listed = self.runner_types(passport).await;
+            if holds(&listed) {
+                return listed;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the known runner types never showed {what}: {listed:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+
+    /// Waits until `runner_type` is listed with `lifecycle` (`None`: absent).
+    pub async fn await_runner_type(
+        &self,
+        passport: &str,
+        runner_type: &str,
+        lifecycle: Option<&str>,
+    ) {
+        self.await_runner_types(
+            passport,
+            &format!("{runner_type} as {lifecycle:?}"),
+            |listed| {
+                listed
+                    .iter()
+                    .find(|entry| entry["runnerType"] == runner_type)
+                    .and_then(|entry| entry["lifecycle"].as_str())
+                    == lifecycle
+            },
+        )
+        .await;
     }
 
     pub async fn await_source_promoted(&self, file_id: Uuid) {

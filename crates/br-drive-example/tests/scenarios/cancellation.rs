@@ -348,7 +348,7 @@ async fn a_runner_type_jobs_retired_fails_the_file_at_creation() {
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
     install_render_rule(&world, &manager).await;
-    jobs.retire_runner_type(RENDER);
+    jobs.retire_runner_type(RENDER).await;
     let drive = world.create_workspace(&owner, "library").await;
     let mut files = drive_subscription(&world, &owner, drive).await;
 

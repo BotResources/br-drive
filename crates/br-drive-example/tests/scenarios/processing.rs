@@ -373,7 +373,7 @@ async fn a_variant_is_picked_by_id_the_catch_all_serves_other_media_types_and_mi
 #[tokio::test]
 async fn a_rule_naming_a_runner_type_jobs_does_not_know_waits_for_the_users_cancel() {
     // Given: a rule whose step names a runner type nobody declared to Jobs —
-    // the library keeps no copy of the catalogue, so the rule is saved as is
+    // the library's catalogue copy only warns, so the rule is saved
     let world = World::start("pod-chain-unknown-type").await;
     let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
@@ -391,10 +391,8 @@ async fn a_rule_naming_a_runner_type_jobs_does_not_know_waits_for_the_users_canc
     )
     .await;
     assert_eq!(
-        ok(&saved)["workspaceCreateRuleset"]
-            .as_object()
-            .map(|saved| saved.keys().cloned().collect::<Vec<_>>()),
-        Some(vec!["id".to_string()])
+        ok(&saved)["workspaceCreateRuleset"]["unknownRunnerTypes"],
+        serde_json::json!(["ghost"])
     );
     let drive = world.create_workspace(&owner, "library").await;
 
@@ -406,7 +404,8 @@ async fn a_rule_naming_a_runner_type_jobs_does_not_know_waits_for_the_users_canc
     )
     .await;
 
-    // Then: Jobs accepts the job — it never dispatches it — and the file waits
+    // Then: the library does not refuse the launch; Jobs accepts the job — it
+    // never dispatches it — and the file waits
     let create = jobs.await_create(file_id).await;
     assert_eq!(create.runner_type, "ghost");
     let file = world.await_state(&owner, file_id, "PROCESSING").await;
@@ -519,7 +518,7 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
     .await;
 
     reprocess_rule(&world, &manager).await;
-    jobs.retire_runner_type(RENDER);
+    jobs.retire_runner_type(RENDER).await;
     ok(&world
         .gql(
             &owner,

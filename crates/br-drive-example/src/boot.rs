@@ -20,6 +20,8 @@ pub struct Service {
     readiness: ReadinessHandle,
     stop: Arc<Notify>,
     handle: JoinHandle<Result<(), EngineError>>,
+    #[cfg(feature = "drive")]
+    catalogue: Option<br_drive::CatalogueWatch>,
     eraser: service_engine::Eraser<AppPrincipal>,
 }
 
@@ -56,6 +58,10 @@ impl Service {
     }
 
     pub async fn shutdown(self) {
+        #[cfg(feature = "drive")]
+        if let Some(watch) = self.catalogue {
+            watch.stop().await;
+        }
         self.stop.notify_one();
         let _ = self.handle.await;
     }
@@ -64,6 +70,10 @@ impl Service {
 pub struct BootOptions {
     pub await_ready: bool,
     pub settings: HostSettings,
+    /// Start the optional runner-type catalogue watch (information only: the
+    /// save's `unknownRunnerTypes` and `workspaceRunnerTypes`); `false` models
+    /// a host that does not.
+    pub watch_catalogue: bool,
 }
 
 impl Default for BootOptions {
@@ -71,6 +81,7 @@ impl Default for BootOptions {
         Self {
             await_ready: true,
             settings: HostSettings::default(),
+            watch_catalogue: true,
         }
     }
 }
@@ -96,7 +107,20 @@ pub async fn boot(
 ) -> Result<Service, EngineError> {
     let http_addr = config.http_addr;
     let readiness = ReadinessHandle::not_ready("booting");
-    let (engine, app) = assemble(config, pool, nats, readiness.clone(), options.settings).await?;
+    let (engine, app) = assemble(
+        config,
+        pool.clone(),
+        nats,
+        readiness.clone(),
+        options.settings,
+    )
+    .await?;
+    #[cfg(feature = "drive")]
+    let catalogue = options
+        .watch_catalogue
+        .then(|| br_drive::watch_runner_types(engine.nats().clone(), pool));
+    #[cfg(not(feature = "drive"))]
+    let _ = (pool, options.watch_catalogue);
     let stop = engine.shutdown_handle();
     let settle = engine.settle_handle();
     let blob_reader = engine.blob_reader();
@@ -141,6 +165,8 @@ pub async fn boot(
         readiness,
         stop,
         handle,
+        #[cfg(feature = "drive")]
+        catalogue,
         eraser,
     })
 }

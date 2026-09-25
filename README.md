@@ -93,6 +93,7 @@ rolls them together. The host never writes to the `drive` schema directly.
 6. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
 7. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
 8. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_protected`, `set_metadata`, `drive_of` for curation.
+9. **Catalogue watch (optional, information only)**: `br_drive::watch_runner_types(engine.nats().clone(), pool.clone())` after boot, `CatalogueWatch::stop` at shutdown, fills the local copy of Jobs' runner-type catalogue that the save's `unknownRunnerTypes` warning and `<p>RunnerTypes` read. Only a host that starts it needs the `PUBLISHED_LANGUAGE` KV bucket on its broker. Nothing waits for it and no launch consults it: a host without it launches every step all the same, reports every step's type as unknown at save and lists no type.
 
 ### The `DriveHost` seam
 
@@ -242,7 +243,7 @@ renders it, is committed at
 | `<p>FileAccess(fileId, name: String): String` | a short-lived presigned GET on the source (attachment); `null` when the caller cannot see the file, a coded refusal when the `download` affordance is denied (the host's code first, then `FILE_NOT_READY` before the commit), and `null` between the commit and the engine reaper's promotion (a verified blob is never downloadable in the pending window; the `SourceAvailable` cause says when to retry). With `name`, a presigned GET on that extracted image (inline; `null` for an unknown name and until the object landed). |
 | `<p>DriveChanged(driveId): DriveDelta!` | the file list: the engine snapshot on connect (`DriveReset` of `DriveFile`s), then `DriveUpsert` / `DriveRemove` on the contiguous revision. |
 | `<p>LabelsChanged: DriveDelta!` | the label catalogue live: a `DriveReset` of `DriveLabel`s, then an upsert (`Created`, `Updated`) or a remove per label. |
-| `<p>RulesetsChanged: DriveDelta!` | the rule table live, for the manager's screen: an upsert per save (`Saved`), a remove per delete. |
+| `<p>RulesetsChanged: DriveDelta!` | the rule table live, for the manager's screen: an upsert per save with `Saved { unknown_runner_types }` as its cause (the same warning the save answers), a remove per delete. |
 | `<p>FilePages(fileId): DriveDelta!` | one file's rendition (milestone 3): a `DriveReset` with every `DrivePage` of the file, then a `DriveUpsert` / `DriveRemove` per page; gated on `ReadFile` for the file's drive, so a caller who cannot read the file gets an empty window and a caller who loses the drive gets one `DriveRemove` per page. |
 
 `DriveFile`: `id`, `driveId`, `path` (normalized, `""` = root), `name`,
@@ -281,7 +282,7 @@ from_drive }`, `FolderMoved`, `ProtectionChanged { protected }`,
 detached }`, `Erased`, `Deleted`, `FolderDeleted`, `DriveDeleted`), page
 causes (`Reported { job_id, origin
 }`, `Edited`, `Imported { origin }`), label causes (`Created`, `Updated`, `Deleted`) or rule causes
-(`Saved`, `Deleted`) on a delta the engine attributes
+(`Saved { unknown_runner_types }`, `Deleted`) on a delta the engine attributes
 to an impact; a key that
 **enters or leaves** a live session's window (a created or deleted file, a
 page the runner reports for the first time, a drive gained or lost) is
@@ -377,8 +378,9 @@ run *steps* in order" — a list, never a graph.
 | Root | Shape |
 |---|---|
 | `<p>Rulesets: [DriveRuleset!]!` | `{ id, name, trigger, mediaTypes, steps[] { runnerType, options }, isDefault, createdBy, createdAt, updatedAt }`; empty for a caller the host's `ReadRulesets` gate refuses. |
-| `<p>CreateRuleset(id, name, trigger: Trigger!, mediaTypes: [String!]!, steps: [RulesetStepInput!]!, isDefault): RulesetSaved!` | gate `ManageRulesets`; `trigger` `UPLOAD \| REPROCESS \| REGENERATE_PAGE`; `mediaTypes` are `type/subtype`, `type/*` or `*` (lowercased, `INVALID_MEDIA_TYPE`); `name` unique per host, case-insensitive (`RULESET_NAME_TAKEN`); 1–32 steps of `{ runnerType, options? }` (`INVALID_RULESET`). One default per (trigger, media-type pattern): a second default whose patterns overlap an existing default's is `DEFAULT_ALREADY_SET` (`*` is its own bucket). Answers `{ id }`. A runner type is a name the library never checks: Jobs judges it when the step's job is created (below). |
-| `<p>UpdateRuleset(id, name?, mediaTypes?, steps?, isDefault?): RulesetSaved!` | same rules; `NOTHING_TO_CHANGE` when nothing differs; the trigger is immutable. |
+| `<p>CreateRuleset(id, name, trigger: Trigger!, mediaTypes: [String!]!, steps: [RulesetStepInput!]!, isDefault): RulesetSaved!` | gate `ManageRulesets`; `trigger` `UPLOAD \| REPROCESS \| REGENERATE_PAGE`; `mediaTypes` are `type/subtype`, `type/*` or `*` (lowercased, `INVALID_MEDIA_TYPE`); `name` unique per host, case-insensitive (`RULESET_NAME_TAKEN`); 1–32 steps of `{ runnerType, options? }` (`INVALID_RULESET`). One default per (trigger, media-type pattern): a second default whose patterns overlap an existing default's is `DEFAULT_ALREADY_SET` (`*` is its own bucket). Answers `{ id, unknownRunnerTypes }`: the steps' runner types the local catalogue copy does not know as `ACTIVE` (absent or `DEPRECATED`), sorted, once each — a warning only, the rule is saved. Jobs alone judges a runner type, when the step's job is created (below). |
+| `<p>UpdateRuleset(id, name?, mediaTypes?, steps?, isDefault?): RulesetSaved!` | same rules and the same warning; `NOTHING_TO_CHANGE` when nothing differs; the trigger is immutable. |
+| `<p>RunnerTypes: [DriveRunnerType!]!` | the local copy of Jobs' runner-type catalogue, for a rule-editing screen: `{ runnerType, lifecycle: ACTIVE \| DEPRECATED, version, seenAt }` in name order (`version` is the entry's wire version, `seenAt` when the watch last wrote it). Gated by the host's `ReadRulesets`, like `<p>Rulesets`: whoever reads the rules may see the names they carry, and a refused principal gets an empty list. Empty on a host that does not run the catalogue watch. A plain read, not a live window: the watch writes outside the engine's pipelines and stages no impact. |
 | `<p>DeleteRuleset(id): MutationAck!` | `RULESET_NOT_FOUND`; files keep the `rulesetId` and the `steps` snapshot of a deleted rule. |
 
 Matching: the given `rulesetId` must exist (`RULESET_NOT_FOUND`) and carry
@@ -458,8 +460,9 @@ for (`creation_rejected` `runner_type_retired`: the file fails at once), but
 it accepts a runner type it does not know and never dispatches its job — as it
 never fails a job no live runner picks up. Such a file waits in `PROCESSING`
 until someone cancels it; Jobs' `cancelled` then lands it `FAILED`, and a
-reprocess (a fixed rule, a started runner) starts over. The library keeps no
-copy of the runner-type catalogue: a rule may name any runner type. The
+reprocess (a fixed rule, a started runner) starts over. The library's copy
+of the runner-type catalogue (below) is information only: a rule may name any
+runner type, and a step's job is created whatever the copy says. The
 cancel relies on Jobs answering: a job Jobs holds as settled or does not know
 at all (a host or Jobs database restored to an earlier point, a job deleted
 in Jobs) never gets a `cancelled`, and its file stays `PROCESSING` — deleting
@@ -475,6 +478,21 @@ stages `job.cancel.v2` for it; the rejection lands the file `FAILED`
 cancelled it (a cancel is idempotent). `DeleteFile`, `DeleteFolder` and
 `delete_drive` stage `job.cancel.v2` for the running job of every file they
 remove, and the later `cancelled` fact finds no file.
+
+The catalogue copy: `drive.known_runner_type` (`runner_type`, `lifecycle`,
+`version`, `seen_at`) is fed by the optional `br_drive::watch_runner_types` — a
+scan of `PUBLISHED_LANGUAGE` under `jobs.runner_type.` then a KV watch; a type
+Jobs retires leaves the bucket and the copy. It is tolerant of an entry that
+does not decode or names another type than its key (warned and left out) and
+strict on the wire: an entry whose `version` is not
+`contract_jobs::runner::WIRE_VERSION` is logged as an error and left out. The
+watch is restarted after a fault. The host starts it next to the engine and
+stops it at shutdown — engine 0.3.0 gives a library no boot or shutdown hook.
+It is read by the save's `unknownRunnerTypes` and by `<p>RunnerTypes`, never
+by a gesture's decision: no readiness reason, no deferred launch, no refusal.
+It is a hand-rolled watch and not the engine's mirror kit because the kit
+requires a `/`-terminated consumed prefix and the catalogue is published by a
+non-engine producer under a dot prefix with a per-value `version`.
 
 The runner source presign (`<p>RunnerContext`'s `sourceUrl`) goes through the
 `drive_runner_sources` view scoped to the one file the job names, and only
@@ -536,6 +554,10 @@ before migration `9121000007` keeps its stored error, and one found
   on their next reset instead of receiving one `Remove` per file.
 - `select_ruleset` reads the defaults of one trigger per gesture — fine at a
   host's scale (tens of rules), noted for the record.
+- The catalogue watch stamps `seen_at` from the database clock: it runs
+  outside the engine's `Ops` and has no engine clock. Its health is not on the
+  engine's readiness (nothing depends on it), and `<p>RunnerTypes` is a plain
+  read with no live window: the watch stages no impact.
 - A job Jobs holds on a file the library cannot tell about is cancelled only
   on a `duplicate_active_entity` rejection: nothing polls Jobs. A manual
   retry of a failed job in Jobs is not followed either — the file settled on
@@ -568,7 +590,8 @@ drive hangs off, owner-only gate: `workspaceCreate` / `workspaceDelete` /
 `workspaceTransfer` / `workspaceProtectFile`; the `workspace:manage` scope on
 a human passport is its `ManageRulesets` gate, any human reads the rules), the
 embedded `drive` slice (its `CancelProcessing` gate allows a workspace's
-owner, like every per-file gesture), a
+owner, like every per-file gesture), the catalogue watch started at boot
+(`BootOptions::watch_catalogue`, on by default), a
 `{"hold": true}` metadata rule refusing to move or delete a file (the per-file
 rule the folder scenarios meet), a `workspace:sweep` scope allowed folder
 gestures but no file, `src/bin/service.rs` handing everything to the engine boot kit, and `tests/`
@@ -579,7 +602,8 @@ real `contract-jobs` DTOs on the real subjects and reads the commands the host
 stages for `jobs`. It judges every `job.create` the way Jobs does, in Jobs' order — the inputs
 `svc-jobs` refuses before its domain (non-v7 ids, a blank or over-long display
 name, a source not named by its producer), a runner type it retired
-(`runner_type_retired`; any other type is accepted, known or not), a reused
+(`runner_type_retired`, and withdrawn from the catalogue it publishes in
+`PUBLISHED_LANGUAGE`; any other type is accepted, published or not), a reused
 id, a second live job on one source entity (`duplicate_active_entity`,
 naming the live job), a self-named, terminal, deleted or unknown parent —
 answering `creation_rejected` on its own and `cancelled` for a live job it

@@ -105,6 +105,7 @@ type DriveQuery {
 	workspaceDriveFiles(driveId: UUID!): [DriveFile!]!
 	workspacePages(fileId: UUID!): [DrivePage!]!
 	workspaceRulesets: [DriveRuleset!]!
+	workspaceRunnerTypes: [DriveRunnerType!]!
 	workspaceLabels: [DriveLabel!]!
 	workspaceFileAccess(fileId: UUID!, name: String): String
 	workspaceRunnerContext(fileId: UUID!, jobId: UUID!): RunnerContext!
@@ -132,6 +133,31 @@ type DriveRuleset {
 	createdBy: UUID!
 	createdAt: DateTime!
 	updatedAt: DateTime!
+}
+
+"""
+One runner type of the local catalogue copy, as the watch last saw it.
+"""
+type DriveRunnerType {
+	runnerType: String!
+	lifecycle: DriveRunnerTypeLifecycle!
+	"""
+	The wire version the catalogue entry declared.
+	"""
+	version: Int!
+	"""
+	When the watch last wrote the entry (database clock).
+	"""
+	seenAt: DateTime!
+}
+
+"""
+A runner type's lifecycle as Jobs publishes it. A retired type is not
+published at all, so it is absent from the copy.
+"""
+enum DriveRunnerTypeLifecycle {
+	ACTIVE
+	DEPRECATED
 }
 
 type DriveStep {
@@ -206,6 +232,12 @@ input ReportedPageInput {
 
 type RulesetSaved {
 	id: UUID!
+	"""
+	The steps' runner types the local catalogue copy does not know as
+	`ACTIVE` (absent or deprecated) — a warning, the rule is saved; every
+	step's type on a host that does not run the catalogue watch.
+	"""
+	unknownRunnerTypes: [String!]!
 }
 
 input RulesetStepInput {

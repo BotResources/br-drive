@@ -89,8 +89,8 @@ ALTER TABLE drive.file
     DROP COLUMN done_at,
     DROP COLUMN completed_at;
 
--- The runner-type catalogue copy is gone: Jobs judges a runner type itself.
-DROP TABLE drive.known_runner_type;
+-- The runner-type catalogue copy stays, as information only (a save's warning,
+-- the known-types read); nothing waits for its first scan any more.
 DROP TABLE drive.catalogue_scan;
 
 -- The per-drive counts (`br_drive::file_counts`) read the computed status: the

@@ -101,24 +101,30 @@ single git tag `v{version}` releases the set. Format follows
   computed accessors, `processing_state()` / `processing_error()`, beside
   `last_job()` / `active_job()` (`br_drive::FileJob`) and `committed_at`; the
   step, job, plan, progress, initiator and clock fields are gone.
-- `RulesetSaved` is `{ id }`: a rule may name any runner type, Jobs judges it
-  when the step's job is created. `RulesetCause::Saved` carries nothing.
+- The runner-type catalogue copy is information only. `drive.known_runner_type`
+  and the optional `br_drive::watch_runner_types` / `CatalogueWatch` (the
+  example's `BootOptions::watch_catalogue`) stay; the copy is read by
+  `RulesetSaved.unknownRunnerTypes` (and `RulesetCause::Saved {
+  unknown_runner_types }`) — the steps' types not known `ACTIVE`, a warning on
+  a rule that is saved — and by the new `<p>RunnerTypes` (Added). A rule may
+  name any runner type; a step's job is created whatever the copy says, and
+  Jobs alone judges it. On a host that does not start the watch every step's
+  type is reported unknown and no type is listed; nothing else changes. Only
+  such a host's broker may lack the `PUBLISHED_LANGUAGE` bucket.
 - The token estimate of a runner report is optional: `summary` and
   `pageCount` still move together, `estimatedTokens` may be absent (it may not
   come alone). An indexing without an estimate clears a previous one.
 
 ### Removed
 
-- The runner-type catalogue copy: `drive.known_runner_type`,
-  `drive.catalogue_scan`, `br_drive::watch_runner_types`, `CatalogueWatch`,
-  the example's `BootOptions::watch_catalogue`, the deferred launch
-  (`launch-retry`, `LAUNCH_RETRY_AFTER`, `LAUNCH_RETRY_CAP`,
-  `FileCause::LaunchDeferred`), `unknownRunnerTypes`, the
-  `runner_type_unavailable` failure, the `RUNNER_TYPE_UNAVAILABLE` and
-  `CATALOGUE_NOT_WATCHED` codes. Jobs refuses at creation a runner type it
-  retired (`creation_rejected` `runner_type_retired`: the file fails), and
-  accepts one it does not know without ever dispatching it: the user's cancel
-  is the way out.
+- Every use of the runner-type catalogue copy as a condition:
+  `drive.catalogue_scan` (the "catalogue was read" record), the deferred
+  launch (`launch-retry`, `LAUNCH_RETRY_AFTER`, `LAUNCH_RETRY_CAP`,
+  `FileCause::LaunchDeferred`), the `runner_type_unavailable` failure, the
+  `RUNNER_TYPE_UNAVAILABLE` and `CATALOGUE_NOT_WATCHED` codes. Jobs refuses at
+  creation a runner type it retired (`creation_rejected`
+  `runner_type_retired`: the file fails), and accepts one it does not know
+  without ever dispatching it: the user's cancel is the way out.
 - Both processing deadlines: `DriveHost::PICKUP_TIMEOUT`,
   `DriveHost::STEP_TIMEOUT`, the `step-deadline` message and its durable, the
   `timed_out` failure. The upload deadline stays, keyed on `committed_at`.
@@ -130,6 +136,11 @@ single git tag `v{version}` releases the set. Format follows
 
 ### Added
 
+- `<p>RunnerTypes: [DriveRunnerType!]!` (`br_drive::known_runner_types`): the
+  local catalogue copy — `{ runnerType, lifecycle: ACTIVE | DEPRECATED,
+  version, seenAt }` in name order — for a host's rule-editing screen. Gated
+  by the host's existing `ReadRulesets` (a refused principal gets an empty
+  list, as for `<p>Rulesets`); a plain read, no live window.
 - `<p>CancelProcessing(fileId)`: the user cancels the job running on a
   `PROCESSING` file, through the new `DriveRequest::CancelProcessing { file }`
   gate (affordance `cancelProcessing`; `FILE_NOT_PROCESSING` otherwise). The
@@ -243,12 +254,12 @@ single git tag `v{version}` releases the set. Format follows
   keeps its error as a synthetic `failed` entry of a synthetic job (never
   sent to Jobs); a `PROCESSING` file without a job, should one exist, lands
   `FAILED` `interrupted`. Then the stored state, step, job, plan, progress,
-  initiator and clock columns, `drive.known_runner_type` and
-  `drive.catalogue_scan` are dropped. A database that ran this branch's
+  initiator and clock columns and `drive.catalogue_scan` are dropped;
+  `drive.known_runner_type` is kept as it is. A database that ran this branch's
   unreleased migrations `9121000006`–`9121000009` must be recreated.
 - `DriveRequest::CancelProcessing { file }` is new: decide it explicitly (a
   wildcard arm answers it). A host that started `br_drive::watch_runner_types`
-  drops the call; one that set `PICKUP_TIMEOUT` / `STEP_TIMEOUT` drops them.
+  keeps it (optional, information only); one that set `PICKUP_TIMEOUT` / `STEP_TIMEOUT` drops them.
   A host that read `file.processing_state` / `file.processing_error` calls
   the accessors. A host that matched `RUNNER_TYPE_UNAVAILABLE`,
   `runner_type_unavailable` or `timed_out` may meet Jobs' own
