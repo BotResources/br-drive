@@ -28,7 +28,7 @@ use service_engine::LibraryMigrations;
 pub use blob::{DriveImage as DriveImageBlob, DriveSource};
 pub use catalogue::{
     CatalogueWatch, DriveRunnerType, DriveRunnerTypeLifecycle, known_runner_types,
-    watch_runner_types,
+    watch_runner_types, watch_runner_types_of,
 };
 pub use drive::{DriveDeleted, create_drive, create_unowned_drive, delete_drive};
 pub use erase::{DriveErasure, EraseMode, REDACTED_PERSON};

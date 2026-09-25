@@ -111,6 +111,15 @@ single git tag `v{version}` releases the set. Format follows
   Jobs alone judges it. On a host that does not start the watch every step's
   type is reported unknown and no type is listed; nothing else changes. Only
   such a host's broker may lack the `PUBLISHED_LANGUAGE` bucket.
+- The catalogue watch opens its KV watch before its scan and drains it after,
+  so a put or a delete landing during the scan is no longer lost. A name over
+  the copy's 128 bytes is left out instead of faulting the watch, a value that
+  is not JSON at all only takes its type out once the watch follows the
+  bucket (the start-up scan still stops on one: see the README), and a fault
+  is retried after a pause doubling from 1 s to 1 min instead of every second.
+  `CatalogueWatch` is `#[must_use]` and gains `detach`; the new
+  `br_drive::watch_runner_types_of(&engine)` starts the watch on the engine's
+  own handles from a `BootPlan` host's `register` closure.
 - The token estimate of a runner report is optional: `summary` and
   `pageCount` still move together, `estimatedTokens` may be absent (it may not
   come alone). An indexing without an estimate clears a previous one.
@@ -137,10 +146,10 @@ single git tag `v{version}` releases the set. Format follows
 ### Added
 
 - `<p>RunnerTypes: [DriveRunnerType!]!` (`br_drive::known_runner_types`): the
-  local catalogue copy — `{ runnerType, lifecycle: ACTIVE | DEPRECATED,
-  version, seenAt }` in name order — for a host's rule-editing screen. Gated
-  by the host's existing `ReadRulesets` (a refused principal gets an empty
-  list, as for `<p>Rulesets`); a plain read, no live window.
+  whole local catalogue copy — `{ runnerType, lifecycle: ACTIVE | DEPRECATED,
+  seenAt }` in name order — for a host's rule-editing screen. Gated by the
+  host's existing `ReadRulesets` (a refused principal gets an empty list, as
+  for `<p>Rulesets`); a plain read, no live window.
 - `<p>CancelProcessing(fileId)`: the user cancels the job running on a
   `PROCESSING` file, through the new `DriveRequest::CancelProcessing { file }`
   gate (affordance `cancelProcessing`; `FILE_NOT_PROCESSING` otherwise). The

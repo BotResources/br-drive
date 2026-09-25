@@ -142,10 +142,6 @@ type DriveRunnerType {
 	runnerType: String!
 	lifecycle: DriveRunnerTypeLifecycle!
 	"""
-	The wire version the catalogue entry declared.
-	"""
-	version: Int!
-	"""
 	When the watch last wrote the entry (database clock).
 	"""
 	seenAt: DateTime!

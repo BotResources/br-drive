@@ -115,12 +115,7 @@ pub async fn boot(
         options.settings,
     )
     .await?;
-    #[cfg(feature = "drive")]
-    let catalogue = options
-        .watch_catalogue
-        .then(|| br_drive::watch_runner_types(engine.nats().clone(), pool));
-    #[cfg(not(feature = "drive"))]
-    let _ = (pool, options.watch_catalogue);
+    let nats = engine.nats().clone();
     let stop = engine.shutdown_handle();
     let settle = engine.settle_handle();
     let blob_reader = engine.blob_reader();
@@ -157,6 +152,15 @@ pub async fn boot(
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+
+    // Started once nothing of the boot can fail any more, so a failed boot
+    // leaves no watch behind; nothing of the boot waits for it either.
+    #[cfg(feature = "drive")]
+    let catalogue = options
+        .watch_catalogue
+        .then(|| br_drive::watch_runner_types(nats, pool));
+    #[cfg(not(feature = "drive"))]
+    let _ = (nats, pool, options.watch_catalogue);
 
     Ok(Service {
         base_url: format!("http://{addr}"),

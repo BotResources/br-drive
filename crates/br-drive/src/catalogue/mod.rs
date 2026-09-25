@@ -17,7 +17,7 @@ use crate::fault::DriveFault;
 use crate::file::UnknownDbValue;
 use crate::host::{DriveHost, DriveRequest};
 
-pub use watch::{CatalogueWatch, watch_runner_types};
+pub use watch::{CatalogueWatch, watch_runner_types, watch_runner_types_of};
 
 /// A runner type's lifecycle as Jobs publishes it. A retired type is not
 /// published at all, so it is absent from the copy.
@@ -49,16 +49,14 @@ impl DriveRunnerTypeLifecycle {
 pub struct DriveRunnerType {
     pub runner_type: String,
     pub lifecycle: DriveRunnerTypeLifecycle,
-    /// The wire version the catalogue entry declared.
-    pub version: i32,
     /// When the watch last wrote the entry (database clock).
     pub seen_at: DateTime<Utc>,
 }
 
-/// The known runner types in name order, for a principal the host's
-/// `ReadRulesets` gate allows — the people who read the rules they would
-/// edit; empty for anyone else, as `<p>Rulesets` is. Empty too on a host that
-/// never started the watch.
+/// The whole local catalogue copy — every runner type the watch last saw,
+/// not only the ones the rules name — in name order. Gated by the host's
+/// `ReadRulesets` (the gate of `<p>Rulesets`): a principal it refuses gets an
+/// empty list. Empty too on a host that never started the watch.
 pub async fn known_runner_types<H: DriveHost>(
     pool: &PgPool,
     principal: &H,
@@ -69,21 +67,20 @@ pub async fn known_runner_types<H: DriveHost>(
     {
         return Ok(Vec::new());
     }
-    let rows: Vec<(String, String, i32, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT runner_type, lifecycle, version, seen_at FROM drive.known_runner_type \
+    let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT runner_type, lifecycle, seen_at FROM drive.known_runner_type \
          ORDER BY runner_type",
     )
     .fetch_all(pool)
     .await
     .map_err(EngineError::from)?;
     let mut known = Vec::with_capacity(rows.len());
-    for (runner_type, lifecycle, version, seen_at) in rows {
+    for (runner_type, lifecycle, seen_at) in rows {
         let lifecycle = DriveRunnerTypeLifecycle::from_db_str(&lifecycle)
             .map_err(|e| EngineError::Config(e.to_string()))?;
         known.push(DriveRunnerType {
             runner_type,
             lifecycle,
-            version,
             seen_at,
         });
     }
@@ -99,9 +96,10 @@ pub(crate) async fn not_known_active(
 ) -> Result<Vec<String>, EngineError> {
     let active: Vec<String> = sqlx::query_scalar(
         "SELECT runner_type FROM drive.known_runner_type \
-         WHERE runner_type = ANY($1) AND lifecycle = 'active'",
+         WHERE runner_type = ANY($1) AND lifecycle = $2",
     )
     .bind(runner_types)
+    .bind(DriveRunnerTypeLifecycle::Active.as_db())
     .fetch_all(conn)
     .await?;
     let mut unknown: Vec<String> = runner_types

@@ -300,7 +300,7 @@ impl World {
         let response = self
             .gql(
                 passport,
-                "query{workspaceRunnerTypes{runnerType lifecycle version seenAt}}",
+                "query{workspaceRunnerTypes{runnerType lifecycle seenAt}}",
                 serde_json::json!({}),
             )
             .await;

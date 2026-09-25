@@ -98,6 +98,14 @@ async fn the_job_log_migration_keeps_every_state_and_error_of_a_0_1_database() {
         .unwrap_or_else(|e| panic!("seed {name}: {e}"));
     }
 
+    sqlx::query(
+        "INSERT INTO drive.known_runner_type (runner_type, lifecycle, version, seen_at) \
+         VALUES ('render', 'active', 1, now())",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the catalogue copy");
+
     // When: the job log migration runs
     apply(&pool, |version| version == JOB_LOG_MIGRATION).await;
 
@@ -169,6 +177,28 @@ async fn the_job_log_migration_keeps_every_state_and_error_of_a_0_1_database() {
     .await
     .unwrap();
     assert_eq!(gone, 0, "the stored state is gone");
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.tables WHERE table_schema = 'drive' \
+         AND table_name IN ('known_runner_type', 'catalogue_scan') ORDER BY table_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tables,
+        vec!["known_runner_type".to_string()],
+        "the catalogue copy survives, the scan record is gone"
+    );
+    let known: Vec<(String, String)> =
+        sqlx::query_as("SELECT runner_type, lifecycle FROM drive.known_runner_type")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        known,
+        vec![("render".to_string(), "active".to_string())],
+        "the copy keeps its rows"
+    );
 
     pool.close().await;
     let _ = sqlx::query(&format!(

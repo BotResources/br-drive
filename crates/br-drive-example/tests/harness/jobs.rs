@@ -451,6 +451,16 @@ impl JobsStandIn {
             .expect("publish the catalogue entry");
     }
 
+    /// Publishes raw bytes under `runner_type`'s catalogue key — a value that
+    /// is not JSON at all.
+    pub async fn publish_catalogue_bytes(&self, runner_type: &str, bytes: &[u8]) {
+        self.catalogue()
+            .await
+            .put(runner_type_key(runner_type), bytes.to_vec().into())
+            .await
+            .expect("publish the catalogue bytes");
+    }
+
     async fn catalogue(&self) -> async_nats::jetstream::kv::Store {
         self.js
             .get_key_value(KV_PUBLISHED_LANGUAGE)

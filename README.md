@@ -93,7 +93,7 @@ rolls them together. The host never writes to the `drive` schema directly.
 6. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
 7. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
 8. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_protected`, `set_metadata`, `drive_of` for curation.
-9. **Catalogue watch (optional, information only)**: `br_drive::watch_runner_types(engine.nats().clone(), pool.clone())` after boot, `CatalogueWatch::stop` at shutdown, fills the local copy of Jobs' runner-type catalogue that the save's `unknownRunnerTypes` warning and `<p>RunnerTypes` read. Only a host that starts it needs the `PUBLISHED_LANGUAGE` KV bucket on its broker. Nothing waits for it and no launch consults it: a host without it launches every step all the same, reports every step's type as unknown at save and lists no type.
+9. **Catalogue watch (optional, information only)**: a host booting through the engine's `run_service` / `BootPlan` starts it at the end of its `register` closure, on the engine's own NATS and PostgreSQL handles, and lets it run until the process exits: `register: move |engine| { register(engine)?; br_drive::watch_runner_types_of(engine).detach(); Ok(()) }` (see `src/bin/service.rs` of the example). A host assembling the engine by hand calls `br_drive::watch_runner_types(nats, pool)` once its boot can no longer fail and `CatalogueWatch::stop` at shutdown. The watch fills the local copy of Jobs' runner-type catalogue that the save's `unknownRunnerTypes` warning and `<p>RunnerTypes` read. Only a host that starts it needs the `PUBLISHED_LANGUAGE` KV bucket on its broker. Nothing waits for it and no launch consults it: a host without it launches every step all the same, reports every step's type as unknown at save and lists no type.
 
 ### The `DriveHost` seam
 
@@ -380,7 +380,7 @@ run *steps* in order" — a list, never a graph.
 | `<p>Rulesets: [DriveRuleset!]!` | `{ id, name, trigger, mediaTypes, steps[] { runnerType, options }, isDefault, createdBy, createdAt, updatedAt }`; empty for a caller the host's `ReadRulesets` gate refuses. |
 | `<p>CreateRuleset(id, name, trigger: Trigger!, mediaTypes: [String!]!, steps: [RulesetStepInput!]!, isDefault): RulesetSaved!` | gate `ManageRulesets`; `trigger` `UPLOAD \| REPROCESS \| REGENERATE_PAGE`; `mediaTypes` are `type/subtype`, `type/*` or `*` (lowercased, `INVALID_MEDIA_TYPE`); `name` unique per host, case-insensitive (`RULESET_NAME_TAKEN`); 1–32 steps of `{ runnerType, options? }` (`INVALID_RULESET`). One default per (trigger, media-type pattern): a second default whose patterns overlap an existing default's is `DEFAULT_ALREADY_SET` (`*` is its own bucket). Answers `{ id, unknownRunnerTypes }`: the steps' runner types the local catalogue copy does not know as `ACTIVE` (absent or `DEPRECATED`), sorted, once each — a warning only, the rule is saved. Jobs alone judges a runner type, when the step's job is created (below). |
 | `<p>UpdateRuleset(id, name?, mediaTypes?, steps?, isDefault?): RulesetSaved!` | same rules and the same warning; `NOTHING_TO_CHANGE` when nothing differs; the trigger is immutable. |
-| `<p>RunnerTypes: [DriveRunnerType!]!` | the local copy of Jobs' runner-type catalogue, for a rule-editing screen: `{ runnerType, lifecycle: ACTIVE \| DEPRECATED, version, seenAt }` in name order (`version` is the entry's wire version, `seenAt` when the watch last wrote it). Gated by the host's `ReadRulesets`, like `<p>Rulesets`: whoever reads the rules may see the names they carry, and a refused principal gets an empty list. Empty on a host that does not run the catalogue watch. A plain read, not a live window: the watch writes outside the engine's pipelines and stages no impact. |
+| `<p>RunnerTypes: [DriveRunnerType!]!` | the whole local copy of Jobs' runner-type catalogue — every type the watch last saw, not only the ones the rules name — for a rule-editing screen: `{ runnerType, lifecycle: ACTIVE \| DEPRECATED, seenAt }` in name order (`seenAt` is when the watch last wrote the entry). Gated by the host's `ReadRulesets`, the gate of `<p>Rulesets`: a principal it refuses gets an empty list. Empty on a host that does not run the catalogue watch. A plain read, not a live window: the watch writes outside the engine's pipelines and stages no impact. |
 | `<p>DeleteRuleset(id): MutationAck!` | `RULESET_NOT_FOUND`; files keep the `rulesetId` and the `steps` snapshot of a deleted rule. |
 
 Matching: the given `rulesetId` must exist (`RULESET_NOT_FOUND`) and carry
@@ -480,19 +480,29 @@ cancelled it (a cancel is idempotent). `DeleteFile`, `DeleteFolder` and
 remove, and the later `cancelled` fact finds no file.
 
 The catalogue copy: `drive.known_runner_type` (`runner_type`, `lifecycle`,
-`version`, `seen_at`) is fed by the optional `br_drive::watch_runner_types` — a
-scan of `PUBLISHED_LANGUAGE` under `jobs.runner_type.` then a KV watch; a type
-Jobs retires leaves the bucket and the copy. It is tolerant of an entry that
-does not decode or names another type than its key (warned and left out) and
-strict on the wire: an entry whose `version` is not
-`contract_jobs::runner::WIRE_VERSION` is logged as an error and left out. The
-watch is restarted after a fault. The host starts it next to the engine and
-stops it at shutdown — engine 0.3.0 gives a library no boot or shutdown hook.
-It is read by the save's `unknownRunnerTypes` and by `<p>RunnerTypes`, never
-by a gesture's decision: no readiness reason, no deferred launch, no refusal.
-It is a hand-rolled watch and not the engine's mirror kit because the kit
-requires a `/`-terminated consumed prefix and the catalogue is published by a
-non-engine producer under a dot prefix with a per-value `version`.
+`version`, `seen_at`) is fed by the optional `br_drive::watch_runner_types` —
+a KV watch of `PUBLISHED_LANGUAGE` opened first, then a scan under
+`jobs.runner_type.`, then the watch drained: a change landing while the scan
+runs is in the watch whether the scan saw it or not, and applying it again is
+harmless, so no put or delete is lost between the scan and the watch. A type
+Jobs retires leaves the bucket and the copy. Per entry, it is tolerant of a
+JSON value that is not a runner-type entry, one naming another type than its
+key, or a name the copy cannot hold (empty or over 128 bytes) — warned and
+left out — and strict on the wire: an entry whose `version` is not
+`contract_jobs::runner::WIRE_VERSION` is logged as an error and left out.
+Once the watch follows the bucket, a value that is not JSON at all only takes
+its type out of the copy. The scan is less forgiving: the engine's KV scan
+decodes every value it lists and gives up on the first that is not JSON, so
+such a value in the bucket at start-up (or at a restart after a fault) stops
+the scan — the copy keeps what it held, and the watch logs the key and
+retries, pausing 1 s doubling to 1 min, until Jobs replaces or deletes the
+value. The same pause follows any other fault. It is read by the save's
+`unknownRunnerTypes` and by `<p>RunnerTypes`, never by a gesture's decision:
+no readiness reason, no deferred launch, no refusal.
+It is a hand-rolled watch and not the engine's mirror kit because a
+registered mirror holds the engine's readiness until it converges, and this
+copy is information only: nothing may wait for it. Nor does every host have
+the `PUBLISHED_LANGUAGE` bucket — only one that starts the watch needs it.
 
 The runner source presign (`<p>RunnerContext`'s `sourceUrl`) goes through the
 `drive_runner_sources` view scoped to the one file the job names, and only
@@ -558,6 +568,11 @@ before migration `9121000007` keeps its stored error, and one found
   outside the engine's `Ops` and has no engine clock. Its health is not on the
   engine's readiness (nothing depends on it), and `<p>RunnerTypes` is a plain
   read with no live window: the watch stages no impact.
+- Every pod of a host runs its own catalogue watch on the one shared table:
+  the last writer wins. Each pod writes what the bucket held when it read it,
+  so two pods converge once the catalogue stops changing, but a pod lagging
+  behind may briefly write back an older value (or a type another pod just
+  forgot) until its watch delivers the change.
 - A job Jobs holds on a file the library cannot tell about is cancelled only
   on a `duplicate_active_entity` rejection: nothing polls Jobs. A manual
   retry of a failed job in Jobs is not followed either — the file settled on
@@ -590,8 +605,9 @@ drive hangs off, owner-only gate: `workspaceCreate` / `workspaceDelete` /
 `workspaceTransfer` / `workspaceProtectFile`; the `workspace:manage` scope on
 a human passport is its `ManageRulesets` gate, any human reads the rules), the
 embedded `drive` slice (its `CancelProcessing` gate allows a workspace's
-owner, like every per-file gesture), the catalogue watch started at boot
-(`BootOptions::watch_catalogue`, on by default), a
+owner, like every per-file gesture), the catalogue watch — started from the `register` closure in
+`src/bin/service.rs`, and by the test boot once its fallible steps are done
+(`BootOptions::watch_catalogue`, on by default) — a
 `{"hold": true}` metadata rule refusing to move or delete a file (the per-file
 rule the folder scenarios meet), a `workspace:sweep` scope allowed folder
 gestures but no file, `src/bin/service.rs` handing everything to the engine boot kit, and `tests/`
