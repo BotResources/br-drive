@@ -56,7 +56,13 @@ impl World {
 
     pub async fn start_with(pod: &str, options: WorldOptions) -> World {
         install_log_capture();
-        let db = TestDb::fresh().await;
+        World::start_on(TestDb::fresh().await, pod, options).await
+    }
+
+    /// The example host booted on `db` as it stands — a database migrated by
+    /// the scenario itself.
+    pub async fn start_on(db: TestDb, pod: &str, options: WorldOptions) -> World {
+        install_log_capture();
         let nats_server = TestNats::spawn().await;
         nats_server.provision(br_drive_example::SERVICE).await;
 

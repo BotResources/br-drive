@@ -1,209 +1,354 @@
-//! The one-way migration from 0.1's stored processing state to the job log.
-//! The only place a starting state is built in SQL: that state is the old
-//! schema, which no gesture of this version can produce.
+//! The one-way upgrade of a 0.1.0 database. The only scenario whose Given is
+//! built in SQL: that state is the 0.1 schema, which no gesture of this
+//! version can produce. Everything after the upgrade is observed the way a
+//! user and a runner observe it — the host booted on the upgraded database.
 
-use sqlx::postgres::PgPoolOptions;
+use std::time::Duration;
+
+use futures_util::FutureExt;
 use uuid::Uuid;
 
-use crate::harness::pg::admin_url;
+use crate::harness::pg::TestDb;
+use crate::harness::runner::{RUNNER_SCOPE, Report, context, report};
+use crate::harness::{
+    JobsStandIn, World, WorldOptions, error_code, ok, passport, service_passport,
+};
 
-const JOB_LOG_MIGRATION: i64 = 9_121_000_007;
+/// The last drive migration released in v0.1.0.
+const RELEASED_0_1: i64 = 9_121_000_005;
 
-/// A 0.1 file row: name, stored state, stored error, job, step.
-type OldFile<'a> = (&'a str, &'a str, Option<&'a str>, Option<Uuid>, Option<i32>);
+/// A 0.1 file: its name and its stored processing columns.
+struct OldFile {
+    name: &'static str,
+    state: &'static str,
+    error: Option<&'static str>,
+    job: Option<Uuid>,
+    step: Option<i32>,
+    done: bool,
+    completed: bool,
+}
 
-async fn apply(pool: &sqlx::PgPool, versions: impl Fn(i64) -> bool) {
-    for migration in br_drive::migrations().migrator.iter() {
-        if versions(migration.version) {
-            sqlx::raw_sql(&migration.sql)
-                .execute(pool)
-                .await
-                .unwrap_or_else(|e| panic!("migration {}: {e}", migration.version));
+impl OldFile {
+    const fn settled(name: &'static str, state: &'static str, error: Option<&'static str>) -> Self {
+        Self {
+            name,
+            state,
+            error,
+            job: None,
+            step: None,
+            done: false,
+            completed: false,
+        }
+    }
+
+    const fn running(
+        name: &'static str,
+        job: Uuid,
+        step: i32,
+        done: bool,
+        completed: bool,
+    ) -> Self {
+        Self {
+            name,
+            state: "processing",
+            error: None,
+            job: Some(job),
+            step: Some(step),
+            done,
+            completed,
         }
     }
 }
 
-#[tokio::test]
-async fn the_job_log_migration_keeps_every_state_and_error_of_a_0_1_database() {
-    // Given: a database on 0.1's schema (and the title), with one file in each state
-    let admin = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&admin_url())
+async fn seed(
+    owner_pool: &sqlx::PgPool,
+    owner: Uuid,
+    workspace: Uuid,
+    files: &[OldFile],
+) -> Vec<(&'static str, Uuid)> {
+    sqlx::query("INSERT INTO workspace (id, owner_id, name) VALUES ($1, $2, 'upgraded')")
+        .bind(workspace)
+        .bind(owner)
+        .execute(owner_pool)
         .await
-        .expect("connect as the admin");
-    let database = format!("drv_{}_db", Uuid::now_v7().simple());
-    sqlx::query(&format!("CREATE DATABASE \"{database}\""))
-        .execute(&admin)
-        .await
-        .expect("create the database");
-    let url = format!(
-        "{}/{database}",
-        admin_url()
-            .rsplit_once('/')
-            .expect("a database in the url")
-            .0
-    );
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .expect("connect to the database");
-    apply(&pool, |version| version < JOB_LOG_MIGRATION).await;
-    let drive = Uuid::now_v7();
+        .expect("seed the host object");
     sqlx::query("INSERT INTO drive.drive (id, created_by, created_at) VALUES ($1, $2, now())")
-        .bind(drive)
-        .bind(Uuid::now_v7())
-        .execute(&pool)
+        .bind(workspace)
+        .bind(owner)
+        .execute(owner_pool)
         .await
-        .unwrap();
-    let in_flight_job = Uuid::now_v7();
-    let initiator = serde_json::json!({ "id": Uuid::now_v7(), "display_name": "Ada" });
-    let rows: [OldFile<'_>; 5] = [
-        ("pending.txt", "pending", None, None, None),
-        ("ready.txt", "ready", None, None, None),
-        (
-            "running.txt",
-            "processing",
-            None,
-            Some(in_flight_job),
-            Some(1),
-        ),
-        ("orphan.txt", "processing", None, None, Some(0)),
-        ("failed.txt", "failed", Some("timed_out"), None, None),
-    ];
+        .expect("seed the drive");
+    let steps = serde_json::json!([
+        { "runner_type": "render", "options": {} },
+        { "runner_type": "index", "options": {} },
+    ]);
+    let initiator = serde_json::json!({ "id": owner, "display_name": "Ada" });
     let mut ids = Vec::new();
-    for (name, state, error, job, step) in rows {
+    for file in files {
         let id = Uuid::now_v7();
-        ids.push((name, id));
+        ids.push((file.name, id));
         sqlx::query(
-            "INSERT INTO drive.file (id, drive_id, path, name, title, media_type, size_bytes, \
-             sha256, blob_ref, processing_state, processing_error, job_id, step_index, \
-             triggered_by, created_by, created_at, updated_at) \
-             VALUES ($1, $2, '', $3, $3, 'text/plain', 1, $4, $5, $6, $7, $8, $9, $10, $11, \
-             now(), now())",
+            "INSERT INTO drive.file (id, drive_id, path, name, media_type, size_bytes, sha256, \
+             blob_ref, processing_state, processing_error, steps, job_id, step_index, \
+             step_count, triggered_by, done_at, completed_at, created_by, created_at, updated_at) \
+             VALUES ($1, $2, '', $3, 'text/plain', 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+             CASE WHEN $13 THEN now() END, CASE WHEN $14 THEN now() END, $15, now(), now())",
         )
         .bind(id)
-        .bind(drive)
-        .bind(name)
+        .bind(workspace)
+        .bind(file.name)
         .bind(vec![0u8; 32])
         .bind(Uuid::now_v7())
-        .bind(state)
-        .bind(error)
-        .bind(job)
-        .bind(step)
-        .bind(job.map(|_| initiator.clone()))
-        .bind(Uuid::now_v7())
-        .execute(&pool)
+        .bind(file.state)
+        .bind(file.error)
+        .bind(file.job.map(|_| steps.clone()))
+        .bind(file.job)
+        .bind(file.step)
+        .bind(file.job.map(|_| 2))
+        .bind(file.job.map(|_| initiator.clone()))
+        .bind(file.done)
+        .bind(file.completed)
+        .bind(owner)
+        .execute(owner_pool)
         .await
-        .unwrap_or_else(|e| panic!("seed {name}: {e}"));
+        .unwrap_or_else(|e| panic!("seed {}: {e}", file.name));
     }
+    ids
+}
 
-    sqlx::query(
-        "INSERT INTO drive.known_runner_type (runner_type, lifecycle, version, seen_at) \
-         VALUES ('render', 'active', 1, now())",
+async fn drive_indexes(pool: &sqlx::PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT indexname::text FROM pg_indexes WHERE schemaname = 'drive' \
+         AND tablename IN ('file', 'file_job', 'file_processed', 'file_page', 'file_image') \
+         ORDER BY indexname",
     )
-    .execute(&pool)
+    .fetch_all(pool)
     .await
-    .expect("seed the catalogue copy");
+    .expect("list the drive indexes")
+}
 
-    // When: the job log migration runs
-    apply(&pool, |version| version == JOB_LOG_MIGRATION).await;
-
-    // Then: every file reads the state and the error it had, from the view
-    let status = |name: &str| {
-        let id = ids.iter().find(|(n, _)| *n == name).unwrap().1;
-        let pool = pool.clone();
-        async move {
-            sqlx::query_as::<_, (String, Option<String>, Option<Uuid>, Option<i32>)>(
-                "SELECT processing_state, processing_error, last_job_id, last_job_step \
-                 FROM drive.file_status WHERE file_id = $1",
-            )
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .expect("the file's status")
-        }
-    };
-    assert_eq!(
-        status("pending.txt").await,
-        ("pending".into(), None, None, None)
-    );
-    assert_eq!(
-        status("ready.txt").await,
-        ("ready".into(), None, None, None)
-    );
-    assert_eq!(
-        status("running.txt").await,
-        ("processing".into(), None, Some(in_flight_job), Some(1)),
-        "a job in flight becomes the file's log, and its next fact lands in it"
-    );
-    let orphan = status("orphan.txt").await;
-    assert_eq!(
-        (orphan.0.as_str(), orphan.1.as_deref()),
-        ("failed", Some("interrupted"))
-    );
-    let failed = status("failed.txt").await;
-    assert_eq!(
-        (failed.0.as_str(), failed.1.as_deref()),
-        ("failed", Some("timed_out"))
-    );
-    let carried: serde_json::Value =
-        sqlx::query_scalar("SELECT triggered_by FROM drive.file_job WHERE job_id = $1")
-            .bind(in_flight_job)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(carried, initiator, "the initiator moves with the job");
-    let committed: Vec<(String, bool)> =
-        sqlx::query_as("SELECT name, committed_at IS NOT NULL FROM drive.file ORDER BY name")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        committed,
-        vec![
-            ("failed.txt".into(), true),
-            ("orphan.txt".into(), true),
-            ("pending.txt".into(), false),
-            ("ready.txt".into(), true),
-            ("running.txt".into(), true),
-        ]
-    );
-    let gone: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'drive' \
-         AND table_name = 'file' AND column_name IN ('processing_state', 'job_id', 'triggered_by')",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(gone, 0, "the stored state is gone");
-    let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT table_name::text FROM information_schema.tables WHERE table_schema = 'drive' \
-         AND table_name IN ('known_runner_type', 'catalogue_scan') ORDER BY table_name",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        tables,
-        vec!["known_runner_type".to_string()],
-        "the catalogue copy survives, the scan record is gone"
-    );
-    let known: Vec<(String, String)> =
-        sqlx::query_as("SELECT runner_type, lifecycle FROM drive.known_runner_type")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        known,
-        vec![("render".to_string(), "active".to_string())],
-        "the copy keeps its rows"
-    );
-
-    pool.close().await;
+#[tokio::test]
+async fn a_0_1_database_upgrades_and_its_running_job_ends_through_the_booted_host() {
+    // Given: a database exactly as 0.1.0 left it — only the drive migrations
+    // that release shipped — with one file in every state 0.1 could store
+    let db = TestDb::at_drive_version(RELEASED_0_1).await;
+    let database = db.database.clone();
+    let admin = db.admin.clone();
+    let owner_role = db.owner_role.clone();
+    let app_role = db.app_role.clone();
+    let outcome = std::panic::AssertUnwindSafe(upgrade_and_drive(db))
+        .catch_unwind()
+        .await;
+    // Cleaned up whatever happened: the database and both roles go.
     let _ = sqlx::query(&format!(
         "DROP DATABASE IF EXISTS \"{database}\" WITH (FORCE)"
     ))
     .execute(&admin)
     .await;
+    for role in [app_role, owner_role] {
+        let _ = sqlx::query(&format!("DROP ROLE IF EXISTS \"{role}\""))
+            .execute(&admin)
+            .await;
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn upgrade_and_drive(db: TestDb) {
+    let owner_id = Uuid::now_v7();
+    let owner = passport(owner_id);
+    let workspace = Uuid::now_v7();
+    let running_job = Uuid::now_v7();
+    let reported_job = Uuid::now_v7();
+    let interrupted_job = Uuid::now_v7();
+    let completed_job = Uuid::now_v7();
+    let owner_pool = db.owner().await;
+    let before = drive_indexes(&owner_pool).await;
+    assert!(
+        before.contains(&"file_job_idx".to_string()),
+        "0.1's job index: {before:?}"
+    );
+    let ids = seed(
+        &owner_pool,
+        owner_id,
+        workspace,
+        &[
+            OldFile::settled("pending.txt", "pending", None),
+            OldFile::settled("ready.txt", "ready", None),
+            OldFile::settled("failed.txt", "failed", Some("runner_type_unavailable")),
+            // The last step runs; no final report yet.
+            OldFile::running("running.txt", running_job, 1, false, false),
+            // The last step's final report received, Jobs' completion not yet.
+            OldFile::running("reported.txt", reported_job, 1, true, false),
+            // The first step's final report received: the next step was never asked.
+            OldFile::running("interrupted.txt", interrupted_job, 0, true, false),
+            // Jobs' completion without the final report (unreachable with the real Jobs).
+            OldFile::running("completed.txt", completed_job, 1, false, true),
+        ],
+    )
+    .await;
+    let id = |name: &str| {
+        ids.iter()
+            .find(|(n, _)| *n == name)
+            .expect("a seeded file")
+            .1
+    };
+    // The ready file carries 0.1's results: an indexing, a page, an image.
+    sqlx::query(
+        "UPDATE drive.file SET summary = 'Old summary.', page_count = 1, estimated_tokens = 5 \
+         WHERE id = $1",
+    )
+    .bind(id("ready.txt"))
+    .execute(&owner_pool)
+    .await
+    .expect("seed the indexing");
+    sqlx::query(
+        "INSERT INTO drive.file_page (file_id, number, markdown, origin, updated_by, updated_at) \
+         VALUES ($1, 1, 'old page ![i](p001-img01.png)', 'runner', $2, now())",
+    )
+    .bind(id("ready.txt"))
+    .bind(owner_id)
+    .execute(&owner_pool)
+    .await
+    .expect("seed a page");
+    sqlx::query(
+        "INSERT INTO drive.file_image (file_id, name, page, blob_ref, media_type, size_bytes, \
+         sha256, landed_at, requested_at) \
+         VALUES ($1, 'p001-img01.png', 1, $2, 'image/png', 3, $3, now(), now())",
+    )
+    .bind(id("ready.txt"))
+    .bind(Uuid::now_v7())
+    .bind(vec![0u8; 32])
+    .execute(&owner_pool)
+    .await
+    .expect("seed an image");
+
+    // When: the host's upgrade applies every migration of this version
+    db.migrate(br_drive_example::db::libraries()).await;
+
+    // Then: the indexes changed as the migrations say — 0.1's per-file job
+    // index went with its column, the job log and the results have theirs
+    let after = drive_indexes(&owner_pool).await;
+    assert!(
+        !after.contains(&"file_job_idx".to_string()),
+        "0.1's job index is gone: {after:?}"
+    );
+    for kept in [
+        "file_drive_idx",
+        "file_job_file_idx",
+        "file_job_one_live_idx",
+        "file_job_pkey",
+        "file_processed_pkey",
+        "file_page_pkey",
+        "file_image_pkey",
+    ] {
+        assert!(
+            after.contains(&kept.to_string()),
+            "{kept} exists: {after:?}"
+        );
+    }
+    owner_pool.close().await;
+
+    // When: the host boots on the upgraded database
+    let world = World::start_on(db, "pod-upgraded", WorldOptions::default()).await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let runner = service_passport(&[RUNNER_SCOPE]);
+
+    // Then: every file reads the state 0.1 stored, through the host
+    let state = |name: &'static str| {
+        let world = &world;
+        let owner = owner.clone();
+        async move {
+            let file = world.file(&owner, id(name)).await;
+            (
+                file["processingState"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                file["processingError"].as_str().map(str::to_string),
+            )
+        }
+    };
+    let expect = |state: &str, error: Option<&str>| (state.to_string(), error.map(str::to_string));
+    assert_eq!(state("pending.txt").await, expect("PENDING", None));
+    assert_eq!(state("ready.txt").await, expect("READY", None));
+    assert_eq!(
+        state("failed.txt").await,
+        expect("FAILED", Some("runner_type_unavailable"))
+    );
+    assert_eq!(state("running.txt").await, expect("PROCESSING", None));
+    assert_eq!(
+        state("reported.txt").await,
+        expect("READY", None),
+        "a final report received by 0.1 ended its last step"
+    );
+    assert_eq!(
+        state("interrupted.txt").await,
+        expect("FAILED", Some("interrupted")),
+        "the next step was never asked of Jobs: the chain is interrupted, open to a reprocess"
+    );
+    assert_eq!(
+        state("completed.txt").await,
+        expect("FAILED", Some("interrupted"))
+    );
+    let interrupted = world.file(&owner, id("interrupted.txt")).await;
+    assert_eq!(interrupted["affordances"]["process"]["allowed"], true);
+    // And: the results moved with their file
+    let ready = world.file(&owner, id("ready.txt")).await;
+    assert_eq!(ready["summary"], "Old summary.");
+    assert_eq!(ready["pageCount"], 1);
+    assert_eq!(ready["estimatedTokens"], 5);
+    assert_eq!(ready["images"][0]["name"], "p001-img01.png");
+    let pages = world.file_pages(&owner, id("ready.txt")).await;
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0]["markdown"], "old page ![i](p001-img01.png)");
+    // And: the host object counts its drive's files through the status view
+    let counted = world
+        .gql(
+            &owner,
+            "query($id:UUID!){workspaceWorkspace(id:$id){fileCount readyFileCount}}",
+            serde_json::json!({ "id": workspace }),
+        )
+        .await;
+    assert_eq!(
+        ok(&counted)["workspaceWorkspace"],
+        serde_json::json!({ "fileCount": 7, "readyFileCount": 2 })
+    );
+
+    // When: the runner of the job 0.1 left running sends its final report
+    let running = id("running.txt");
+    assert_eq!(
+        error_code(&context(&world, &runner, running, completed_job).await),
+        "JOB_NOT_ACTIVE",
+        "another file's job never opens this one"
+    );
+    ok(&report(
+        &world,
+        &runner,
+        running,
+        Report {
+            job_id: running_job,
+            pages: vec![(1, "finished after the upgrade")],
+            origin: None,
+            indexer: Some(("Upgraded.", 1, 3)),
+            done: true,
+        },
+    )
+    .await);
+
+    // Then: it lands on the backfilled job and ends the chain — it was the
+    // last step — and Jobs is told
+    let file = world.await_state(&owner, running, "READY").await;
+    assert_eq!(file["summary"], "Upgraded.");
+    assert_eq!(file["steps"].as_array().map(Vec::len), Some(2));
+    assert_eq!(jobs.await_finish(running_job).await.job_id, running_job);
+    assert_eq!(
+        world.job_events(running_job).await,
+        vec!["reported_done"],
+        "the runner's end is logged on the job 0.1 was running"
+    );
+    jobs.expect_no_command(Duration::from_millis(500)).await;
+
+    world.service.shutdown().await;
 }

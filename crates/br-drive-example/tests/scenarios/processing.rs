@@ -70,15 +70,12 @@ async fn the_ruleset_chain_runs_step_by_step_over_jobs_facts_and_lands_ready() {
         &UploadRequest::text(drive, "", "report.txt", BYTES),
     )
     .await;
+    // (the file may enter the window already processing: the engine delivers
+    // an entering key by repopulation, without the ProcessingStarted cause)
     let started = next_drive_delta(&mut files, |node| {
         node["__typename"] == "DriveUpsert" && node["view"]["processingState"] == "PROCESSING"
     })
     .await;
-    assert_eq!(
-        started["view"]["progress"]["stepIndex"], 0,
-        "the file enters the window already processing (the engine delivers an entering key by \
-         repopulation, without the ProcessingStarted cause)"
-    );
     assert_eq!(started["view"]["rulesetId"], rule.to_string());
     assert_eq!(started["view"]["progress"]["stepIndex"], 0);
     assert_eq!(started["view"]["progress"]["stepCount"], 2);
