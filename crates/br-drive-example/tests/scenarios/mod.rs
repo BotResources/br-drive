@@ -10,6 +10,7 @@ mod imports;
 mod jobs_double;
 mod labels;
 mod migration;
+mod migration_0_2;
 mod pages;
 mod process_gesture;
 mod processing;
