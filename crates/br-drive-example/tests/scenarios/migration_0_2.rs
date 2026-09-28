@@ -3,7 +3,7 @@
 //! which no gesture of this version can produce; everything after the upgrade
 //! is observed through the booted host, and the tables the migration wrote.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, SubsecRound, TimeDelta, Utc};
 use futures_util::FutureExt;
 use uuid::Uuid;
 
@@ -110,7 +110,9 @@ async fn upgrade_and_drive(db: TestDb) {
     let owner_id = Uuid::now_v7();
     let owner = passport(owner_id);
     let workspace = Uuid::now_v7();
-    let t0 = Utc::now() - TimeDelta::minutes(10);
+    // At the database's precision (microseconds), so an instant read back
+    // compares equal on any clock.
+    let t0 = (Utc::now() - TimeDelta::minutes(10)).trunc_subsecs(6);
     let t = |seconds: i64| t0 + TimeDelta::seconds(seconds);
     let owner_pool = db.owner().await;
     sqlx::query("INSERT INTO workspace (id, owner_id, name) VALUES ($1, $2, 'upgraded')")
