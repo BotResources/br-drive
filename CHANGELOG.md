@@ -7,6 +7,10 @@ single git tag `v{version}` releases the set. Format follows
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.0 — 2026-09-28
+
 ### Fixed
 
 - A processing chain of more than one step reaches `READY` against the real
