@@ -121,10 +121,6 @@ async fn a_job_of_a_runner_type_jobs_never_declared_waits_until_the_user_cancels
         "FILE_NOT_FOUND"
     );
 
-    crate::poll_until!(Duration::from_secs(15), {
-        (world.job_events(stuck).await == ["queued"]).then_some(())
-    });
-
     // When: the owner cancels it
     ok(&cancel(&world, &owner, file_id).await);
 
@@ -157,17 +153,19 @@ async fn a_job_of_a_runner_type_jobs_never_declared_waits_until_the_user_cancels
         serde_json::json!({ "allowed": false, "reason": "FILE_NOT_PROCESSING" })
     );
     assert_eq!(
-        world.job_events(stuck).await,
-        vec!["queued", "cancel_requested", "cancelled"],
-        "the job's log holds every fact and the request, in arrival order"
+        world.job_end(stuck).await,
+        Some(("cancelled".to_string(), None)),
+        "the job ended cancelled"
     );
+    assert_eq!(world.job_cancels(stuck).await, 1, "the request is recorded");
     assert_eq!(
         error_code(&context(&world, &runner, file_id, stuck).await),
         "JOB_NOT_ACTIVE",
         "the cancelled job no longer opens the file"
     );
     // A `queued` redelivered after the cancellation reopens nothing.
-    jobs.queue(stuck, RENDER).await;
+    let late = jobs.queue(stuck, RENDER).await;
+    world.await_consumed(late).await;
     refute_delta(
         &mut files,
         "workspaceDriveChanged",
@@ -268,16 +266,14 @@ async fn a_cancel_jobs_dropped_can_be_asked_again() {
     jobs.await_cancel(job).await;
     let file = world.await_state(&owner, file_id, "FAILED").await;
     assert_eq!(file["processingError"], "cancelled");
-    let mut events = world.job_events(job).await;
-    events.sort_unstable();
     assert_eq!(
-        events,
-        vec![
-            "cancel_requested",
-            "cancel_requested",
-            "cancelled",
-            "queued"
-        ]
+        world.job_cancels(job).await,
+        2,
+        "both requests are recorded"
+    );
+    assert_eq!(
+        world.job_end(job).await,
+        Some(("cancelled".to_string(), None))
     );
     assert_eq!(
         error_code(&cancel(&world, &owner, file_id).await),
@@ -357,9 +353,13 @@ async fn a_cancel_that_crosses_a_steps_final_report_stops_the_chain_there() {
     jobs.expect_no_command(Duration::from_secs(1)).await;
     let log = world.job_log(file_id).await;
     assert_eq!(log.len(), 2, "the step never started is recorded as such");
+    assert_eq!(log[0].2.as_deref(), Some("reported_done"));
     assert_eq!(log[1].1, 1);
-    assert_eq!(log[1].2.len(), 1);
-    assert_eq!(log[1].2[0]["kind"], "cancelled");
+    assert_eq!(
+        log[1].2.as_deref(),
+        Some("cancelled"),
+        "a job row of its own, ended cancelled before it started"
+    );
     assert_eq!(
         world.file_pages(&owner, file_id).await.len(),
         1,
@@ -427,11 +427,14 @@ async fn a_cancel_that_crosses_the_last_steps_final_report_leaves_the_file_ready
     assert!(finished["view"]["processingError"].is_null());
     jobs.await_finish(only).await;
 
-    // And: Jobs' `cancelled`, arriving after, is logged and changes nothing
-    jobs.cancel(only).await;
-    crate::poll_until!(Duration::from_secs(15), {
-        (world.job_events(only).await.last().map(String::as_str) == Some("cancelled")).then_some(())
-    });
+    // And: Jobs' `cancelled`, arriving after, changes nothing: the job ended
+    // with the runner's final report, and a later end is not recorded
+    let late = jobs.cancel(only).await;
+    world.await_consumed(late).await;
+    assert_eq!(
+        world.job_end(only).await,
+        Some(("reported_done".to_string(), None))
+    );
     refute_delta(
         &mut files,
         "workspaceDriveChanged",
@@ -481,8 +484,11 @@ async fn a_runner_type_jobs_retired_fails_the_file_at_creation() {
     assert_eq!(failed["cause"]["reason"], "runner_type_retired");
     assert_eq!(failed["view"]["processingError"], "runner_type_retired");
     assert_eq!(
-        world.job_events(create.job_id).await,
-        vec!["creation_rejected"]
+        world.job_end(create.job_id).await,
+        Some((
+            "creation_rejected".to_string(),
+            Some("runner_type_retired".to_string())
+        ))
     );
     jobs.expect_no_command(Duration::from_secs(1)).await;
 
@@ -684,9 +690,6 @@ async fn a_late_fact_of_an_old_job_changes_nothing() {
     jobs.start(current, run).await;
     jobs.declare_plan(current, run, &["read", "write"]).await;
     jobs.start_step(current, run, 0, "read").await;
-    crate::poll_until!(Duration::from_secs(15), {
-        (world.job_events(current).await.len() == 4).then_some(())
-    });
     let progress = crate::poll_until!(Duration::from_secs(15), {
         let file = world.file(&owner, file_id).await;
         (file["progress"]["currentLabel"] == "read"
@@ -698,31 +701,37 @@ async fn a_late_fact_of_an_old_job_changes_nothing() {
     // When: facts of the old job arrive late — a start, a plan, a step, even a
     // completion and a failure
     let stale_run = Uuid::now_v7();
-    jobs.start(old, stale_run).await;
-    jobs.declare_plan(old, stale_run, &["stale"]).await;
-    jobs.start_step(old, stale_run, 5, "stale").await;
-    jobs.complete(old).await;
-    jobs.fail(old, "RUNNER_REPORTED", Some("stale_failure"))
-        .await;
-
-    // Then: they are logged on the old job only — each fact type rides its own
-    // durable, so their arrival order is the broker's — and the file does not move
-    let mut expected = vec![
-        "queued",
-        "cancel_requested",
-        "cancelled",
-        "completed",
-        "failed",
-        "plan_declared",
-        "started",
-        "step_started",
+    let late = [
+        jobs.start(old, stale_run).await,
+        jobs.declare_plan(old, stale_run, &["stale"]).await,
+        jobs.start_step(old, stale_run, 5, "stale").await,
+        jobs.complete(old).await,
+        jobs.fail(old, "RUNNER_REPORTED", Some("stale_failure"))
+            .await,
     ];
-    expected.sort_unstable();
-    crate::poll_until!(Duration::from_secs(15), {
-        let mut events = world.job_events(old).await;
-        events.sort_unstable();
-        (events == expected).then_some(())
-    });
+
+    // Then: once each is consumed — each fact type rides its own durable, so
+    // their arrival order is the broker's — the old job's end is still the
+    // first one, nothing of its progress is kept, and the file does not move
+    for message in late {
+        world.await_consumed(message).await;
+    }
+    assert_eq!(
+        world.job_end(old).await,
+        Some(("cancelled".to_string(), None))
+    );
+    let old_progress: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM drive.file_job_plan WHERE job_id = $1) \
+              + (SELECT count(*) FROM drive.file_job_step WHERE job_id = $1)",
+    )
+    .bind(old)
+    .fetch_one(&world.db.app)
+    .await
+    .unwrap();
+    assert_eq!(
+        old_progress, 0,
+        "a job that no longer runs keeps no progress"
+    );
     refute_delta(
         &mut files,
         "workspaceDriveChanged",
@@ -741,23 +750,18 @@ async fn a_late_fact_of_an_old_job_changes_nothing() {
     assert_eq!(file["processingState"], "PROCESSING");
     assert_eq!(file["progress"], progress);
     assert_eq!(world.job_of(file_id).await, Some(current));
-    let mut current_events = world.job_events(current).await;
-    current_events.sort_unstable();
     assert_eq!(
-        current_events,
-        vec!["plan_declared", "queued", "started", "step_started"],
-        "the current job's log is untouched by the old job's facts"
+        world.job_end(current).await,
+        None,
+        "the current job still runs"
     );
     jobs.expect_no_command(Duration::from_millis(500)).await;
 
     // When: the current job ends, then one of its own progress facts arrives late
     done(&world, &jobs, &runner, file_id, current).await;
     world.await_state(&owner, file_id, "READY").await;
-    jobs.start_step(current, run, 1, "write").await;
-    crate::poll_until!(Duration::from_secs(15), {
-        (world.job_events(current).await.last().map(String::as_str) == Some("step_started"))
-            .then_some(())
-    });
+    let late_step = jobs.start_step(current, run, 1, "write").await;
+    world.await_consumed(late_step).await;
 
     // Then: a READY file stays READY
     assert_eq!(

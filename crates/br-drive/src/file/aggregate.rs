@@ -167,7 +167,7 @@ pub struct FileRow<H> {
     pub updated_at: DateTime<Utc>,
     /// The file's processing status, read from `drive.file_status` when the
     /// row is loaded — never written: the library changes it by writing the
-    /// file's job log.
+    /// file's job facts.
     pub(crate) status: FileStatus,
     pub(crate) host: PhantomData<fn() -> H>,
 }
@@ -222,7 +222,7 @@ impl<H> Clone for FileRow<H> {
 }
 
 impl<H> FileRow<H> {
-    /// `PENDING | PROCESSING | READY | FAILED`, computed from the job log.
+    /// `PENDING | PROCESSING | READY | FAILED`, computed from the job facts.
     pub fn processing_state(&self) -> ProcessingState {
         self.status.state
     }
@@ -401,18 +401,6 @@ pub(crate) fn file_progressed<H: DriveHost>(
     file: &FileRow<H>,
 ) -> Result<(), service_engine::error::EngineError> {
     ops.impact_caused::<File, _>(&file.id, FileCause::ProgressChanged)
-}
-
-/// Stages an impact on `file` without a cause: its views recompute, and a live
-/// session receives a delta only if what it shows changed — for a job log
-/// entry that may or may not show (a queued job, a late fact of an old job).
-/// The host object is not touched: such an entry never changes the file's
-/// state, so never the drive's counts.
-pub(crate) fn file_touched<H: DriveHost>(
-    ops: &mut service_engine::pipeline::Ops<'_>,
-    file: &FileRow<H>,
-) -> Result<(), service_engine::error::EngineError> {
-    ops.impact::<File>(&file.id, service_engine::impact::Dims::ALL)
 }
 
 impl<H: DriveHost> FileRow<H> {

@@ -404,39 +404,60 @@ impl World {
             .expect("read the blob row")
     }
 
-    /// The job log of a file, oldest job first: each job's id, step and
-    /// entries — what the library recorded of every Jobs fact it received.
-    pub async fn job_log(&self, file_id: Uuid) -> Vec<(Uuid, i32, Vec<serde_json::Value>)> {
-        let rows: Vec<(Uuid, i32, serde_json::Value)> = sqlx::query_as(
-            "SELECT job_id, step_index, events FROM drive.file_job \
-             WHERE file_id = $1 ORDER BY created_at, job_id",
+    /// The jobs of a file, in their order: each job's id, chain step and end
+    /// kind (`None` while it runs) — what the library recorded.
+    pub async fn job_log(&self, file_id: Uuid) -> Vec<(Uuid, i32, Option<String>)> {
+        sqlx::query_as(
+            "SELECT j.job_id, j.step_index, e.kind FROM drive.file_job j \
+             LEFT JOIN drive.file_job_end e ON e.job_id = j.job_id \
+             WHERE j.file_id = $1 ORDER BY j.number",
         )
         .bind(file_id)
         .fetch_all(&self.db.app)
         .await
-        .expect("read the file's job log");
-        rows.into_iter()
-            .map(|(job, step, events)| {
-                let events = events.as_array().cloned().unwrap_or_default();
-                (job, step, events)
-            })
-            .collect()
+        .expect("read the file's jobs")
     }
 
-    /// The kinds of the entries logged on one job, in arrival order.
-    pub async fn job_events(&self, job_id: Uuid) -> Vec<String> {
-        let events: Option<serde_json::Value> =
-            sqlx::query_scalar("SELECT events FROM drive.file_job WHERE job_id = $1")
-                .bind(job_id)
-                .fetch_optional(&self.db.app)
-                .await
-                .expect("read the job's log");
-        events
-            .and_then(|events| events.as_array().cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|entry| entry["kind"].as_str().map(str::to_string))
-            .collect()
+    /// How a job ended, as recorded: its kind and reason; `None` while it runs.
+    pub async fn job_end(&self, job_id: Uuid) -> Option<(String, Option<String>)> {
+        sqlx::query_as("SELECT kind, reason_code FROM drive.file_job_end WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_optional(&self.db.app)
+            .await
+            .expect("read the job's end")
+    }
+
+    /// How many cancel requests a job recorded.
+    pub async fn job_cancels(&self, job_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM drive.file_job_cancel WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&self.db.app)
+            .await
+            .expect("read the job's cancel requests")
+    }
+
+    /// Waits until the host consumed the message `message_id` (the engine
+    /// claims a message in the transaction of the reaction that handled it):
+    /// the barrier after which "it changed nothing" can be asserted.
+    pub async fn await_consumed(&self, message_id: Uuid) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let claimed: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM service_engine.message_claim WHERE message_id = $1)",
+            )
+            .bind(message_id)
+            .fetch_one(&self.db.app)
+            .await
+            .expect("read the engine's message claims");
+            if claimed {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the host never consumed message {message_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
     }
 
     pub async fn send_upload_deadline(&self, file_id: Uuid) {

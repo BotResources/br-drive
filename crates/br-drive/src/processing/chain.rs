@@ -6,7 +6,7 @@ use service_engine::pipeline::Ops;
 use uuid::Uuid;
 
 use super::commands::{Initiator, JobCancel, JobCreate, JobFail, JobFinish};
-use super::log::{FileJob, append, entry, insert_job, kind};
+use super::log::{End, EndKind, FileJob, end, insert_job};
 use super::roots::roots;
 use crate::fault::{DriveFault, codes};
 use crate::file::images::drop_images;
@@ -56,7 +56,7 @@ impl ChainPlan {
     }
 }
 
-/// Reads the file's status again after the library wrote its job log in this
+/// Reads the file's status again after the library recorded a job fact in this
 /// transaction, so the rest of the gesture sees what the view now computes.
 pub(crate) async fn refresh_status<H>(
     cx: &mut Ops<'_>,
@@ -131,9 +131,10 @@ async fn launch_step<H: DriveHost>(
     Ok(Some(job_id))
 }
 
-/// A second unsettled job for one file violates `file_job_one_live_idx`: the
-/// file is already processing. The gestures' row lock prevents it; this keeps
-/// the answer a code should it ever happen.
+/// A second job numbered alike for one file violates the `(file_id, number)`
+/// primary key: another writer created the file's next job first. The file's
+/// row lock every writer takes prevents it; this keeps the answer a code
+/// should it ever happen.
 fn live_job_taken(error: EngineError) -> DriveFault {
     match &error {
         EngineError::Db(sqlx::Error::Database(db)) if db.is_unique_violation() => {
@@ -165,9 +166,9 @@ pub async fn start_chain<H: DriveHost>(
 }
 
 /// The runner's final report ended `job`, the file's running job, in the
-/// report's transaction: `reported_done` is logged (the job settles), Jobs is
-/// told (`job.finish`), and the chain moves on — the next step's job, or the
-/// end of the chain (READY). Jobs' own `completed` then only confirms it. A
+/// report's transaction: its end `reported_done` is recorded (the job
+/// settles), Jobs is told (`job.finish`), and the chain moves on — the next
+/// step's job, or the end of the chain (READY). Jobs' own `completed` then only confirms it. A
 /// user's cancel that crossed the report stops the chain there: the next step
 /// is recorded as never started, `cancelled`; on the last step there is
 /// nothing left to stop and the file is READY.
@@ -177,10 +178,15 @@ pub(crate) async fn report_done<H: DriveHost>(
     job: &FileJob,
 ) -> Result<(), DriveFault> {
     let now = cx.now().as_datetime();
-    append(
+    end(
         cx.connection(),
         job.job_id,
-        entry(kind::REPORTED_DONE, now, serde_json::json!({}))?,
+        End {
+            kind: EndKind::ReportedDone,
+            reason_code: None,
+            message: None,
+            at: now,
+        },
     )
     .await?;
     finish_job(cx, job.job_id)?;
@@ -241,8 +247,9 @@ async fn conclude<H: DriveHost>(cx: &mut Ops<'_>, file: &FileRow<H>) -> Result<(
 }
 
 /// The runner declared `job`, the file's running job, failed: the declaration
-/// is logged with its reason (the job settles, the file is FAILED with that
-/// reason) and Jobs is told (`job.fail`). The results reported so far stay.
+/// is recorded as its end, with its reason (the job settles, the file is
+/// FAILED with that reason) and Jobs is told (`job.fail`). The results
+/// reported so far stay.
 pub(crate) async fn report_failed<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
@@ -251,14 +258,15 @@ pub(crate) async fn report_failed<H: DriveHost>(
     message: Option<&str>,
 ) -> Result<(), DriveFault> {
     let now = cx.now().as_datetime();
-    append(
+    end(
         cx.connection(),
         job.job_id,
-        entry(
-            kind::REPORTED_FAILED,
-            now,
-            serde_json::json!({ "reason_code": reason_code, "message": message }),
-        )?,
+        End {
+            kind: EndKind::ReportedFailed,
+            reason_code: Some(reason_code),
+            message,
+            at: now,
+        },
     )
     .await?;
     let note = match message {
@@ -284,8 +292,8 @@ pub(crate) async fn report_failed<H: DriveHost>(
     Ok(())
 }
 
-/// Records step `next` as cancelled before it started: a row of its own, never
-/// sent to Jobs, whose only entry is the library's `cancelled`.
+/// Records step `next` as cancelled before it started: a job row of its own,
+/// never sent to Jobs, ended at once by the library's `cancelled`.
 async fn stop_before<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
@@ -298,16 +306,23 @@ async fn stop_before<H: DriveHost>(
         step_index: i32::try_from(next).unwrap_or(i32::MAX),
         trigger: ended.trigger,
         triggered_by: ended.triggered_by.clone(),
-        events: vec![entry(
-            kind::CANCELLED,
-            now,
-            serde_json::json!({ "before_start": true }),
-        )?],
+        events: Vec::new(),
         created_at: now,
     };
     insert_job(cx.connection(), file.id, &stopped)
         .await
         .map_err(live_job_taken)?;
+    end(
+        cx.connection(),
+        stopped.job_id,
+        End {
+            kind: EndKind::Cancelled,
+            reason_code: None,
+            message: None,
+            at: now,
+        },
+    )
+    .await?;
     refresh_status(cx, file).await?;
     file.updated_at = now;
     cx.save(file).await?;

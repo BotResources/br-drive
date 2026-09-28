@@ -236,8 +236,7 @@ async fn upgrade_and_drive(db: TestDb) {
     );
     for kept in [
         "file_drive_idx",
-        "file_job_file_idx",
-        "file_job_one_live_idx",
+        "file_job_job_id_key",
         "file_job_pkey",
         "file_processed_pkey",
         "file_page_pkey",
@@ -344,9 +343,9 @@ async fn upgrade_and_drive(db: TestDb) {
     assert_eq!(file["steps"].as_array().map(Vec::len), Some(2));
     assert_eq!(jobs.await_finish(running_job).await.job_id, running_job);
     assert_eq!(
-        world.job_events(running_job).await,
-        vec!["reported_done"],
-        "the runner's end is logged on the job 0.1 was running"
+        world.job_end(running_job).await,
+        Some(("reported_done".to_string(), None)),
+        "the runner's end is recorded on the job 0.1 was running"
     );
     jobs.expect_no_command(Duration::from_millis(500)).await;
 

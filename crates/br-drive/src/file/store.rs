@@ -12,7 +12,7 @@ use super::aggregate::{FileRow, FileStatus, PageOrigin, ProcessingState};
 use crate::host::{DRIVE_DIM, DriveHost};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
-use crate::processing::FileJob;
+use crate::processing::{FileJob, Initiator, RunningFacts};
 use crate::ruleset::Trigger;
 use crate::title::FileTitle;
 
@@ -27,7 +27,9 @@ const RESULT_COLUMNS: &str = "summary, page_count, estimated_tokens";
 /// The columns of `drive.file_status` a file row reads beside its own: the
 /// computed state and error, and the file's last job.
 const STATUS_COLUMNS: &str = "processing_state, processing_error, last_job_id, last_job_step, \
-     last_job_trigger, last_job_triggered_by, last_job_events, last_job_created_at";
+     last_job_trigger, last_job_triggered_by_id, last_job_triggered_by_name, last_job_created_at, \
+     last_job_plan, last_job_plan_index, last_job_plan_label, last_job_plan_at, \
+     last_job_cancel_requested_at";
 
 /// The file table joined to its computed status and to its results, aliased
 /// `f`, `s` and `r`.
@@ -104,7 +106,22 @@ pub(crate) fn row_to_file_prefixed<H>(
     let last_job_id: Option<Uuid> = row.get(column("last_job_id").as_str());
     let last_job = match last_job_id {
         Some(job_id) => {
-            let events: Option<serde_json::Value> = row.get(column("last_job_events").as_str());
+            let plan_at: Option<DateTime<Utc>> = row.get(column("last_job_plan_at").as_str());
+            let facts = RunningFacts {
+                plan: row.get(column("last_job_plan").as_str()),
+                step: plan_at.map(|at| {
+                    (
+                        row.get::<Option<i32>, _>(column("last_job_plan_index").as_str())
+                            .unwrap_or_default(),
+                        row.get::<Option<String>, _>(column("last_job_plan_label").as_str())
+                            .unwrap_or_default(),
+                        at,
+                    )
+                }),
+                cancel_requested_at: row.get(column("last_job_cancel_requested_at").as_str()),
+            };
+            let triggered_by_id: Option<Uuid> =
+                row.get(column("last_job_triggered_by_id").as_str());
             let trigger: Option<String> = row.get(column("last_job_trigger").as_str());
             Some(FileJob {
                 job_id,
@@ -116,14 +133,11 @@ pub(crate) fn row_to_file_prefixed<H>(
                     .map(Trigger::from_db_str)
                     .transpose()
                     .map_err(config_error)?,
-                triggered_by: decode_json(
-                    "a job's initiator",
-                    row.get(column("last_job_triggered_by").as_str()),
-                ),
-                events: match events {
-                    Some(serde_json::Value::Array(events)) => events,
-                    _ => Vec::new(),
-                },
+                triggered_by: triggered_by_id.map(|id| Initiator {
+                    id,
+                    display_name: row.get(column("last_job_triggered_by_name").as_str()),
+                }),
+                events: facts.entries(),
                 created_at: row
                     .get::<Option<DateTime<Utc>>, _>(column("last_job_created_at").as_str())
                     .unwrap_or_default(),
@@ -162,7 +176,7 @@ pub(crate) fn row_to_file_prefixed<H>(
 }
 
 /// The status of one file as `drive.file_status` computes it now — read again
-/// after the library wrote the file's job log in the same transaction.
+/// after the library recorded a fact of the file's jobs in the same transaction.
 pub(crate) async fn status_of(
     conn: &mut PgConnection,
     file_id: Uuid,

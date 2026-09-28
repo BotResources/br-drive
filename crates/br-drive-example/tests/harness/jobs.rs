@@ -217,15 +217,18 @@ fn event_subject(coords: &EventCoords) -> String {
     )
 }
 
+/// Publishes a Jobs fact and answers its message id — what the host's
+/// reaction claims when it consumes it (`World::await_consumed`).
 async fn publish_fact<T: Serialize>(
     js: &async_nats::jetstream::Context,
     actor: Uuid,
     coords: EventCoords,
     event_type: &str,
     payload: T,
-) {
+) -> Uuid {
+    let message_id = Uuid::now_v7();
     let event = IntegrationEvent::new(
-        Uuid::now_v7(),
+        message_id,
         event_type,
         EVENT_VERSION,
         Utc::now(),
@@ -241,6 +244,7 @@ async fn publish_fact<T: Serialize>(
         .expect("publish the jobs fact")
         .await
         .expect("the stream acks the jobs fact");
+    message_id
 }
 
 /// Reads every command addressed to jobs as it arrives, judges each
@@ -568,11 +572,16 @@ impl JobsStandIn {
             .cloned()
     }
 
-    async fn publish<T: Serialize>(&self, coords: EventCoords, event_type: &str, payload: T) {
-        publish_fact(&self.js, self.actor, coords, event_type, payload).await;
+    async fn publish<T: Serialize>(
+        &self,
+        coords: EventCoords,
+        event_type: &str,
+        payload: T,
+    ) -> Uuid {
+        publish_fact(&self.js, self.actor, coords, event_type, payload).await
     }
 
-    pub async fn queue(&self, job_id: Uuid, runner_type: &str) {
+    pub async fn queue(&self, job_id: Uuid, runner_type: &str) -> Uuid {
         self.publish(
             evt_job_queued_v1_coords().unwrap(),
             EVENT_TYPE_QUEUED,
@@ -581,19 +590,19 @@ impl JobsStandIn {
                 runner_type: runner_type.to_string(),
             },
         )
-        .await;
+        .await
     }
 
-    pub async fn start(&self, job_id: Uuid, run_id: Uuid) {
+    pub async fn start(&self, job_id: Uuid, run_id: Uuid) -> Uuid {
         self.publish(
             evt_job_started_v1_coords().unwrap(),
             EVENT_TYPE_STARTED,
             JobStarted { job_id, run_id },
         )
-        .await;
+        .await
     }
 
-    pub async fn declare_plan(&self, job_id: Uuid, run_id: Uuid, steps: &[&str]) {
+    pub async fn declare_plan(&self, job_id: Uuid, run_id: Uuid, steps: &[&str]) -> Uuid {
         self.publish(
             evt_job_plan_declared_v1_coords().unwrap(),
             EVENT_TYPE_PLAN_DECLARED,
@@ -603,12 +612,12 @@ impl JobsStandIn {
                 steps: steps.iter().map(|s| s.to_string()).collect(),
             },
         )
-        .await;
+        .await
     }
 
-    pub async fn start_step(&self, job_id: Uuid, run_id: Uuid, index: u32, label: &str) {
+    pub async fn start_step(&self, job_id: Uuid, run_id: Uuid, index: u32, label: &str) -> Uuid {
         self.start_step_at(job_id, run_id, index, label, Utc::now())
-            .await;
+            .await
     }
 
     /// The same fact with a pinned instant: publishing it twice is a redelivery.
@@ -619,7 +628,7 @@ impl JobsStandIn {
         index: u32,
         label: &str,
         started_at: chrono::DateTime<Utc>,
-    ) {
+    ) -> Uuid {
         self.publish(
             evt_job_step_started_v1_coords().unwrap(),
             EVENT_TYPE_STEP_STARTED,
@@ -631,25 +640,30 @@ impl JobsStandIn {
                 started_at,
             },
         )
-        .await;
+        .await
     }
 
-    pub async fn complete(&self, job_id: Uuid) {
+    pub async fn complete(&self, job_id: Uuid) -> Uuid {
         self.settle(job_id);
         self.publish(
             evt_job_completed_v1_coords().unwrap(),
             EVENT_TYPE_COMPLETED,
             JobCompleted { job_id },
         )
-        .await;
+        .await
     }
 
-    pub async fn reject_creation(&self, job_id: Uuid, reason_code: &str) {
+    pub async fn reject_creation(&self, job_id: Uuid, reason_code: &str) -> Uuid {
         self.reject_creation_with(job_id, reason_code, Value::Object(Default::default()))
-            .await;
+            .await
     }
 
-    pub async fn reject_creation_with(&self, job_id: Uuid, reason_code: &str, params: Value) {
+    pub async fn reject_creation_with(
+        &self,
+        job_id: Uuid,
+        reason_code: &str,
+        params: Value,
+    ) -> Uuid {
         self.settle(job_id);
         self.publish(
             evt_job_creation_rejected_v1_coords().unwrap(),
@@ -660,10 +674,10 @@ impl JobsStandIn {
                 params,
             },
         )
-        .await;
+        .await
     }
 
-    pub async fn fail(&self, job_id: Uuid, failure_cause: &str, reason_code: Option<&str>) {
+    pub async fn fail(&self, job_id: Uuid, failure_cause: &str, reason_code: Option<&str>) -> Uuid {
         self.settle(job_id);
         self.publish(
             evt_job_failed_v1_coords().unwrap(),
@@ -680,17 +694,17 @@ impl JobsStandIn {
                 note: None,
             },
         )
-        .await;
+        .await
     }
 
-    pub async fn cancel(&self, job_id: Uuid) {
+    pub async fn cancel(&self, job_id: Uuid) -> Uuid {
         self.settle(job_id);
         self.publish(
             evt_job_cancelled_v1_coords().unwrap(),
             EVENT_TYPE_CANCELLED,
             JobCancelled { job_id },
         )
-        .await;
+        .await
     }
 
     /// The next command addressed to jobs: one skipped by an earlier wait
