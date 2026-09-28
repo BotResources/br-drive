@@ -162,7 +162,14 @@ async fn a_runners_declared_failure_fails_the_file_with_its_code_and_tells_jobs(
         &UploadRequest::text(drive, "", "unreadable.txt", BYTES),
     )
     .await;
-    let job = jobs.await_create(file_id).await.job_id;
+    let create = jobs.await_create(file_id).await;
+    let job = create.job_id;
+    // The job's config names the root the runner declares a failure on.
+    let failure_root = create.config.as_ref().expect("the job config")["failure_root"]
+        .as_str()
+        .expect("the failure root")
+        .to_string();
+    assert_eq!(failure_root, "workspaceRunnerReportFailure");
     ok(&report(
         &world,
         &runner,
@@ -212,16 +219,23 @@ async fn a_runners_declared_failure_fails_the_file_with_its_code_and_tells_jobs(
         "PROCESSING"
     );
 
-    // When: the runner declares its job failed
-    ok(&report_failure(
-        &world,
-        &runner,
-        file_id,
-        job,
-        "unreadable_scan",
-        Some("page 3 is blank"),
-    )
-    .await);
+    // When: the runner declares its job failed, on the root its config names
+    let declared = world
+        .gql(
+            &runner,
+            &format!(
+                "mutation($f:UUID!,$j:UUID!,$c:String!,$m:String){{\
+                 {failure_root}(fileId:$f,jobId:$j,reasonCode:$c,message:$m){{success}}}}"
+            ),
+            serde_json::json!({
+                "f": file_id, "j": job, "c": "unreadable_scan", "m": "page 3 is blank",
+            }),
+        )
+        .await;
+    assert_eq!(
+        ok(&declared)[failure_root.as_str()],
+        serde_json::json!({ "success": true })
+    );
 
     // Then: the file is FAILED with the runner's own code, open to a reprocess
     let failed = next_drive_delta(&mut files, |node| {

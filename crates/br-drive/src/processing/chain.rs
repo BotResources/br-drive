@@ -100,6 +100,7 @@ async fn launch_step<H: DriveHost>(
         "context_root": roots.context_root,
         "image_upload_root": roots.image_upload_root,
         "report_root": roots.report_root,
+        "failure_root": roots.failure_root,
         "step": index,
         "options": step.options,
     });

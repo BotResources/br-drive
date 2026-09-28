@@ -11,6 +11,14 @@ Nothing yet.
 
 ## 0.3.0 — 2026-09-28
 
+### Added
+
+- The job config sent with `job.create` names the failure-declaration root,
+  `failure_root` (`<p>RunnerReportFailure`), beside `context_root`,
+  `image_upload_root` and `report_root`; `br_drive::RootNames` gains
+  `failure_root`. A runner declares its failure on the root its config
+  names.
+
 ### Removed
 
 - The host-privileged import: `<p>ImportPages` and `<p>ImportImage` (and

@@ -12,6 +12,7 @@ pub struct RootNames {
     pub context_root: String,
     pub image_upload_root: String,
     pub report_root: String,
+    pub failure_root: String,
 }
 
 impl RootNames {
@@ -22,6 +23,7 @@ impl RootNames {
             context_root: format!("{camel}RunnerContext"),
             image_upload_root: format!("{camel}RunnerRequestImageUpload"),
             report_root: format!("{camel}RunnerReport"),
+            failure_root: format!("{camel}RunnerReportFailure"),
         })
     }
 }
@@ -74,6 +76,7 @@ mod tests {
         assert_eq!(roots.context_root, "myHostRunnerContext");
         assert_eq!(roots.image_upload_root, "myHostRunnerRequestImageUpload");
         assert_eq!(roots.report_root, "myHostRunnerReport");
+        assert_eq!(roots.failure_root, "myHostRunnerReportFailure");
         assert!(RootNames::for_prefix("Bad_Prefix").is_err());
     }
 }

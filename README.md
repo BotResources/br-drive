@@ -334,7 +334,8 @@ nothing. **A runner that retries its final report after a lost ack must take
 Job config (what `job.create` carries, so a runner can be written against
 it): `host` (the host service name), `file_id`, `job_id`, `context_root`
 (`<p>RunnerContext`), `image_upload_root` (`<p>RunnerRequestImageUpload`),
-`report_root` (`<p>RunnerReport`), `step` (the index in the rule), `options`
+`report_root` (`<p>RunnerReport`), `failure_root`
+(`<p>RunnerReportFailure`), `step` (the index in the rule), `options`
 (the ruleset step's options; `options.page` and `options.comment` on a page
 regeneration). The config never carries a presigned URL — the runner mints one
 through `RunnerContext` when it needs it.

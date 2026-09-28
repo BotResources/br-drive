@@ -114,6 +114,7 @@ async fn the_ruleset_chain_runs_step_by_step_over_jobs_facts_and_lands_ready() {
         "workspaceRunnerRequestImageUpload"
     );
     assert_eq!(config["report_root"], "workspaceRunnerReport");
+    assert_eq!(config["failure_root"], "workspaceRunnerReportFailure");
     assert_eq!(config["step"], 0);
     assert_eq!(config["options"], serde_json::json!({ "dpi": 150 }));
     assert!(
