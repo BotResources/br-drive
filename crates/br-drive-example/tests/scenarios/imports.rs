@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 use crate::harness::runner::{RUNNER_SCOPE, Report, finish_job, install_render_rule, report};
 use crate::harness::upload::{
-    UploadRequest, commit, post_bytes, request, sha256_hex, ticket, upload,
+    UploadRequest, commit, post_bytes, process, request, sha256_hex, ticket, upload,
+    upload_processed,
 };
 use crate::harness::{
     JobsStandIn, Subscription, World, drive_subscription, error_code, manager_passport,
@@ -195,7 +196,7 @@ async fn an_import_is_the_hosts_privilege_on_a_ready_file_and_obeys_every_rendit
     )
     .await;
     install_render_rule(&world, &manager).await;
-    let processing = upload(
+    let processing = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "busy.txt", BYTES),
@@ -299,7 +300,7 @@ async fn import_commit(world: &World, passport: &str, file_id: Uuid) -> serde_js
 }
 
 #[tokio::test]
-async fn a_migration_commits_an_upload_without_processing_under_an_upload_rule_then_imports_it() {
+async fn a_migration_commits_an_upload_under_an_upload_rule_then_imports_it() {
     // Given: the host already declared an upload rule for text files, the
     // host's migration account holding the import scope, and the owner watching
     let world = World::start("pod-import-commit").await;
@@ -438,13 +439,17 @@ async fn a_migration_commits_an_upload_without_processing_under_an_upload_rule_t
     assert_eq!(world.file_pages(&owner, file_id).await.len(), 1);
     jobs.expect_no_command(Duration::from_secs(1)).await;
 
-    // And: a normal commit is unchanged — an upload of the migration account
-    // committed the normal way runs the rule
+    // And: a normal commit never processes either — an upload of the migration
+    // account committed the normal way is READY, and runs the rule only when
+    // the owner asks for it
     let fresh = Uuid::now_v7();
     let fresh_request = UploadRequest::text(drive, "", "fresh.txt", BYTES);
     let fresh_ticket = ticket(&request(&world, &importer, fresh, &fresh_request).await);
     post_bytes(&world, &fresh_ticket, BYTES, fresh_request.name).await;
     ok(&commit(&world, &importer, fresh).await);
+    world.await_state(&owner, fresh, "READY").await;
+    jobs.expect_no_command(Duration::from_millis(600)).await;
+    ok(&process(&world, &owner, fresh).await);
     let fresh_job = jobs.await_create(fresh).await.job_id;
     world.await_state(&owner, fresh, "PROCESSING").await;
 
@@ -523,7 +528,7 @@ async fn the_hosts_own_object_republishes_as_the_files_of_its_drive_land_fail_mo
 
     // When: a second file enters a chain that fails
     install_render_rule(&world, &manager).await;
-    let doomed = upload(
+    let doomed = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(library, "", "doomed.txt", BYTES),
@@ -558,7 +563,7 @@ async fn the_hosts_own_object_republishes_as_the_files_of_its_drive_land_fail_mo
     counts_reach(&mut workspaces, library, 0, 0).await;
 
     // When: a file's chain finishes
-    let finished = upload(
+    let finished = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(library, "", "finished.txt", BYTES),

@@ -9,7 +9,7 @@ use br_core_integration::{
 };
 use chrono::Utc;
 use contract_jobs::catalog::{RunnerType, RunnerTypeLifecycle, runner_type_key};
-use contract_jobs::command::{CancelJob, CreateJob, FinishJob};
+use contract_jobs::command::{CancelJob, CreateJob, FailJob, FinishJob};
 use contract_jobs::event::{
     EVENT_TYPE_CANCELLED, EVENT_TYPE_COMPLETED, EVENT_TYPE_CREATION_REJECTED, EVENT_TYPE_FAILED,
     EVENT_TYPE_PLAN_DECLARED, EVENT_TYPE_QUEUED, EVENT_TYPE_STARTED, EVENT_TYPE_STEP_STARTED,
@@ -17,10 +17,10 @@ use contract_jobs::event::{
     JobQueued, JobStarted, JobStepStarted, REASON_DUPLICATE_ACTIVE_ENTITY, REASON_ID_REUSE,
 };
 use contract_jobs::{
-    CMD_JOB_CANCEL_V2, CMD_JOB_CREATE_V1, CMD_JOB_FINISH_V2, evt_job_cancelled_v1_coords,
-    evt_job_completed_v1_coords, evt_job_creation_rejected_v1_coords, evt_job_failed_v1_coords,
-    evt_job_plan_declared_v1_coords, evt_job_queued_v1_coords, evt_job_started_v1_coords,
-    evt_job_step_started_v1_coords,
+    CMD_JOB_CANCEL_V2, CMD_JOB_CREATE_V1, CMD_JOB_FAIL_V2, CMD_JOB_FINISH_V2,
+    evt_job_cancelled_v1_coords, evt_job_completed_v1_coords, evt_job_creation_rejected_v1_coords,
+    evt_job_failed_v1_coords, evt_job_plan_declared_v1_coords, evt_job_queued_v1_coords,
+    evt_job_started_v1_coords, evt_job_step_started_v1_coords,
 };
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -282,6 +282,12 @@ async fn drain(
                     .lock()
                     .expect("the ledger lock")
                     .settle(finish.job_id);
+                None
+            }
+            CMD_JOB_FAIL_V2 => {
+                let fail: FailJob =
+                    serde_json::from_value(payload.clone()).expect("a job.fail decodes");
+                ledger.lock().expect("the ledger lock").settle(fail.job_id);
                 None
             }
             CMD_JOB_CANCEL_V2 => {
@@ -772,6 +778,11 @@ impl JobsStandIn {
 
     pub async fn await_finish(&self, job_id: Uuid) -> FinishJob {
         self.await_command::<FinishJob>(CMD_JOB_FINISH_V2, |finish| finish.job_id == job_id)
+            .await
+    }
+
+    pub async fn await_fail(&self, job_id: Uuid) -> FailJob {
+        self.await_command::<FailJob>(CMD_JOB_FAIL_V2, |fail| fail.job_id == job_id)
             .await
     }
 

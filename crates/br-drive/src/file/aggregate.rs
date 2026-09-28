@@ -393,6 +393,16 @@ pub(crate) fn file_changed<H: DriveHost>(
     ops.impact_caused::<File, _>(&file.id, cause)
 }
 
+/// Stages the progress of `file`'s running job: its own views, with the
+/// `ProgressChanged` cause. The host object is not touched: progress never
+/// changes the drive's counts.
+pub(crate) fn file_progressed<H: DriveHost>(
+    ops: &mut service_engine::pipeline::Ops<'_>,
+    file: &FileRow<H>,
+) -> Result<(), service_engine::error::EngineError> {
+    ops.impact_caused::<File, _>(&file.id, FileCause::ProgressChanged)
+}
+
 /// Stages an impact on `file` without a cause: its views recompute, and a live
 /// session receives a delta only if what it shows changed — for a job log
 /// entry that may or may not show (a queued job, a late fact of an old job).

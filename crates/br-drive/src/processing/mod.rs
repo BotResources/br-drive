@@ -1,5 +1,6 @@
 //! The ruleset chain over Jobs: one job per step, staged through the engine
-//! outbox, advanced by Jobs' facts and the runner's final report.
+//! outbox, ended by the runner (its final report or its declared failure) and
+//! by Jobs' own terminal facts, whichever comes first.
 
 mod chain;
 mod commands;
@@ -7,8 +8,8 @@ mod log;
 mod reactions;
 mod roots;
 
-pub(crate) use chain::refresh_status;
-pub use chain::{ChainPlan, cancel_active_job, finish_job, start_chain, wipe_rendition};
+pub use chain::{ChainPlan, cancel_active_job, start_chain};
+pub(crate) use chain::{refresh_status, report_done, report_failed};
 pub use commands::Initiator;
 pub(crate) use commands::JobCancel;
 pub use log::{FileJob, RunProgress, kind as job_event};

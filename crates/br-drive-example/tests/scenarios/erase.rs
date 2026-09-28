@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::harness::archive::ARCHIVE_RUNNER_SCOPE;
 use crate::harness::runner::{RUNNER_SCOPE, Report, install_render_rule, report};
-use crate::harness::upload::{Ticket, UploadRequest, post_bytes, sha256_hex, upload};
+use crate::harness::upload::{Ticket, UploadRequest, post_bytes, sha256_hex, upload_processed};
 use crate::harness::{ArchiveHost, JobsStandIn, World, manager_passport, ok, service_passport};
 
 const BYTES: &[u8] = b"personal bytes";
@@ -26,7 +26,7 @@ async fn anonymising_a_person_rewrites_every_id_they_left_and_keeps_their_files(
     let runner = service_passport(&[RUNNER_SCOPE]);
     install_render_rule(&world, &person).await;
     let drive = world.create_workspace(&person, "mine").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &person,
         &UploadRequest::text(drive, "", "mine.txt", BYTES),
@@ -273,6 +273,14 @@ async fn archive_upload(
             world,
             owner,
             "mutation($f:UUID!){archiveVaultCommitUpload(fileId:$f){success}}",
+            serde_json::json!({ "f": file_id }),
+        )
+        .await);
+    ok(&archive
+        .gql(
+            world,
+            owner,
+            "mutation($f:UUID!){archiveVaultProcessFile(fileId:$f){success}}",
             serde_json::json!({ "f": file_id }),
         )
         .await);

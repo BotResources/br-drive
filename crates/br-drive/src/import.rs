@@ -1,6 +1,8 @@
 //! The host-privileged import: a rendition and its images written into a READY
 //! file without a runner and without a job — for a downstream project moving
 //! an existing corpus in, whose pages (human edits included) it already holds.
+//! A commit never processes, so `ImportCommit` differs from `CommitUpload`
+//! only by who may call it: the importer's scope and the host's own gate.
 //! Every import gesture asks the host (`DriveRequest::Import`, or
 //! `DriveRequest::ImportCommit` for the commit), so each host decides who may
 //! call them, and they write through the same paths a
@@ -16,6 +18,7 @@ use service_engine::pipeline::{Mutation, MutationInput, OneShot};
 use uuid::Uuid;
 
 use crate::fault::{DriveFault, codes};
+use crate::file::processed;
 use crate::file::rendition::{apply_indexing, validate_rendition};
 use crate::file::store::{self, PageWrite};
 use crate::file::{FileCause, FileRow, Page, PageCause, PageKey, PageOrigin};
@@ -48,11 +51,10 @@ impl MutationInput for ImportCommit {
 }
 
 /// Confirms a pending upload the way `CommitUpload` does — the object is
-/// present and is the pinned bytes — and lands the file READY without running
-/// any rule, even when an `upload` rule matches: the file's rendition comes
-/// from `ImportPages` / `ImportImage`, not from a runner. The same right as an
-/// import: the host's `IMPORT_SCOPE`, then its own `ImportCommit` gate on the
-/// pending row. A normal commit is unchanged.
+/// present and is the pinned bytes — and lands the file READY: the file's
+/// rendition comes from `ImportPages` / `ImportImage`, not from a runner. The
+/// same right as an import: the host's `IMPORT_SCOPE`, then its own
+/// `ImportCommit` gate on the pending row.
 pub fn import_commit<'m, H: DriveHost>(
     cx: &'m mut Mutation<'m, H>,
     input: ImportCommit,
@@ -175,6 +177,14 @@ pub fn import_pages<'m, H: DriveHost>(
         if let (Some(summary), Some(page_count)) = (input.summary, input.page_count)
             && apply_indexing(&mut file, summary, page_count, input.estimated_tokens)
         {
+            processed::store_indexing(
+                cx.connection(),
+                file.id,
+                file.summary.as_deref(),
+                file.page_count,
+                file.estimated_tokens,
+            )
+            .await?;
             file.updated_at = now;
             cx.save(&file).await?;
             crate::file::file_changed::<H>(cx, &file, FileCause::RenditionImported)?;

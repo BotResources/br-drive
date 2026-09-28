@@ -205,24 +205,23 @@ macro_rules! drive_slice {
                     &self,
                     ctx: &::async_graphql::Context<'_>,
                     file_id: ::uuid::Uuid,
-                    ruleset_id: ::core::option::Option<::uuid::Uuid>,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
                     ::service_engine::ack::<$p, $crate::CommitUpload>(
                         ctx,
-                        $crate::CommitUpload { file_id, ruleset_id },
+                        $crate::CommitUpload { file_id },
                     )
                     .await
                 }
 
-                async fn [<$prefix _process>](
+                async fn [<$prefix _process_file>](
                     &self,
                     ctx: &::async_graphql::Context<'_>,
                     file_id: ::uuid::Uuid,
                     ruleset_id: ::core::option::Option<::uuid::Uuid>,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
-                    ::service_engine::ack::<$p, $crate::Process>(
+                    ::service_engine::ack::<$p, $crate::ProcessFile>(
                         ctx,
-                        $crate::Process { file_id, ruleset_id },
+                        $crate::ProcessFile { file_id, ruleset_id },
                     )
                     .await
                 }
@@ -565,6 +564,26 @@ macro_rules! drive_slice {
                             page_count,
                             estimated_tokens,
                             done,
+                        },
+                    )
+                    .await
+                }
+
+                async fn [<$prefix _runner_report_failure>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    job_id: ::uuid::Uuid,
+                    reason_code: ::std::string::String,
+                    message: ::core::option::Option<::std::string::String>,
+                ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    ::service_engine::ack::<$p, $crate::RunnerReportFailure>(
+                        ctx,
+                        $crate::RunnerReportFailure {
+                            file_id,
+                            job_id,
+                            reason_code,
+                            message,
                         },
                     )
                     .await

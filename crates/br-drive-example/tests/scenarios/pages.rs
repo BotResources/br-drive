@@ -6,7 +6,7 @@ use crate::harness::runner::{
     RUNNER_SCOPE, Report, finish_job, install_regenerate_rule, install_render_rule, report,
     upload_image,
 };
-use crate::harness::upload::{UploadRequest, upload};
+use crate::harness::upload::{UploadRequest, upload_processed};
 use crate::harness::{
     JobsStandIn, PAGE_DELTAS, Subscription, World, drain_with_a_rename, drive_subscription,
     error_code, manager_passport, next_drive_delta, next_page_delta, ok, pages_reset,
@@ -42,7 +42,8 @@ async fn rendered_file(
     drive: Uuid,
     name: &str,
 ) -> Uuid {
-    let file_id = upload(world, owner, &UploadRequest::text(drive, "", name, SOURCE)).await;
+    let file_id =
+        upload_processed(world, owner, &UploadRequest::text(drive, "", name, SOURCE)).await;
     world.await_source_promoted(file_id).await;
     let job_id = world.await_job(file_id).await;
     ok(&report(
@@ -155,7 +156,7 @@ async fn a_long_report_reaches_the_page_window_page_by_page_and_never_rewrites_t
     let runner = service_passport(&[RUNNER_SCOPE]);
     let _rules = rules(&world).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "long.txt", SOURCE),
@@ -248,7 +249,7 @@ async fn a_page_window_follows_one_file_and_closes_when_the_file_leaves_the_owne
     install_regenerate_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
     let file_a = rendered_file(&world, &jobs, &owner, &runner, drive, "a.txt").await;
-    let file_b = upload(
+    let file_b = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "b.txt", SOURCE),
@@ -355,7 +356,7 @@ async fn regenerating_a_page_replaces_that_pages_images_by_name_and_releases_the
     let (jobs, manager) = rules(&world).await;
     install_regenerate_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "doc.txt", SOURCE),
@@ -489,7 +490,7 @@ async fn deleting_a_folder_releases_its_image_blobs_and_drops_its_pages() {
     let runner = service_passport(&[RUNNER_SCOPE]);
     let (jobs, _) = rules(&world).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "sub", "doc.txt", SOURCE),
@@ -506,7 +507,7 @@ async fn deleting_a_folder_releases_its_image_blobs_and_drops_its_pages() {
             pages: vec![(1, "![a](p001-img01.png)")],
             origin: None,
             indexer: None,
-            done: true,
+            done: false,
         },
     )
     .await);

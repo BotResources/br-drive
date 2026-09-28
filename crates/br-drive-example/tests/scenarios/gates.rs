@@ -7,7 +7,9 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::harness::runner::{RUNNER_SCOPE, install_render_rule};
-use crate::harness::upload::{UploadRequest, commit, post_bytes, request, ticket, upload};
+use crate::harness::upload::{
+    UploadRequest, commit, post_bytes, request, ticket, upload, upload_processed,
+};
 use crate::harness::{
     JobsStandIn, LABEL_DELTAS, Subscription, World, catalogue_subscription, drive_subscription,
     error_code, manager_passport, next_delta, next_drive_delta, ok, passport, quiet, refute_delta,
@@ -91,7 +93,7 @@ async fn code(
     error_code(&world.gql(passport, mutation, variables).await)
 }
 
-const PROCESS: &str = "mutation($f:UUID!){workspaceProcess(fileId:$f){success}}";
+const PROCESS: &str = "mutation($f:UUID!){workspaceProcessFile(fileId:$f){success}}";
 const EDIT_PAGE: &str =
     "mutation($f:UUID!){workspaceEditPage(fileId:$f,number:1,markdown:\"x\"){success}}";
 const REGENERATE: &str = "mutation($f:UUID!){workspaceRegeneratePage(fileId:$f,number:1){success}}";
@@ -126,7 +128,7 @@ async fn a_stranger_learns_nothing_of_a_file_it_cannot_see_and_changes_nothing()
     install_render_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
     let elsewhere = world.create_workspace(&stranger, "elsewhere").await;
-    let processing = upload(
+    let processing = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "busy.txt", BYTES),

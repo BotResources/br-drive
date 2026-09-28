@@ -4,6 +4,7 @@ mod delta;
 mod gestures;
 pub(crate) mod images;
 pub(crate) mod pages;
+pub(crate) mod processed;
 pub(crate) mod rendition;
 pub(crate) mod store;
 mod view;
@@ -12,12 +13,13 @@ pub use aggregate::{
     File, FileCause, FileRow, FileStatus, FileVisibility, PageOrigin, ProcessingState,
     UnknownDbValue,
 };
-pub(crate) use aggregate::{file_changed, file_touched};
+pub(crate) use aggregate::{file_changed, file_progressed, file_touched};
 pub use curation::{drive_of, set_metadata, set_protected};
 pub use delta::{DriveDelta, DriveRemove, DriveReset, DriveUpsert, DriveView};
 pub use gestures::{
-    CancelProcessing, DeleteFile, EditPage, Process, RegeneratePage, RetitleFile, UpdateFile,
-    cancel_processing, delete_file, edit_page, process, regenerate_page, retitle_file, update_file,
+    CancelProcessing, DeleteFile, EditPage, ProcessFile, RegeneratePage, RetitleFile, UpdateFile,
+    cancel_processing, delete_file, edit_page, process_file, regenerate_page, retitle_file,
+    update_file,
 };
 pub use images::{
     IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded,

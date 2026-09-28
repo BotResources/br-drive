@@ -143,3 +143,41 @@ pub async fn upload(world: &World, passport: &str, request: &UploadRequest<'_>) 
     );
     file_id
 }
+
+pub const PROCESS_FILE: &str =
+    "mutation($f:UUID!,$r:UUID){workspaceProcessFile(fileId:$f,rulesetId:$r){success}}";
+
+/// The user's `ProcessFile` gesture, with the default rule of its trigger.
+pub async fn process(world: &World, passport: &str, file_id: Uuid) -> serde_json::Value {
+    process_with(world, passport, file_id, None).await
+}
+
+/// The user's `ProcessFile` gesture with a rule of their choosing.
+pub async fn process_with(
+    world: &World,
+    passport: &str,
+    file_id: Uuid,
+    ruleset: Option<Uuid>,
+) -> serde_json::Value {
+    world
+        .gql(
+            passport,
+            PROCESS_FILE,
+            serde_json::json!({ "f": file_id, "r": ruleset }),
+        )
+        .await
+}
+
+/// An upload committed, then processed: what a front does right after the
+/// commit when its user wants the file processed.
+pub async fn upload_processed(world: &World, passport: &str, request: &UploadRequest<'_>) -> Uuid {
+    let file_id = upload(world, passport, request).await;
+    let processed = process(world, passport, file_id).await;
+    assert!(
+        processed.get("errors").is_none(),
+        "the process gesture is acked: {} ({})",
+        processed,
+        error_code(&processed)
+    );
+    file_id
+}

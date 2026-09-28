@@ -38,7 +38,7 @@ pub use file::{
     DrivePage, DrivePages, DriveProgress, DriveRemove, DriveReset, DriveUpsert, DriveView,
     DriveWindow, EDIT_PAGE_ACTION, EditPage, File, FileCause, FileRow, FileStatus, FileVisibility,
     IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded,
-    ImageRecord, Page, PageCause, PageKey, PageOrigin, PageWindow, Process, ProcessingState,
+    ImageRecord, Page, PageCause, PageKey, PageOrigin, PageWindow, ProcessFile, ProcessingState,
     REGENERATE_PAGE_ACTION, RegeneratePage, RetitleFile, RunnerPage, UnknownDbValue, UpdateFile,
     drive_of, references_image, set_metadata, set_protected,
 };
@@ -65,9 +65,9 @@ pub use ruleset::{
     RulesetSaved, RulesetStep, RulesetStepInput, Trigger, UpdateRuleset,
 };
 pub use runner::{
-    MAX_REPORT_PAGES, ReportedPage, ReportedPageInput, RunnerContext, RunnerReport,
-    RunnerRequestImageUpload, RunnerSource, RunnerSources, RunnerWindow, runner_context,
-    scoped_to_job,
+    MAX_FAILURE_MESSAGE_BYTES, MAX_FAILURE_REASON_BYTES, MAX_REPORT_PAGES, ReportedPage,
+    ReportedPageInput, RunnerContext, RunnerReport, RunnerReportFailure, RunnerRequestImageUpload,
+    RunnerSource, RunnerSources, RunnerWindow, runner_context, scoped_to_job,
 };
 pub use title::{FileTitle, InvalidTitle, MAX_TITLE_CHARS};
 pub use upload::{CommitUpload, RequestUpload, UploadTicket};

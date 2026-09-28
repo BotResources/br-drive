@@ -6,7 +6,9 @@ use uuid::Uuid;
 use crate::harness::runner::{
     INDEX, RENDER, RUNNER_SCOPE, Report, RuleSpec, context, create_ruleset, report, ruleset_id,
 };
-use crate::harness::upload::{UploadRequest, request, ticket, upload};
+use crate::harness::upload::{
+    UploadRequest, process, process_with, request, ticket, upload, upload_processed,
+};
 use crate::harness::{
     JobsStandIn, World, drive_subscription, error_code, manager_passport, next_drive_delta, ok,
     passport, service_passport,
@@ -62,7 +64,7 @@ async fn the_ruleset_chain_runs_step_by_step_over_jobs_facts_and_lands_ready() {
     let drive = world.create_workspace(&owner, "library").await;
     let mut files = drive_subscription(&world, &owner, drive).await;
 
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "report.txt", BYTES),
@@ -294,33 +296,21 @@ async fn a_variant_is_picked_by_id_the_catch_all_serves_other_media_types_and_mi
     let status =
         crate::harness::upload::post_bytes(&world, &picked_ticket, BYTES, "picked.txt").await;
     assert!((200..300).contains(&status));
-    let mismatch = world
-        .gql(
-            &owner,
-            "mutation($f:UUID!,$r:UUID){workspaceCommitUpload(fileId:$f,rulesetId:$r){success}}",
-            serde_json::json!({ "f": picked, "r": reprocess }),
-        )
-        .await;
+    ok(&crate::harness::upload::commit(&world, &owner, picked).await);
+    let mismatch = process_with(&world, &owner, picked, Some(reprocess)).await;
     assert_eq!(
         error_code(&mismatch),
         "RULESET_MISMATCH",
-        "a reprocess rule cannot serve an upload"
+        "a file that never had a job runs an upload rule: a reprocess rule cannot serve it"
     );
-    let unknown = world
-        .gql(
-            &owner,
-            "mutation($f:UUID!,$r:UUID){workspaceCommitUpload(fileId:$f,rulesetId:$r){success}}",
-            serde_json::json!({ "f": picked, "r": Uuid::now_v7() }),
-        )
-        .await;
+    let unknown = process_with(&world, &owner, picked, Some(Uuid::now_v7())).await;
     assert_eq!(error_code(&unknown), "RULESET_NOT_FOUND");
-    ok(&world
-        .gql(
-            &owner,
-            "mutation($f:UUID!,$r:UUID){workspaceCommitUpload(fileId:$f,rulesetId:$r){success}}",
-            serde_json::json!({ "f": picked, "r": variant }),
-        )
-        .await);
+    assert_eq!(
+        world.file(&owner, picked).await["processingState"],
+        "READY",
+        "a refused process leaves the file as it was"
+    );
+    ok(&process_with(&world, &owner, picked, Some(variant)).await);
     let create = jobs.await_create(picked).await;
     assert_eq!(create.runner_type, RENDER);
     assert_eq!(
@@ -356,6 +346,7 @@ async fn a_variant_is_picked_by_id_the_catch_all_serves_other_media_types_and_mi
         let status = crate::harness::upload::post_bytes(&world, &other_ticket, BYTES, name).await;
         assert!((200..300).contains(&status));
         ok(&crate::harness::upload::commit(&world, &owner, other).await);
+        ok(&process(&world, &owner, other).await);
         let create = jobs.await_create(other).await;
         assert_eq!(
             create.runner_type, expected_runner,
@@ -397,7 +388,7 @@ async fn a_rule_naming_a_runner_type_jobs_does_not_know_waits_for_the_users_canc
     let drive = world.create_workspace(&owner, "library").await;
 
     // When: a file is uploaded
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "ghostly.txt", BYTES),
@@ -443,7 +434,7 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
     let drive = world.create_workspace(&owner, "library").await;
     let mut files = drive_subscription(&world, &owner, drive).await;
 
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "flaky.txt", BYTES),
@@ -466,7 +457,7 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
     let no_rule = world
         .gql(
             &owner,
-            "mutation($f:UUID!){workspaceProcess(fileId:$f){success}}",
+            "mutation($f:UUID!){workspaceProcessFile(fileId:$f){success}}",
             serde_json::json!({ "f": file_id }),
         )
         .await;
@@ -489,7 +480,7 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
     ok(&world
         .gql(
             &owner,
-            "mutation($f:UUID!){workspaceProcess(fileId:$f){success}}",
+            "mutation($f:UUID!){workspaceProcessFile(fileId:$f){success}}",
             serde_json::json!({ "f": file_id }),
         )
         .await);
@@ -503,9 +494,10 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
         replayed["view"]["progress"]["stepCount"], 2,
         "with no reprocess rule the file replays its own snapshot"
     );
-    assert!(
-        world.file_pages(&owner, file_id).await.is_empty(),
-        "a reprocess wipes the rendition at chain start"
+    assert_eq!(
+        world.file_pages(&owner, file_id).await.len(),
+        1,
+        "nothing is wiped at chain start: the previous results stay readable"
     );
     let replay = jobs.await_create(file_id).await;
     assert_eq!(replay.runner_type, RENDER);
@@ -522,7 +514,7 @@ async fn a_failed_or_rejected_run_carries_its_reason_and_a_reprocess_starts_over
     ok(&world
         .gql(
             &owner,
-            "mutation($f:UUID!){workspaceProcess(fileId:$f){success}}",
+            "mutation($f:UUID!){workspaceProcessFile(fileId:$f){success}}",
             serde_json::json!({ "f": file_id }),
         )
         .await);
@@ -561,7 +553,7 @@ async fn a_foreign_cancel_fails_the_file_while_the_cancel_we_asked_for_is_absorb
     two_step_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
 
-    let foreign = upload(
+    let foreign = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "foreign.txt", BYTES),
@@ -572,7 +564,7 @@ async fn a_foreign_cancel_fails_the_file_while_the_cancel_we_asked_for_is_absorb
     let file = world.await_state(&owner, foreign, "FAILED").await;
     assert_eq!(file["processingError"], "cancelled");
 
-    let ours = upload(
+    let ours = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "ours.txt", BYTES),
@@ -624,7 +616,7 @@ async fn a_rule_edited_or_deleted_mid_chain_never_reaches_a_running_or_a_process
         "a rule never applies retroactively"
     );
 
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "running.txt", BYTES),
@@ -709,7 +701,7 @@ async fn every_jobs_fact_replayed_changes_nothing() {
     let runner = service_passport(&[RUNNER_SCOPE]);
     two_step_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "replayed.txt", BYTES),
@@ -857,7 +849,7 @@ async fn a_page_edit_during_processing_and_a_report_on_a_pending_file_are_refuse
         "a file that never landed has no job"
     );
 
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "busy.txt", BYTES),
@@ -918,13 +910,7 @@ async fn a_process_gesture_picks_the_given_rule_and_refuses_when_nothing_at_all_
     )
     .await;
     assert_eq!(world.file(&owner, plain).await["processingState"], "READY");
-    let nothing = world
-        .gql(
-            &owner,
-            "mutation($f:UUID!){workspaceProcess(fileId:$f){success}}",
-            serde_json::json!({ "f": plain }),
-        )
-        .await;
+    let nothing = process(&world, &owner, plain).await;
     assert_eq!(
         error_code(&nothing),
         "NO_RULESET_MATCHES",
@@ -932,7 +918,7 @@ async fn a_process_gesture_picks_the_given_rule_and_refuses_when_nothing_at_all_
     );
     assert_eq!(world.file(&owner, plain).await["processingState"], "READY");
 
-    let variant = ruleset_id(
+    let reprocess_variant = ruleset_id(
         &create_ruleset(
             &world,
             &manager,
@@ -940,19 +926,32 @@ async fn a_process_gesture_picks_the_given_rule_and_refuses_when_nothing_at_all_
                 name: "index again",
                 trigger: "REPROCESS",
                 media_types: &["text/plain"],
+                steps: &[(INDEX, serde_json::json!({ "again": true }))],
+                is_default: false,
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        error_code(&process_with(&world, &owner, plain, Some(reprocess_variant)).await),
+        "RULESET_MISMATCH",
+        "a file that never had a job is processed by an upload rule"
+    );
+    let variant = ruleset_id(
+        &create_ruleset(
+            &world,
+            &manager,
+            RuleSpec {
+                name: "index first",
+                trigger: "UPLOAD",
+                media_types: &["text/plain"],
                 steps: &[(INDEX, serde_json::json!({ "variant": true }))],
                 is_default: false,
             },
         )
         .await,
     );
-    ok(&world
-        .gql(
-            &owner,
-            "mutation($f:UUID!,$r:UUID){workspaceProcess(fileId:$f,rulesetId:$r){success}}",
-            serde_json::json!({ "f": plain, "r": variant }),
-        )
-        .await);
+    ok(&process_with(&world, &owner, plain, Some(variant)).await);
     let create = jobs.await_create(plain).await;
     assert_eq!(create.runner_type, INDEX);
     assert_eq!(
@@ -963,6 +962,22 @@ async fn a_process_gesture_picks_the_given_rule_and_refuses_when_nothing_at_all_
         world.file(&owner, plain).await["rulesetId"],
         variant.to_string(),
         "the given rule is the snapshot the file keeps"
+    );
+
+    // And: once the file had a job, the gesture runs a reprocess rule
+    jobs.fail(create.job_id, "runner_error", Some("try_again"))
+        .await;
+    world.await_state(&owner, plain, "FAILED").await;
+    assert_eq!(
+        error_code(&process_with(&world, &owner, plain, Some(variant)).await),
+        "RULESET_MISMATCH",
+        "an upload rule no longer serves a file that was processed"
+    );
+    ok(&process_with(&world, &owner, plain, Some(reprocess_variant)).await);
+    let again = jobs.await_create(plain).await;
+    assert_eq!(
+        again.config.as_ref().unwrap()["options"],
+        serde_json::json!({ "again": true })
     );
 
     world.cleanup().await;

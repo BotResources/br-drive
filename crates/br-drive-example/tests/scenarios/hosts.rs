@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::harness::archive::ARCHIVE_RUNNER_SCOPE;
 use crate::harness::runner::{RENDER, RUNNER_SCOPE, Report, install_render_rule, report};
-use crate::harness::upload::{Ticket, UploadRequest, post_bytes, sha256_hex, upload};
+use crate::harness::upload::{Ticket, UploadRequest, post_bytes, sha256_hex, upload_processed};
 use crate::harness::{ArchiveHost, JobsStandIn, World, manager_passport, ok, service_passport};
 
 const BYTES: &[u8] = b"two hosts, one broker";
@@ -48,6 +48,14 @@ async fn archive_upload(
             serde_json::json!({ "f": file_id }),
         )
         .await);
+    ok(&archive
+        .gql(
+            world,
+            owner,
+            "mutation($f:UUID!){archiveVaultProcessFile(fileId:$f){success}}",
+            serde_json::json!({ "f": file_id }),
+        )
+        .await);
     file_id
 }
 
@@ -74,7 +82,7 @@ async fn two_hosts_on_one_broker_each_receive_every_jobs_fact_about_their_own_jo
 
     let workspace_drive = world.create_workspace(&manager, "library").await;
     let archive_drive = archive.drive_for(archivist_id).await;
-    let workspace_file = upload(
+    let workspace_file = upload_processed(
         &world,
         &manager,
         &UploadRequest::text(workspace_drive, "", "ours.txt", BYTES),

@@ -12,14 +12,16 @@ use crate::harness::runner::{
     INDEX, RENDER, RUNNER_SCOPE, Report, RuleSpec, context, create_ruleset, finish_job,
     install_render_rule, report,
 };
-use crate::harness::upload::{UploadRequest, commit, post_bytes, request, ticket, upload};
+use crate::harness::upload::{
+    UploadRequest, commit, post_bytes, process, request, ticket, upload_processed,
+};
 use crate::harness::{
     JobsStandIn, World, drive_subscription, error_code, manager_passport, next_drive_delta, ok,
     passport, refute_delta, service_passport,
 };
 
 const BYTES: &[u8] = b"a document the runners never pick up";
-const PROCESS: &str = "mutation($f:UUID!){workspaceProcess(fileId:$f){success}}";
+const PROCESS: &str = "mutation($f:UUID!){workspaceProcessFile(fileId:$f){success}}";
 const CANCEL: &str = "mutation($f:UUID!){workspaceCancelProcessing(fileId:$f){success}}";
 
 async fn done(world: &World, jobs: &JobsStandIn, runner: &str, file_id: Uuid, job_id: Uuid) {
@@ -46,19 +48,42 @@ async fn cancel(world: &World, passport: &str, file_id: Uuid) -> serde_json::Val
 }
 
 #[tokio::test]
-async fn a_job_no_runner_picks_up_waits_until_the_user_cancels_it_then_can_be_reprocessed() {
-    // Given: a render rule whose runner type has no live instance
+async fn a_job_of_a_runner_type_jobs_never_declared_waits_until_the_user_cancels_it_then_can_be_reprocessed()
+ {
+    // Given: a render rule whose runner type Jobs never declared in its
+    // catalogue — the save warns about it, and saves the rule
     let world = World::start("pod-user-cancel").await;
     let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
     let stranger = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
-    install_render_rule(&world, &manager).await;
+    let saved = create_ruleset(
+        &world,
+        &manager,
+        RuleSpec {
+            name: "render text",
+            trigger: "UPLOAD",
+            media_types: &["text/plain"],
+            steps: &[(RENDER, serde_json::json!({}))],
+            is_default: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        ok(&saved)["workspaceCreateRuleset"]["unknownRunnerTypes"],
+        serde_json::json!([RENDER]),
+        "the catalogue copy knows no such type: a warning, not a refusal"
+    );
+    assert!(
+        world.runner_types(&manager).await.is_empty(),
+        "Jobs declared no runner type at all"
+    );
     let drive = world.create_workspace(&owner, "library").await;
 
-    // When: a file is uploaded and Jobs queues its job, which nobody picks up
-    let file_id = upload(
+    // When: a file is uploaded and processed, and Jobs queues its job — which
+    // it never dispatches, as it knows no such runner type
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "stuck.txt", BYTES),
@@ -215,7 +240,7 @@ async fn a_cancel_jobs_dropped_can_be_asked_again() {
     let owner = passport(Uuid::now_v7());
     install_render_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "twice.txt", BYTES),
@@ -263,17 +288,10 @@ async fn a_cancel_jobs_dropped_can_be_asked_again() {
     world.cleanup().await;
 }
 
-#[tokio::test]
-async fn a_cancel_that_crosses_a_steps_completion_stops_the_chain_there() {
-    // Given: a two-step rule, and a file whose first step's runner reported done
-    let world = World::start("pod-cancel-crossed").await;
-    let jobs = JobsStandIn::attach(&world).await;
-    let manager = manager_passport(Uuid::now_v7(), "Ada");
-    let owner = passport(Uuid::now_v7());
-    let runner = service_passport(&[RUNNER_SCOPE]);
+async fn two_step_rule(world: &World, manager: &str) {
     ok(&create_ruleset(
-        &world,
-        &manager,
+        world,
+        manager,
         RuleSpec {
             name: "render then index",
             trigger: "UPLOAD",
@@ -286,14 +304,32 @@ async fn a_cancel_that_crosses_a_steps_completion_stops_the_chain_there() {
         },
     )
     .await);
+}
+
+#[tokio::test]
+async fn a_cancel_that_crosses_a_steps_final_report_stops_the_chain_there() {
+    // Given: a two-step rule, and a file whose first step runs
+    let world = World::start("pod-cancel-crossed").await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let owner = passport(Uuid::now_v7());
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    two_step_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "crossed.txt", BYTES),
     )
     .await;
     let first = jobs.await_create(file_id).await.job_id;
+
+    // When: the owner cancels — the cancel is still on its way to Jobs — and
+    // the runner's final report lands before Jobs acts on it
+    jobs.drop_cancels(true);
+    ok(&cancel(&world, &owner, file_id).await);
+    jobs.await_cancel(first).await;
+    let mut files = drive_subscription(&world, &owner, drive).await;
     ok(&report(
         &world,
         &runner,
@@ -307,17 +343,9 @@ async fn a_cancel_that_crosses_a_steps_completion_stops_the_chain_there() {
         },
     )
     .await);
-    jobs.await_finish(first).await;
 
-    // When: the owner cancels while Jobs finishes the job — Jobs refuses to
-    // cancel a job it already finished and says nothing — then Jobs completes it
-    jobs.drop_cancels(true);
-    ok(&cancel(&world, &owner, file_id).await);
-    jobs.await_cancel(first).await;
-    let mut files = drive_subscription(&world, &owner, drive).await;
-    jobs.complete(first).await;
-
-    // Then: the chain stops there: FAILED `cancelled`, no second job asked for
+    // Then: the chain stops there: FAILED `cancelled`, Jobs is told the first
+    // job is done, and no second job is asked for
     let failed = next_drive_delta(&mut files, |node| {
         node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingFailed"
     })
@@ -325,6 +353,7 @@ async fn a_cancel_that_crosses_a_steps_completion_stops_the_chain_there() {
     assert_eq!(failed["cause"]["reason"], "cancelled");
     assert_eq!(failed["view"]["processingError"], "cancelled");
     assert_eq!(failed["view"]["affordances"]["process"]["allowed"], true);
+    jobs.await_finish(first).await;
     jobs.expect_no_command(Duration::from_secs(1)).await;
     let log = world.job_log(file_id).await;
     assert_eq!(log.len(), 2, "the step never started is recorded as such");
@@ -336,6 +365,88 @@ async fn a_cancel_that_crosses_a_steps_completion_stops_the_chain_there() {
         1,
         "the first step's work stays"
     );
+
+    // And: Jobs' own `completed` of the first job, arriving after, changes nothing
+    jobs.complete(first).await;
+    refute_delta(
+        &mut files,
+        "workspaceDriveChanged",
+        Duration::from_millis(800),
+        |node| node["view"]["processingState"] != "FAILED",
+    )
+    .await;
+    jobs.expect_no_command(Duration::from_millis(500)).await;
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_cancel_that_crosses_the_last_steps_final_report_leaves_the_file_ready() {
+    // Given: a one-step rule, and a file whose only step runs
+    let world = World::start("pod-cancel-crossed-last").await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let owner = passport(Uuid::now_v7());
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    install_render_rule(&world, &manager).await;
+    let drive = world.create_workspace(&owner, "library").await;
+    let file_id = upload_processed(
+        &world,
+        &owner,
+        &UploadRequest::text(drive, "", "last.txt", BYTES),
+    )
+    .await;
+    let only = jobs.await_create(file_id).await.job_id;
+
+    // When: the owner cancels, and the runner's final report lands before
+    // Jobs acts on the cancel
+    jobs.drop_cancels(true);
+    ok(&cancel(&world, &owner, file_id).await);
+    jobs.await_cancel(only).await;
+    let mut files = drive_subscription(&world, &owner, drive).await;
+    ok(&report(
+        &world,
+        &runner,
+        file_id,
+        Report {
+            job_id: only,
+            pages: vec![(1, "the whole work")],
+            origin: None,
+            indexer: None,
+            done: true,
+        },
+    )
+    .await);
+
+    // Then: nothing was left to stop — the work is done and the file READY
+    let finished = next_drive_delta(&mut files, |node| {
+        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingFinished"
+    })
+    .await;
+    assert_eq!(finished["view"]["processingState"], "READY");
+    assert!(finished["view"]["processingError"].is_null());
+    jobs.await_finish(only).await;
+
+    // And: Jobs' `cancelled`, arriving after, is logged and changes nothing
+    jobs.cancel(only).await;
+    crate::poll_until!(Duration::from_secs(15), {
+        (world.job_events(only).await.last().map(String::as_str) == Some("cancelled")).then_some(())
+    });
+    refute_delta(
+        &mut files,
+        "workspaceDriveChanged",
+        Duration::from_millis(800),
+        |node| node["view"]["processingState"] != "READY",
+    )
+    .await;
+    let file = world.file(&owner, file_id).await;
+    assert_eq!(file["processingState"], "READY");
+    assert_eq!(
+        file["affordances"]["cancelProcessing"]["reason"],
+        "FILE_NOT_PROCESSING"
+    );
+    assert_eq!(world.file_pages(&owner, file_id).await.len(), 1);
+    jobs.expect_no_command(Duration::from_millis(500)).await;
 
     world.cleanup().await;
 }
@@ -353,7 +464,7 @@ async fn a_runner_type_jobs_retired_fails_the_file_at_creation() {
     let mut files = drive_subscription(&world, &owner, drive).await;
 
     // When: a file is uploaded
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "retired.txt", BYTES),
@@ -378,7 +489,8 @@ async fn a_runner_type_jobs_retired_fails_the_file_at_creation() {
     world.cleanup().await;
 }
 
-/// A committed file whose job Jobs refused because Jobs still holds `stray` on it.
+/// A committed file whose first processing Jobs refused because Jobs still
+/// holds `stray` on it.
 async fn trapped(world: &World, jobs: &JobsStandIn, owner: &str, drive: Uuid) -> (Uuid, Uuid) {
     let upload_request = UploadRequest::text(drive, "", "restored.txt", BYTES);
     let file_id = Uuid::now_v7();
@@ -387,6 +499,7 @@ async fn trapped(world: &World, jobs: &JobsStandIn, owner: &str, drive: Uuid) ->
     let posted = post_bytes(world, &upload_ticket, BYTES, "restored.txt").await;
     assert!((200..300).contains(&posted), "the bytes land: {posted}");
     ok(&commit(world, owner, file_id).await);
+    ok(&process(world, owner, file_id).await);
     let (_, refusal) = jobs.await_refused_create(file_id).await;
     assert_eq!(refusal.reason_code, "duplicate_active_entity");
     assert_eq!(refusal.params["activeJobId"], stray.to_string());
@@ -482,7 +595,7 @@ async fn a_duplicate_rejection_naming_another_file_cancels_nothing() {
     let owner = passport(Uuid::now_v7());
     install_render_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "foreign.txt", BYTES),
@@ -553,7 +666,7 @@ async fn a_late_fact_of_an_old_job_changes_nothing() {
     let runner = service_passport(&[RUNNER_SCOPE]);
     install_render_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "busy.txt", BYTES),
@@ -665,7 +778,7 @@ async fn two_concurrent_reprocesses_of_one_file_start_exactly_one_job() {
     let owner = passport(Uuid::now_v7());
     install_render_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "race.txt", BYTES),
@@ -736,7 +849,7 @@ async fn what_the_chain_tells_jobs_is_always_something_jobs_accepts() {
     assert!(world.drive_files(&owner, drive).await.is_empty());
 
     // When: the owner uploads a file
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "notes.txt", BYTES),

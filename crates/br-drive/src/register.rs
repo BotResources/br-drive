@@ -4,9 +4,9 @@ use service_engine::error::EngineError;
 use crate::erase::DriveErasure;
 use crate::file::images::{IMAGE_LANDED_DURABLE, ImageLanded, image_landed};
 use crate::file::{
-    CancelProcessing, DeleteFile, DriveFiles, DrivePages, EditPage, Process, RegeneratePage,
-    RetitleFile, UpdateFile, cancel_processing, delete_file, edit_page, process, regenerate_page,
-    retitle_file, update_file,
+    CancelProcessing, DeleteFile, DriveFiles, DrivePages, EditPage, ProcessFile, RegeneratePage,
+    RetitleFile, UpdateFile, cancel_processing, delete_file, edit_page, process_file,
+    regenerate_page, retitle_file, update_file,
 };
 use crate::folders::{self, DeleteFolder, MoveFolder};
 use crate::host::DriveHost;
@@ -24,8 +24,8 @@ use crate::ruleset::{
     update_ruleset,
 };
 use crate::runner::{
-    RunnerReport, RunnerRequestImageUpload, RunnerSources, runner_report,
-    runner_request_image_upload,
+    RunnerReport, RunnerReportFailure, RunnerRequestImageUpload, RunnerSources, runner_report,
+    runner_report_failure, runner_request_image_upload,
 };
 use crate::upload::{self, CommitUpload, RequestUpload, UPLOAD_DEADLINE_DURABLE, UploadDeadline};
 
@@ -56,7 +56,7 @@ pub fn register<H: DriveHost>(
     engine.register_mutation::<RetitleFile, _>(retitle_file::<H>)?;
     engine.register_mutation::<DeleteFile, _>(delete_file::<H>)?;
     engine.register_mutation::<EditPage, _>(edit_page::<H>)?;
-    engine.register_mutation::<Process, _>(process::<H>)?;
+    engine.register_mutation::<ProcessFile, _>(process_file::<H>)?;
     engine.register_mutation::<CancelProcessing, _>(cancel_processing::<H>)?;
     engine.register_mutation::<RegeneratePage, _>(regenerate_page::<H>)?;
     engine.register_mutation::<CreateRuleset, _>(create_ruleset::<H>)?;
@@ -67,6 +67,7 @@ pub fn register<H: DriveHost>(
     engine.register_mutation::<SetFileLabels, _>(set_file_labels::<H>)?;
     engine.register_mutation::<RunnerRequestImageUpload, _>(runner_request_image_upload::<H>)?;
     engine.register_mutation::<RunnerReport, _>(runner_report::<H>)?;
+    engine.register_mutation::<RunnerReportFailure, _>(runner_report_failure::<H>)?;
     engine.register_mutation::<ImportPages, _>(import::import_pages::<H>)?;
     engine.register_mutation::<ImportImage, _>(import::import_image::<H>)?;
     let reader = engine.blob_reader();

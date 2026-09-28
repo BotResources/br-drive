@@ -4,7 +4,7 @@ use contract_jobs::catalog::RunnerTypeLifecycle;
 use uuid::Uuid;
 
 use crate::harness::runner::{INDEX, RENDER, RuleSpec, create_ruleset, ruleset_id};
-use crate::harness::upload::{UploadRequest, upload};
+use crate::harness::upload::{UploadRequest, upload, upload_processed};
 use crate::harness::{
     JobsStandIn, RULESET_DELTAS, World, WorldOptions, catalogue_subscription, error_code,
     manager_passport, next_delta, ok, passport, service_passport,
@@ -591,7 +591,7 @@ async fn a_host_without_the_catalogue_watch_warns_every_step_and_still_launches(
 
     // When: a file is uploaded
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "blind.txt", BYTES),

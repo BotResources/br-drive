@@ -1,18 +1,18 @@
-use contract_jobs::command::{CancelJob, CreateJob, FinishJob};
+use contract_jobs::command::{CancelJob, CreateJob, FailJob, FinishJob};
 use service_engine::BlobRef;
 use service_engine::error::EngineError;
+use service_engine::impact::Dims;
 use service_engine::pipeline::Ops;
 use uuid::Uuid;
 
-use super::commands::{Initiator, JobCancel, JobCreate, JobFinish};
-use super::log::{FileJob, insert_job};
+use super::commands::{Initiator, JobCancel, JobCreate, JobFail, JobFinish};
+use super::log::{FileJob, append, entry, insert_job, kind};
 use super::roots::roots;
 use crate::fault::{DriveFault, codes};
 use crate::file::images::drop_images;
-use crate::file::store;
-use crate::file::{FileCause, FileRow};
+use crate::file::{FileCause, FileRow, Page, PageKey, processed, store};
 use crate::host::DriveHost;
-use crate::ruleset::{RulesetRow, RulesetStep};
+use crate::ruleset::{RulesetRow, RulesetStep, Trigger};
 
 fn merge_options(base: &serde_json::Value, extra: &serde_json::Value) -> serde_json::Value {
     let mut merged = match base {
@@ -56,21 +56,6 @@ impl ChainPlan {
     }
 }
 
-pub async fn wipe_rendition<H: DriveHost>(
-    cx: &mut Ops<'_>,
-    file: &mut FileRow<H>,
-) -> Result<(), DriveFault> {
-    store::delete_pages(cx.connection(), file.id).await?;
-    let names = crate::file::images::image_names_of(cx.connection(), file.id).await?;
-    for reference in drop_images(cx.connection(), file.id, &names).await? {
-        cx.release_blob(BlobRef(reference))?;
-    }
-    file.summary = None;
-    file.page_count = None;
-    file.estimated_tokens = None;
-    Ok(())
-}
-
 /// Reads the file's status again after the library wrote its job log in this
 /// transaction, so the rest of the gesture sees what the view now computes.
 pub(crate) async fn refresh_status<H>(
@@ -89,6 +74,7 @@ async fn launch_step<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
     index: usize,
+    trigger: Option<Trigger>,
     initiator: Option<Initiator>,
 ) -> Result<Option<Uuid>, DriveFault> {
     let steps = file.steps.clone().unwrap_or_default();
@@ -102,6 +88,7 @@ async fn launch_step<H: DriveHost>(
     let job = FileJob {
         job_id: Uuid::now_v7(),
         step_index,
+        trigger,
         triggered_by: initiator,
         events: Vec::new(),
         created_at: cx.now().as_datetime(),
@@ -156,48 +143,144 @@ fn live_job_taken(error: EngineError) -> DriveFault {
     }
 }
 
+/// Starts a chain on a READY or FAILED file: the plan becomes the file's
+/// snapshot and its first step a job. Nothing of the previous results is
+/// touched — they stay readable while the new run reports over them.
 pub async fn start_chain<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
     plan: ChainPlan,
+    trigger: Trigger,
     initiator: Initiator,
 ) -> Result<(), DriveFault> {
     file.ruleset_id = plan.ruleset_id;
     file.steps = Some(plan.steps);
     file.updated_at = cx.now().as_datetime();
     cx.save(file).await?;
-    let Some(job_id) = launch_step(cx, file, 0, Some(initiator)).await? else {
+    let Some(job_id) = launch_step(cx, file, 0, Some(trigger), Some(initiator)).await? else {
         return Err(DriveFault::Refused(codes::INVALID_RULESET));
     };
     crate::file::file_changed::<H>(cx, file, FileCause::ProcessingStarted { job_id, step: 0 })?;
     Ok(())
 }
 
-/// The file's last job completed: the next step is launched, or the chain is
-/// over and the file is READY (its last job's outcome is `completed`). A
-/// user's cancel that crossed the completion (Jobs refuses to cancel a job it
-/// already finished, and says nothing) stops the chain there: the next step is
-/// recorded as never started, `cancelled`, and no job is asked for.
-pub(crate) async fn advance<H: DriveHost>(
+/// The runner's final report ended `job`, the file's running job, in the
+/// report's transaction: `reported_done` is logged (the job settles), Jobs is
+/// told (`job.finish`), and the chain moves on — the next step's job, or the
+/// end of the chain (READY). Jobs' own `completed` then only confirms it. A
+/// user's cancel that crossed the report stops the chain there: the next step
+/// is recorded as never started, `cancelled`; on the last step there is
+/// nothing left to stop and the file is READY.
+pub(crate) async fn report_done<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
-    completed: &FileJob,
+    job: &FileJob,
 ) -> Result<(), DriveFault> {
-    let next = usize::try_from(completed.step_index).unwrap_or(0) + 1;
+    let now = cx.now().as_datetime();
+    append(
+        cx.connection(),
+        job.job_id,
+        entry(kind::REPORTED_DONE, now, serde_json::json!({}))?,
+    )
+    .await?;
+    finish_job(cx, job.job_id)?;
+    let next = usize::try_from(job.step_index).unwrap_or(0) + 1;
     let has_next = file.steps.as_ref().is_some_and(|steps| next < steps.len());
-    if completed.cancel_requested() && has_next {
-        return stop_before(cx, file, next, completed).await;
+    if job.cancel_requested() && has_next {
+        return stop_before(cx, file, next, job).await;
     }
-    let cause = match launch_step(cx, file, next, completed.triggered_by.clone()).await? {
+    let cause = match launch_step(cx, file, next, job.trigger, job.triggered_by.clone()).await? {
         Some(job_id) => FileCause::ProcessingStarted {
             job_id,
             step: i32::try_from(next).unwrap_or(i32::MAX),
         },
-        None => FileCause::ProcessingFinished,
+        None => {
+            refresh_status(cx, file).await?;
+            conclude::<H>(cx, file).await?;
+            FileCause::ProcessingFinished
+        }
     };
-    file.updated_at = cx.now().as_datetime();
+    file.updated_at = now;
     cx.save(file).await?;
     crate::file::file_changed::<H>(cx, file, cause)?;
+    Ok(())
+}
+
+/// The chain is over: the pages numbered above the file's page count go —
+/// edited ones included — and so do the images no page references any more.
+/// What the run did not report again stays as it was.
+async fn conclude<H: DriveHost>(cx: &mut Ops<'_>, file: &FileRow<H>) -> Result<(), DriveFault> {
+    if let Some(page_count) = file.page_count {
+        // A trimmed page leaves its live windows: the engine delivers the
+        // `DriveRemove` by repopulation, without a cause.
+        for number in processed::trim_pages(cx.connection(), file.id, page_count).await? {
+            cx.impact::<Page>(
+                &PageKey {
+                    file_id: file.id,
+                    number,
+                },
+                Dims::ALL,
+            )?;
+        }
+    }
+    let unreferenced = processed::unreferenced_images(cx.connection(), file.id).await?;
+    if unreferenced.is_empty() {
+        return Ok(());
+    }
+    for reference in drop_images(cx.connection(), file.id, &unreferenced).await? {
+        cx.release_blob(BlobRef(reference))?;
+    }
+    crate::file::file_changed::<H>(
+        cx,
+        file,
+        FileCause::ImagesDropped {
+            names: unreferenced,
+        },
+    )?;
+    Ok(())
+}
+
+/// The runner declared `job`, the file's running job, failed: the declaration
+/// is logged with its reason (the job settles, the file is FAILED with that
+/// reason) and Jobs is told (`job.fail`). The results reported so far stay.
+pub(crate) async fn report_failed<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    file: &mut FileRow<H>,
+    job: &FileJob,
+    reason_code: &str,
+    message: Option<&str>,
+) -> Result<(), DriveFault> {
+    let now = cx.now().as_datetime();
+    append(
+        cx.connection(),
+        job.job_id,
+        entry(
+            kind::REPORTED_FAILED,
+            now,
+            serde_json::json!({ "reason_code": reason_code, "message": message }),
+        )?,
+    )
+    .await?;
+    let note = match message {
+        Some(message) => format!("{reason_code}: {message}"),
+        None => reason_code.to_string(),
+    };
+    cx.command(JobFail {
+        payload: FailJob {
+            job_id: job.job_id,
+            note: Some(note),
+        },
+    })?;
+    refresh_status(cx, file).await?;
+    file.updated_at = now;
+    cx.save(file).await?;
+    crate::file::file_changed::<H>(
+        cx,
+        file,
+        FileCause::ProcessingFailed {
+            reason: reason_code.to_string(),
+        },
+    )?;
     Ok(())
 }
 
@@ -207,15 +290,16 @@ async fn stop_before<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
     next: usize,
-    completed: &FileJob,
+    ended: &FileJob,
 ) -> Result<(), DriveFault> {
     let now = cx.now().as_datetime();
     let stopped = FileJob {
         job_id: Uuid::now_v7(),
         step_index: i32::try_from(next).unwrap_or(i32::MAX),
-        triggered_by: completed.triggered_by.clone(),
-        events: vec![super::log::entry(
-            super::log::kind::CANCELLED,
+        trigger: ended.trigger,
+        triggered_by: ended.triggered_by.clone(),
+        events: vec![entry(
+            kind::CANCELLED,
             now,
             serde_json::json!({ "before_start": true }),
         )?],
@@ -250,7 +334,7 @@ pub fn cancel_active_job<H: DriveHost>(
     Ok(())
 }
 
-pub fn finish_job(cx: &mut Ops<'_>, job_id: Uuid) -> Result<(), DriveFault> {
+fn finish_job(cx: &mut Ops<'_>, job_id: Uuid) -> Result<(), DriveFault> {
     cx.command(JobFinish {
         payload: FinishJob { job_id },
     })?;

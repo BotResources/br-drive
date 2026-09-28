@@ -10,11 +10,13 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use super::commands::Initiator;
+use crate::ruleset::Trigger;
 
-/// The kinds of the log's entries: the eight Jobs facts, plus
-/// `cancel_requested`, which only the library writes. The library also writes
-/// `cancelled` itself on the row of a step it never started because a user's
-/// cancel crossed the previous step's completion.
+/// The kinds of the log's entries: the eight Jobs facts, plus what only the
+/// library writes — `reported_done` and `reported_failed` (the runner's own
+/// end of the job, told through the host), `cancel_requested` (a user's
+/// cancel). The library also writes `cancelled` itself on the row of a step it
+/// never started because a user's cancel crossed the previous step's end.
 pub mod kind {
     pub const QUEUED: &str = "queued";
     pub const CREATION_REJECTED: &str = "creation_rejected";
@@ -26,6 +28,10 @@ pub mod kind {
     pub const CANCELLED: &str = "cancelled";
     /// A user asked to cancel the job; Jobs confirms with `cancelled`.
     pub const CANCEL_REQUESTED: &str = "cancel_requested";
+    /// The runner's final report: the job's end (terminal).
+    pub const REPORTED_DONE: &str = "reported_done";
+    /// The runner declared the job failed, with its reason (terminal).
+    pub const REPORTED_FAILED: &str = "reported_failed";
 }
 
 /// One job of a file, as the file's reads see it: the last one carries the
@@ -35,6 +41,9 @@ pub struct FileJob {
     pub job_id: Uuid,
     /// The index of the chain step the job runs, in the file's `steps`.
     pub step_index: i32,
+    /// The gesture that started the job's chain; `None` for a job carried
+    /// over from 0.1.
+    pub trigger: Option<Trigger>,
     /// The principal whose gesture started the chain, as sent to Jobs.
     pub triggered_by: Option<Initiator>,
     /// The log, in arrival order: `{kind, at, ...payload}`.
@@ -134,6 +143,7 @@ pub(crate) async fn insert_job(
     file_id: Uuid,
     job: &FileJob,
 ) -> Result<(), EngineError> {
+    let trigger = job.trigger.map(Trigger::as_str);
     let triggered_by = job
         .triggered_by
         .as_ref()
@@ -144,12 +154,14 @@ pub(crate) async fn insert_job(
             source,
         })?;
     sqlx::query(
-        "INSERT INTO drive.file_job (job_id, file_id, step_index, triggered_by, events, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO drive.file_job \
+           (job_id, file_id, step_index, trigger, triggered_by, events, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(job.job_id)
     .bind(file_id)
     .bind(job.step_index)
+    .bind(trigger)
     .bind(triggered_by)
     .bind(serde_json::Value::Array(job.events.clone()))
     .bind(job.created_at)
@@ -197,6 +209,7 @@ mod tests {
         FileJob {
             job_id: Uuid::now_v7(),
             step_index: 0,
+            trigger: None,
             triggered_by: None,
             events,
             created_at: Utc::now(),

@@ -13,31 +13,43 @@ use crate::host::{DRIVE_DIM, DriveHost};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
 use crate::processing::FileJob;
+use crate::ruleset::Trigger;
 use crate::title::FileTitle;
 
 /// The columns of `drive.file` itself, in insert order.
 pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, title, protected, media_type, size_bytes, sha256, blob_ref, \
-     committed_at, metadata, summary, page_count, estimated_tokens, ruleset_id, steps, \
-     created_by, created_at, updated_at";
+     committed_at, metadata, ruleset_id, steps, created_by, created_at, updated_at";
+
+/// The columns of `drive.file_processed` a file row reads beside its own: what
+/// the workers produced (absent until the first result).
+const RESULT_COLUMNS: &str = "summary, page_count, estimated_tokens";
 
 /// The columns of `drive.file_status` a file row reads beside its own: the
 /// computed state and error, and the file's last job.
 const STATUS_COLUMNS: &str = "processing_state, processing_error, last_job_id, last_job_step, \
-     last_job_triggered_by, last_job_events, last_job_created_at";
+     last_job_trigger, last_job_triggered_by, last_job_events, last_job_created_at";
 
-/// The file table joined to its computed status, aliased `f` and `s`.
-pub(crate) const FILE_FROM: &str = "drive.file f JOIN drive.file_status s ON s.file_id = f.id";
+/// The file table joined to its computed status and to its results, aliased
+/// `f`, `s` and `r`.
+pub(crate) const FILE_FROM: &str = "drive.file f JOIN drive.file_status s ON s.file_id = f.id \
+     LEFT JOIN drive.file_processed r ON r.file_id = f.id";
 
 /// The select list of a file row read through `FILE_FROM`, every column
 /// named `{prefix}{column}`.
 pub(crate) fn file_select(prefix: &str) -> String {
-    let file = FILE_COLUMNS
-        .split(", ")
-        .map(|column| format!("f.{column} AS {prefix}{column}", column = column.trim()));
-    let status = STATUS_COLUMNS
-        .split(", ")
-        .map(|column| format!("s.{column} AS {prefix}{column}", column = column.trim()));
-    file.chain(status).collect::<Vec<_>>().join(", ")
+    let aliased = |alias: &'static str, columns: &'static str| {
+        columns.split(", ").map(move |column| {
+            format!(
+                "{alias}.{column} AS {prefix}{column}",
+                column = column.trim()
+            )
+        })
+    };
+    aliased("f", FILE_COLUMNS)
+        .chain(aliased("r", RESULT_COLUMNS))
+        .chain(aliased("s", STATUS_COLUMNS))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The library is the only writer of these columns; a value that does not
@@ -93,11 +105,17 @@ pub(crate) fn row_to_file_prefixed<H>(
     let last_job = match last_job_id {
         Some(job_id) => {
             let events: Option<serde_json::Value> = row.get(column("last_job_events").as_str());
+            let trigger: Option<String> = row.get(column("last_job_trigger").as_str());
             Some(FileJob {
                 job_id,
                 step_index: row
                     .get::<Option<i32>, _>(column("last_job_step").as_str())
                     .unwrap_or_default(),
+                trigger: trigger
+                    .as_deref()
+                    .map(Trigger::from_db_str)
+                    .transpose()
+                    .map_err(config_error)?,
                 triggered_by: decode_json(
                     "a job's initiator",
                     row.get(column("last_job_triggered_by").as_str()),
@@ -221,9 +239,8 @@ impl<H: DriveHost> Persistence for FileStore<H> {
         Box::pin(async move {
             sqlx::query(
                 "UPDATE drive.file SET drive_id = $2, path = $3, name = $4, protected = $5, \
-                   committed_at = $6, metadata = $7, summary = $8, page_count = $9, \
-                   estimated_tokens = $10, updated_at = $11, ruleset_id = $12, steps = $13, \
-                   title = $14 \
+                   committed_at = $6, metadata = $7, updated_at = $8, ruleset_id = $9, \
+                   steps = $10, title = $11 \
                  WHERE id = $1",
             )
             .bind(file.id)
@@ -233,9 +250,6 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.protected)
             .bind(file.committed_at)
             .bind(&file.metadata)
-            .bind(&file.summary)
-            .bind(file.page_count)
-            .bind(file.estimated_tokens)
             .bind(file.updated_at)
             .bind(file.ruleset_id)
             .bind(encode_json("a file's steps snapshot", file.steps.as_ref())?)
@@ -255,7 +269,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             sqlx::query(&format!(
                 "INSERT INTO drive.file ({FILE_COLUMNS}) VALUES \
                  ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                  $16, $17, $18, $19, $20)"
+                  $16, $17)"
             ))
             .bind(file.id)
             .bind(file.drive_id)
@@ -269,9 +283,6 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.blob_ref)
             .bind(file.committed_at)
             .bind(&file.metadata)
-            .bind(&file.summary)
-            .bind(file.page_count)
-            .bind(file.estimated_tokens)
             .bind(file.ruleset_id)
             .bind(encode_json("a file's steps snapshot", file.steps.as_ref())?)
             .bind(file.created_by)
@@ -349,14 +360,6 @@ pub async fn image_refs_of_files(
         })
         .flatten()
         .collect())
-}
-
-pub async fn delete_pages(conn: &mut PgConnection, file_id: Uuid) -> Result<u64, EngineError> {
-    let done = sqlx::query("DELETE FROM drive.file_page WHERE file_id = $1")
-        .bind(file_id)
-        .execute(conn)
-        .await?;
-    Ok(done.rows_affected())
 }
 
 pub async fn ids_in_drives(
@@ -482,6 +485,7 @@ pub async fn upsert_pages(
     if pages.is_empty() {
         return Ok(());
     }
+    super::processed::ensure(conn, file_id).await?;
     let numbers: Vec<i32> = pages.iter().map(|page| page.number).collect();
     let markdowns: Vec<&str> = pages.iter().map(|page| page.markdown).collect();
     let origins: Vec<&str> = pages.iter().map(|page| page.origin.as_str()).collect();

@@ -44,6 +44,7 @@ pub mod codes {
     pub const NO_RULESET_MATCHES: Reason = Reason::new("NO_RULESET_MATCHES");
     pub const FILE_PROCESSING: Reason = Reason::new("FILE_PROCESSING");
     pub const FILE_NOT_PROCESSING: Reason = Reason::new("FILE_NOT_PROCESSING");
+    pub const INVALID_FAILURE_REASON: Reason = Reason::new("INVALID_FAILURE_REASON");
     pub const LABEL_NOT_FOUND: Reason = Reason::new("LABEL_NOT_FOUND");
     pub const LABEL_NAME_TAKEN: Reason = Reason::new("LABEL_NAME_TAKEN");
     pub const INVALID_LABEL: Reason = Reason::new("INVALID_LABEL");

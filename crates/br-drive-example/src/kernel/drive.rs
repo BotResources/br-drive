@@ -83,8 +83,8 @@ impl DriveHost for AppPrincipal {
             DriveRequest::CreateFile { .. } if self.is_importer() => {
                 return Gate::allowed();
             }
-            // It commits only the uploads it made itself — the normal way,
-            // or without processing.
+            // It commits only the uploads it made itself — the normal way, or
+            // through its import privilege.
             DriveRequest::CommitUpload { file }
                 if self.is_importer() && file.created_by == self.id().as_uuid() =>
             {

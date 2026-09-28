@@ -19,8 +19,6 @@ use crate::file::{FileCause, FileRow, FileStatus};
 use crate::host::{DriveHost, DriveRequest};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
-use crate::processing;
-use crate::ruleset::{Trigger, select_ruleset};
 use crate::title::FileTitle;
 
 pub const UPLOAD_DEADLINE_AGGREGATE: &str = "drive_file";
@@ -152,7 +150,6 @@ pub fn request_upload<'m, H: DriveHost>(
 #[derive(Debug, Deserialize)]
 pub struct CommitUpload {
     pub file_id: Uuid,
-    pub ruleset_id: Option<Uuid>,
 }
 
 impl MutationInput for CommitUpload {
@@ -161,6 +158,9 @@ impl MutationInput for CommitUpload {
     const NAME: &'static str = "drive_commit_upload";
 }
 
+/// Confirms a pending upload: the object is present and is the pinned bytes
+/// (a live storage HEAD), and the file is READY — stored, not processed.
+/// Processing is a gesture of its own (`ProcessFile`), right after or never.
 pub fn commit_upload<'m, H: DriveHost>(
     cx: &'m mut Mutation<'m, H>,
     input: CommitUpload,
@@ -176,22 +176,8 @@ pub fn commit_upload<'m, H: DriveHost>(
         let now = cx.now().as_datetime();
         file.committed_at = Some(now);
         file.updated_at = now;
-        let ruleset = select_ruleset(
-            cx.connection(),
-            Trigger::Upload,
-            &file.media_type,
-            input.ruleset_id,
-        )
-        .await?;
+        cx.save(&file).await?;
         crate::file::file_changed::<H>(cx, &file, FileCause::UploadCommitted)?;
-        match ruleset {
-            Some(ruleset) => {
-                let initiator = processing::Initiator::of(cx.principal());
-                let plan = processing::ChainPlan::from_ruleset(&ruleset, None);
-                processing::start_chain(cx, &mut file, plan, initiator).await?;
-            }
-            None => cx.save(&file).await?,
-        }
         Ok(())
     })
 }
