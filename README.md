@@ -24,7 +24,7 @@ The workspace's MSRV is Rust 1.94 — the floor of the pinned `contract-jobs`
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.2.0", version = "0.2.0" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.2.1", version = "0.2.1" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -325,7 +325,7 @@ runner reports and never interprets a media type.
 | `<p>RunnerReportFailure(fileId, jobId, reasonCode, message?): MutationAck!` | the runner declares its job failed: the same runner-scope and running-job checks as a report; `reasonCode` is a code, `[a-z][a-z0-9_]*` up to 128 bytes, `message` free text up to 4 KiB (`INVALID_FAILURE_REASON` otherwise). The job ends there: the file is `FAILED` with `reasonCode` as its `processingError` (`ProcessingFailed { reason }`), `job.fail.v2` is staged with `"{reasonCode}: {message}"` as its note, and what the run reported so far stays readable. |
 
 The job. Every runner root validates `jobId` against the file's running job —
-the last job of its log while the file is `PROCESSING` (`JOB_NOT_ACTIVE` for
+the file's last job while the file is `PROCESSING` (`JOB_NOT_ACTIVE` for
 any other job, for a file that never landed, and for a file that is not
 `PROCESSING`). The runner declares the end of its job through the host, never
 only to Jobs: `done: true` on the report ends it (the chain moves on at once,
@@ -410,9 +410,10 @@ snapshot taken when the rule fired.
 
 The chain, one step at a time, in the library's own transactions:
 
-1. a step is a **job**: the library mints a UUIDv7 `job_id`, records it in the
-   file's job log (`drive.file_job`: the job, its step index, the gesture
-   that started its chain, its initiator, an empty log) and stages
+1. a step is a **job**: the library mints a UUIDv7 `job_id`, records that
+   the job was created (`drive.file_job`: the file's next job number, the
+   job, its chain step, the gesture that started its chain, its initiator)
+   and stages
    `integration.cmd.jobs.job.create.v1` through the engine outbox in the same
    transaction: `producer`, `source_bc` and `config.host` are the host
    service, `source_entity_id` is the file (so Jobs enforces one live job per
@@ -425,57 +426,72 @@ The chain, one step at a time, in the library's own transactions:
    owned by the host (Jobs refuses a terminal parent, and a live one would
    make the step the parent runner's work);
 2. **the runner ends the job**, through the host: its final report
-   (`done: true`) logs `reported_done` on the job and, in the same
+   (`done: true`) records the job's end, `reported_done`, and, in the same
    transaction, creates the next step's job or — past the last step — ends
    the chain (`READY`, `ProcessingFinished`), and stages `job.finish.v2`; its
-   declared failure (`<p>RunnerReportFailure`) logs `reported_failed` with
-   its reason, lands the file `FAILED` with that code (`ProcessingFailed {
+   declared failure (`<p>RunnerReportFailure`) records the end
+   `reported_failed` with its reason, lands the file `FAILED` with that code (`ProcessingFailed {
    reason }`) and stages `job.fail.v2`. A refusal of that `job.finish` by Jobs
    (a job it had already cancelled or failed) changes nothing: the file stays
-   as the runner reported it, and Jobs' own terminal fact is logged;
+   as the runner reported it, and Jobs' own terminal fact is not recorded:
+   the job had already ended;
 3. the eight `integration.evt.jobs.job.*.v1` facts are consumed on eight
    durables named `{service}-drive-job-…` (every durable the library binds,
    the `upload-deadline` and `image-landed` ones included, is namespaced by
    `DriveHost::SERVICE`, so N hosts on one cluster never share a consumer).
-   Each fact is **appended to the log of its own job** — `{kind, at,
-   ...the fact's payload as received}`, in arrival order — after the job's
-   file row is locked; a fact about a job no file holds is acknowledged and
-   ignored, so every fact can be redelivered. Only the file's **last** job,
-   while it runs, moves the file: `plan_declared` fills `progress.plan` and
-   `step_started` moves `progress.currentIndex / currentLabel / at` (the
-   latest start wins, whatever the arrival order; `ProgressChanged` only when
-   the progress moved, and never on the host object: progress changes no
-   count); `creation_rejected` / `failed` land `FAILED` with the reason code
-   (`ProcessingFailed { reason }`), `cancelled` lands `FAILED` `cancelled` —
-   the safety net for a runner that crashed, a user's cancel, a job Jobs
-   refused. Jobs' `completed` only confirms the library's own `job.finish`: it
-   is logged and changes nothing. A fact of an older job — or a fact of the
-   last job after its first terminal entry (Jobs' facts ride separate
-   durables, and the runner's end is written before Jobs hears of it) — is
-   logged and changes nothing;
+   Each fact is handled after its job's file row is locked; a fact about a
+   job no file holds is acknowledged and ignored, so every fact can be
+   redelivered. Only the file's **running** job — its last one, not ended —
+   moves the file: `plan_declared` records a plan (`drive.file_job_plan`;
+   the latest declaration is `progress.plan`, a redelivered one adds
+   nothing) and `step_started` a step of a run (`drive.file_job_step`, one
+   row per run and plan index; the latest start is `progress.currentIndex /
+   currentLabel / at`, whatever the arrival order); `ProgressChanged` only
+   when the progress moved, and never on the host object: progress changes
+   no count. `creation_rejected` / `failed` record the job's end with the
+   reason code and land it `FAILED` (`ProcessingFailed { reason }`),
+   `cancelled` lands it `FAILED` `cancelled` — the safety net for a runner
+   that crashed, a user's cancel, a job Jobs refused. A job ends once
+   (`drive.file_job_end`, one row per job): an end arriving after the first
+   (Jobs' facts ride separate durables, and the runner's end is written
+   before Jobs hears of it) is not recorded and changes nothing; progress of
+   a job that no longer runs is not recorded either. Jobs' `queued`,
+   `started` and `completed` are read by nothing — `completed` only confirms
+   the library's own `job.finish` — and are acknowledged without a trace;
 4. a user's cancel that crossed a step's final report (the cancel was still
    on its way to Jobs when the report landed) stops the chain there: the next
-   step is recorded as a job row of its own, never sent to Jobs, whose only
-   entry is the library's `cancelled`, and the file lands `FAILED`
+   step is recorded as a job row of its own, never sent to Jobs, ended at
+   once by the library's `cancelled`, and the file lands `FAILED`
    `cancelled`. A cancel that crossed the **last** step's final report has
    nothing left to stop: the work is done and the file is `READY`; Jobs'
-   `cancelled`, if it comes, is logged and changes nothing.
+   `cancelled`, if it comes, changes nothing.
 
-The state is **computed, never stored**. The `drive.file_status` view reads
-each file's last job (the last recorded, by an identity sequence Postgres
-assigns — never by the pods' clocks): no job and no `committed_at` →
-`PENDING`; no job and `committed_at` set → `READY` (a stored, unprocessed
-file is ready); a last job whose first terminal entry is `reported_done` →
-`READY` (the next step's job is appended in the transaction that logs the
-report, so a done last job means the chain is over); `reported_failed`,
-`failed`, `cancelled` or `creation_rejected` → `FAILED`, `processingError`
-read from that entry (the runner's declared `reasonCode`; a Jobs failure's
-`failure_report.reason_code`, else its `failure_cause`; a rejection's
-`reason_code`; `cancelled`); anything else, or an empty log → `PROCESSING`.
-Every gate, affordance, view and the `file_counts` helper read it; a gesture
-locks the file row before reading it, so two gestures never both see the
-same last job, and a partial unique index keeps at most one unsettled job per
-file whatever happens. `ruleset_id` and `steps` stay on the File for replay;
+The state is **computed, never stored**, from which fact rows exist — the
+shape Jobs gives its own ledger, one insert-only table per fact:
+
+| Table | The fact | Key |
+|---|---|---|
+| `drive.file_job` | the job was created: its chain `step_index`, `trigger`, initiator (`triggered_by_id`, `triggered_by_name`), `created_at` | `(file_id, number)`, `number` 1, 2, 3… per file; `job_id` unique |
+| `drive.file_job_end` | the job ended: `kind` (`reported_done`, `reported_failed`, `failed`, `cancelled`, `creation_rejected`), `reason_code` (required for a failure or a rejection), `message`, `at` | `job_id`: the first end wins |
+| `drive.file_job_cancel` | a user asked to cancel it: `requested_by`, `at` | `(job_id, number)` |
+| `drive.file_job_plan` | its runner declared a plan: `run_id`, `labels`, `declared_at` | `(job_id, number)`; the highest is current |
+| `drive.file_job_step` | its runner started a step of its plan: `label`, `started_at` | `(job_id, run_id, plan_index)` |
+
+The `drive.file_status` view reads each file's last job (its highest
+`number`) and that job's end: no job and no `committed_at` → `PENDING`; no job
+and `committed_at` set → `READY` (a stored, unprocessed file is ready); no end
+→ `PROCESSING`; an end `reported_done` → `READY` (the next step's job is
+created in the transaction that records the end, so a done last job means the
+chain is over); any other end → `FAILED`, `processingError` its reason (the
+runner's declared `reasonCode`; a Jobs failure's `failure_report.reason_code`,
+else its `failure_cause`; a rejection's `reason_code`; `cancelled`). Every
+gate, affordance, view and the `file_counts` helper read it. A job number is
+assigned max + 1 under the file's row lock, which every writer of a file's
+jobs takes first — a gesture locks the file row before reading its status, so
+two gestures never both see the same last job — and a new job is only ever
+created once the file's last job ended: at most one job runs per file. Should
+a writer ever skip the lock, the `(file_id, number)` primary key refuses the
+second job (`FILE_PROCESSING`). `ruleset_id` and `steps` stay on the File for replay;
 `progress` is `null` outside `PROCESSING`. `updatedAt` moves on every write
 that changes the status (a settling Jobs fact, a cancel request, the
 runner's end), never on a progress fact.
@@ -569,7 +585,8 @@ the engine's `PersonErased` fact. `DriveHost::erase_mode` picks the mode:
 
 - `Anonymise` (default): every `created_by` / `updated_by` the person left on
   drives, files, pages, labels, label links and rules, and the `triggered_by`
-  of the jobs they started (on the job log), is rewritten to `br_drive::REDACTED_PERSON`
+  of the jobs they started and the `requested_by` of the cancels they asked
+  for, is rewritten to `br_drive::REDACTED_PERSON`
   (the nil UUID); nothing is deleted.
 - `Delete`: every file the person created is deleted (its pages, images and
   label links cascade, its objects are purged through the manifest), then the
@@ -600,7 +617,7 @@ and changes nothing.
 `LABEL_NOT_FOUND`, `LABEL_NAME_TAKEN`,
 `INVALID_LABEL`, `INVALID_FAILURE_REASON` — plus the host's own codes through
 the gate and the hooks. On a `FAILED` file, `processingError` carries, from
-the entry that settled the file's last job: the `reasonCode` the runner
+the end of the file's last job (`drive.file_job_end`): the `reasonCode` the runner
 declared through `<p>RunnerReportFailure`, verbatim; the `reason_code` of the
 failure report a runner sent Jobs, else Jobs' `failure_cause`; Jobs'
 `creation_rejected` code (e.g. `duplicate_active_entity`,
@@ -633,17 +650,14 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
 - The catalogue watch receives every put of the whole `PUBLISHED_LANGUAGE`
   bucket and keeps the `jobs.runner_type.` keys client-side: the engine's KV
   facade has no prefix watch yet (an engine ask).
-- The job log is kept whole and forever: every fact rewrites the job's
-  `events` array (`events || entry`), and the reads of a `PROCESSING` file
-  decode its running job's log to compute `progress`. Fine for a handful of
-  steps and a few facts per step; a runner reporting per-page steps, or a
-  file reprocessed many times, wants a retention rule (settled jobs beyond
-  the last few) or a compaction of the progress entries (the last
-  `plan_declared`, the latest `step_started`).
+- The job fact tables are kept forever, a few rows per job (insert-only,
+  never rewritten). A file reprocessed many times, or a runner reporting
+  per-page steps, may want a retention rule later (the progress rows of
+  ended jobs are never read).
 - A job Jobs holds on a file the library cannot tell about is cancelled only
   on a `duplicate_active_entity` rejection: nothing polls Jobs. A manual
   retry of a failed job in Jobs is not followed either — the file settled on
-  the job's first terminal entry (`FAILED`), later facts are logged only, and
+  the job's first end (`FAILED`), a later end is not recorded, and
   the runner of the retried run is refused `JOB_NOT_ACTIVE`; the user
   reprocesses instead.
 - A file whose running job Jobs holds as settled or does not know (a restored
@@ -651,7 +665,7 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
   never confirmed. A host-privileged gesture settling such a job locally is
   not written yet; deleting the file is the way out.
 - A runner report the library refuses (an invalid batch, say) is a refused
-  mutation: its transaction rolls back, so nothing is logged on the job; the
+  mutation: its transaction rolls back, so nothing is recorded on the job; the
   runner may then declare its failure (`<p>RunnerReportFailure`).
 - The Jobs double serializes the commands it reads, so the crossing of a
   `job.cancel` and a `job.create` on Jobs' separate durables is modelled by
