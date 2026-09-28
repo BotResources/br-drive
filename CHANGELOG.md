@@ -111,7 +111,9 @@ single git tag `v{version}` releases the set. Format follows
   `<p>RunnerReportFailure`, see Added) logs `reported_failed` and stages
   `job.fail.v2`. Jobs' own `failed`, `cancelled` and `creation_rejected` stay
   terminal, the safety net for a runner that crashed or a user's cancel. A
-  replayed final report meets a job that no longer runs (`JOB_NOT_ACTIVE`).
+  job ends once: a replayed final report meets a job that no longer runs
+  (`JOB_NOT_ACTIVE`, nothing changes) — a runner retrying its final report
+  after a lost ack takes `JOB_NOT_ACTIVE` as success.
 - **Committing and processing are two gestures.** `CommitUpload` only
   confirms the upload (the storage check, `committed_at`): the file is
   `READY`, stored and unprocessed, whatever rule matches. `<p>ProcessFile`
@@ -244,12 +246,6 @@ single git tag `v{version}` releases the set. Format follows
   `cancelled`; one that crosses the last step's final report has nothing
   left to stop — the file is `READY`. The example host exposes it to a
   workspace's owner.
-- `<p>ImportCommit(fileId)`: commits a pending upload the way `CommitUpload`
-  does — the file lands `READY`, no rule runs — for a migration account: the
-  same right as an import (`IMPORT_SCOPE`), then a gate of its own, the new
-  `DriveRequest::ImportCommit { file }` on the pending row (its uploader
-  included), then `FILE_NOT_PENDING` and the commit's storage check
-  (`UPLOAD_NOT_LANDED`).
 - `br_drive::create_unowned_drive::<H>(ops, id, created_by)`, for a host whose
   `DriveOwner` is `NoDriveOwner` only.
 - A host-privileged **import** of an existing rendition:
@@ -262,7 +258,11 @@ single git tag `v{version}` releases the set. Format follows
   through the same upsert and the same impacts as a runner report
   (`Imported { origin }` on the pages, `RenditionImported` on the file); the
   image reuses the verified runner image path. The runner's image staging
-  and rendition validation are shared with it.
+  and rendition validation are shared with it. The migration commits its
+  uploads with the ordinary `<p>CommitUpload` — a commit never processes, so
+  no commit of its own is needed: the host's `CommitUpload { file }` gate lets
+  its importer (`DriveHost::is_importer`) through for the uploads it made, as
+  the example host does.
 - `DriveHost::DriveOwner`: a host names its own noun type, keyed by the
   drive id (`impl br_drive::DriveOwnerNoun for Its {}`), or
   `br_drive::NoDriveOwner`; every file change the library stages also
@@ -348,8 +348,8 @@ single git tag `v{version}` releases the set. Format follows
   `<p>ProcessFile`; `DriveRequest::Process { file }` is now also asked for a
   file's first processing. A runner may declare its failure through
   `<p>RunnerReportFailure` instead of failing its run with Jobs; a runner
-  that retried a lost final report gets `JOB_NOT_ACTIVE` once the first one
-  landed.
+  that retries a final report after a lost ack gets `JOB_NOT_ACTIVE` once the
+  first one landed, and must take it as success.
 - `DriveRequest::CancelProcessing { file }` is new: decide it explicitly (a
   wildcard arm answers it). A host that started `br_drive::watch_runner_types`
   keeps it (optional, information only); one that set `PICKUP_TIMEOUT` / `STEP_TIMEOUT` drops them.
@@ -368,9 +368,9 @@ single git tag `v{version}` releases the set. Format follows
   decision of each file under the prefix: a host whose per-file rule is
   stricter than its folder rule sees folder gestures refused with that rule's
   code where they went through before.
-- `<p>ImportCommit` is new: it needs `IMPORT_SCOPE` and the host's new
-  `DriveRequest::ImportCommit { file }` — decide it explicitly (a wildcard
-  arm answers it); the row carries the uploader.
+- A migration commits its uploads with the ordinary `CommitUpload`: let the
+  migration account through `CommitUpload { file }` (`is_importer()`, and
+  `file.created_by` for the uploads it made).
   `DriveRequest::Import { file }` is new; an import additionally needs
   `IMPORT_SCOPE`, so a host that sets none offers no import whatever its
   gate answers.

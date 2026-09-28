@@ -433,17 +433,6 @@ impl<H: DriveHost> FileRow<H> {
         ready(self, principal, DriveRequest::Import { file: self })
     }
 
-    /// The host's `ImportCommit` gate, then a PENDING file: a migration's
-    /// commit is an import's privilege (`<p>ImportCommit`).
-    pub fn import_commit_gate(&self, principal: &H) -> Gate {
-        host_then(
-            self,
-            principal,
-            DriveRequest::ImportCommit { file: self },
-            || (self.status.state != ProcessingState::Pending).then_some(codes::FILE_NOT_PENDING),
-        )
-    }
-
     pub fn read_gate(&self, principal: &H) -> Gate {
         host_gate(self, principal, &DriveRequest::ReadFile { file: self })
     }

@@ -25,8 +25,10 @@ pub enum DriveRequest<'a, H> {
         media_type: &'a MediaType,
         size: u64,
     },
-    /// Confirming a pending upload: the row carries its uploader
-    /// (`created_by`), so a host can reserve the commit to them.
+    /// Confirming a pending upload (`<p>CommitUpload`), the one commit
+    /// gesture: the row carries its uploader (`created_by`), so a host can
+    /// reserve the commit to them — its migration account (`is_importer`)
+    /// included, for the uploads it made.
     CommitUpload {
         file: &'a FileRow<H>,
     },
@@ -80,13 +82,6 @@ pub enum DriveRequest<'a, H> {
     Import {
         file: &'a FileRow<H>,
     },
-    /// Committing a PENDING upload through the import privilege
-    /// (`<p>ImportCommit`), by a principal holding `IMPORT_SCOPE`: the pending
-    /// row carries its uploader, so a host can reserve it to the uploads its
-    /// migration made.
-    ImportCommit {
-        file: &'a FileRow<H>,
-    },
     /// Reading the host's label catalogue, live included.
     ReadLabels,
     /// Writing a file's free `metadata` through `br_drive::set_metadata`.
@@ -108,7 +103,6 @@ impl<H> DriveRequest<'_, H> {
             | Self::DeleteFile { file }
             | Self::RetitleFile { file }
             | Self::Import { file }
-            | Self::ImportCommit { file }
             | Self::Process { file }
             | Self::CancelProcessing { file }
             | Self::EditPage { file }
@@ -151,10 +145,11 @@ pub trait DriveHost: Principal {
     fn visible_drives(&self) -> Vec<Uuid>;
 
     /// The scope a service account must hold to import a rendition into a
-    /// file (`<p>ImportPages`, `<p>ImportImage`) or to commit an upload without
-    /// processing (`<p>ImportCommit`); `None` (the default) means
+    /// file (`<p>ImportPages`, `<p>ImportImage`); `None` (the default) means
     /// the host offers no import. The host's `DriveRequest::Import` gate then
-    /// decides file by file.
+    /// decides file by file. A migration commits its uploads with the
+    /// ordinary `<p>CommitUpload`: the host's `CommitUpload { file }` gate
+    /// lets its importer (`is_importer`) through for the uploads it made.
     const IMPORT_SCOPE: Option<&'static str> = None;
 
     fn is_importer(&self) -> bool {

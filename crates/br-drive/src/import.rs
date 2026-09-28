@@ -1,16 +1,15 @@
 //! The host-privileged import: a rendition and its images written into a READY
 //! file without a runner and without a job — for a downstream project moving
 //! an existing corpus in, whose pages (human edits included) it already holds.
-//! A commit never processes, so `ImportCommit` differs from `CommitUpload`
-//! only by who may call it: the importer's scope and the host's own gate.
-//! Every import gesture asks the host (`DriveRequest::Import`, or
-//! `DriveRequest::ImportCommit` for the commit), so each host decides who may
-//! call them, and they write through the same paths a
-//! commit and a runner report do, so the views learn of every change.
+//! The migration commits its uploads with the ordinary `CommitUpload` (a commit
+//! never processes): the host's `CommitUpload { file }` gate lets its importer
+//! (`DriveHost::is_importer`) through for the uploads it made. Every import
+//! gesture asks the host (`DriveRequest::Import`), so each host decides who
+//! may call them, and they write through the same paths a runner report does,
+//! so the views learn of every change.
 
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
-use service_engine::BlobReader;
 use service_engine::blobs::Sha256Digest;
 use service_engine::pipeline::{Mutation, MutationInput, OneShot};
 use uuid::Uuid;
@@ -24,7 +23,7 @@ use crate::host::DriveHost;
 use crate::image::ImageName;
 use crate::media::MediaType;
 use crate::runner::stage_image;
-use crate::upload::{UploadTicket, require_landed};
+use crate::upload::UploadTicket;
 
 /// The library's own opt-in, before the host's per-file decision: only a
 /// service account holding the host's `IMPORT_SCOPE` imports, and a host that
@@ -35,44 +34,6 @@ fn importer_only<H: DriveHost>(principal: &H) -> Result<(), DriveFault> {
     } else {
         Err(DriveFault::Refused(codes::IMPORT_SCOPE_REQUIRED))
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ImportCommit {
-    pub file_id: Uuid,
-}
-
-impl MutationInput for ImportCommit {
-    type Output = ();
-    type Error = DriveFault;
-    const NAME: &'static str = "drive_import_commit";
-}
-
-/// Confirms a pending upload the way `CommitUpload` does — the object is
-/// present and is the pinned bytes — and lands the file READY: the file's
-/// rendition comes from `ImportPages` / `ImportImage`, not from a runner. The
-/// same right as an import: the host's `IMPORT_SCOPE`, then its own
-/// `ImportCommit` gate on the pending row.
-pub fn import_commit<'m, H: DriveHost>(
-    cx: &'m mut Mutation<'m, H>,
-    input: ImportCommit,
-    reader: BlobReader,
-) -> BoxFuture<'m, Result<(), DriveFault>> {
-    Box::pin(async move {
-        importer_only(cx.principal())?;
-        let mut file = cx
-            .load::<FileRow<H>>(&input.file_id)
-            .await?
-            .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
-        file.import_commit_gate(cx.principal()).require()?;
-        require_landed(&reader, &file).await?;
-        let now = cx.now().as_datetime();
-        file.committed_at = Some(now);
-        file.updated_at = now;
-        cx.save(&file).await?;
-        crate::file::file_changed::<H>(cx, &file, FileCause::UploadCommitted)?;
-        Ok(())
-    })
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -94,6 +94,37 @@ async fn the_runners_final_report_lands_the_file_ready_without_waiting_for_jobs(
         "JOB_NOT_ACTIVE"
     );
 
+    // When: the runner, whose ack got lost, sends the same final report again
+    let replayed = report(
+        &world,
+        &runner,
+        file_id,
+        Report {
+            job_id: job,
+            pages: vec![(1, "the only page")],
+            origin: None,
+            indexer: Some(("One page.", 1, 7)),
+            done: true,
+        },
+    )
+    .await;
+
+    // Then: the job no longer runs — `JOB_NOT_ACTIVE`, which a retrying runner
+    // takes as success — and nothing moves, nothing more is told to Jobs
+    assert_eq!(error_code(&replayed), "JOB_NOT_ACTIVE");
+    files.expect_silence(Duration::from_millis(600)).await;
+    jobs.expect_no_command(Duration::from_millis(300)).await;
+    assert_eq!(
+        world
+            .job_events(job)
+            .await
+            .iter()
+            .filter(|kind| *kind == "reported_done")
+            .count(),
+        1,
+        "the job ended once"
+    );
+
     // When: Jobs confirms, then says it again
     jobs.complete(job).await;
     jobs.complete(job).await;
