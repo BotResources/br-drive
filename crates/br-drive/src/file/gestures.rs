@@ -331,7 +331,7 @@ impl MutationInput for CancelProcessing {
 }
 
 /// Asks Jobs to cancel the job running on a PROCESSING file. The request is
-/// logged on the job (`cancel_requested`) and the file stays PROCESSING until
+/// recorded on the job (`drive.file_job_cancel`) and the file stays PROCESSING until
 /// Jobs confirms with `cancelled`, which lands it FAILED `cancelled`, open to
 /// a reprocess. Asking again sends the cancel again — Jobs may not have
 /// consumed the job's creation yet when the first one reaches it.
@@ -348,12 +348,9 @@ pub fn cancel_processing<'m, H: DriveHost>(
         let Some(job_id) = file.active_job().map(|job| job.job_id) else {
             return Err(DriveFault::Refused(codes::FILE_NOT_PROCESSING));
         };
-        let entry = processing::job_entry(
-            processing::job_event::CANCEL_REQUESTED,
-            cx.now().as_datetime(),
-            serde_json::json!({}),
-        )?;
-        processing::append_job_event(cx.connection(), job_id, entry).await?;
+        let requested_by = cx.principal().id().as_uuid();
+        let now = cx.now().as_datetime();
+        processing::request_cancel(cx.connection(), job_id, requested_by, now).await?;
         cx.command(processing::JobCancel {
             payload: CancelJob { job_id },
         })?;

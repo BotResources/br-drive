@@ -15,7 +15,8 @@ use crate::file::{File, FileCause};
 use crate::host::DriveHost;
 
 /// The person id every anonymised `created_by` / `updated_by` / `triggered_by`
-/// is rewritten to: the nil UUID, which no real principal carries.
+/// / `requested_by` is rewritten to: the nil UUID, which no real principal
+/// carries.
 pub const REDACTED_PERSON: Uuid = Uuid::nil();
 
 /// What the library does with a person's rows when the host erases them.
@@ -62,28 +63,27 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
     // so the rewrites below — new statements, after the lock — see that job.
     sqlx::query(
         "SELECT id FROM drive.file WHERE id IN \
-           (SELECT file_id FROM drive.file_job WHERE triggered_by ->> 'id' = $1::text) \
+           (SELECT file_id FROM drive.file_job WHERE triggered_by_id = $1) \
          ORDER BY id FOR UPDATE",
     )
     .bind(person)
     .execute(&mut *conn)
     .await?;
     let done = sqlx::query(
-        "UPDATE drive.file_job SET triggered_by = jsonb_set(triggered_by, '{id}', to_jsonb($2::text)) \
-         WHERE triggered_by ->> 'id' = $1::text",
+        "UPDATE drive.file_job SET triggered_by_id = $2, triggered_by_name = NULL \
+         WHERE triggered_by_id = $1",
     )
     .bind(person)
     .bind(REDACTED_PERSON)
     .execute(&mut *conn)
     .await?;
     rows += done.rows_affected();
-    let done = sqlx::query(
-        "UPDATE drive.file_job SET triggered_by = triggered_by - 'display_name' || '{\"display_name\": null}'::jsonb \
-         WHERE triggered_by ->> 'id' = $1::text",
-    )
-    .bind(REDACTED_PERSON)
-    .execute(conn)
-    .await?;
+    let done =
+        sqlx::query("UPDATE drive.file_job_cancel SET requested_by = $2 WHERE requested_by = $1")
+            .bind(person)
+            .bind(REDACTED_PERSON)
+            .execute(conn)
+            .await?;
     rows += done.rows_affected();
     Ok(rows)
 }

@@ -115,31 +115,18 @@ async fn the_runners_final_report_lands_the_file_ready_without_waiting_for_jobs(
     files.expect_silence(Duration::from_millis(600)).await;
     jobs.expect_no_command(Duration::from_millis(300)).await;
     assert_eq!(
-        world
-            .job_events(job)
-            .await
-            .iter()
-            .filter(|kind| *kind == "reported_done")
-            .count(),
-        1,
-        "the job ended once"
+        world.job_end(job).await,
+        Some(("reported_done".to_string(), None)),
+        "the job ended once, with the runner's final report"
     );
 
     // When: Jobs confirms, then says it again
-    jobs.complete(job).await;
-    jobs.complete(job).await;
+    let confirmed = [jobs.complete(job).await, jobs.complete(job).await];
 
     // Then: nothing moves — the confirmation is information only
-    crate::poll_until!(Duration::from_secs(15), {
-        (world
-            .job_events(job)
-            .await
-            .iter()
-            .filter(|kind| *kind == "completed")
-            .count()
-            == 2)
-            .then_some(())
-    });
+    for message in confirmed {
+        world.await_consumed(message).await;
+    }
     refute_delta(
         &mut files,
         "workspaceDriveChanged",
@@ -267,12 +254,17 @@ async fn a_runners_declared_failure_fails_the_file_with_its_code_and_tells_jobs(
     );
 
     // When: Jobs' own `failed` follows — with its cause, not the runner's code
-    jobs.fail(job, "DECLARED_BY_OWNER", None).await;
+    let late = jobs.fail(job, "DECLARED_BY_OWNER", None).await;
 
-    // Then: it is logged and changes nothing
-    crate::poll_until!(Duration::from_secs(15), {
-        (world.job_events(job).await.last().map(String::as_str) == Some("failed")).then_some(())
-    });
+    // Then: it changes nothing — the runner's end came first and stays
+    world.await_consumed(late).await;
+    assert_eq!(
+        world.job_end(job).await,
+        Some((
+            "reported_failed".to_string(),
+            Some("unreadable_scan".to_string())
+        ))
+    );
     refute_delta(
         &mut files,
         "workspaceDriveChanged",
@@ -343,25 +335,22 @@ async fn a_jobs_failure_after_the_runners_final_report_changes_nothing() {
 
     // When: Jobs says the first job failed (a finish it refused, a late
     // backstop) — and cancelled, and completed
-    jobs.fail(first, "RUN_TIMED_OUT", Some("too_slow")).await;
-    jobs.cancel(first).await;
-    jobs.complete(first).await;
-
-    // Then: the facts are logged on the first job and the file does not move:
-    // still PROCESSING its second step, which still opens the file
-    let mut expected = vec![
-        "cancelled",
-        "completed",
-        "failed",
-        "queued",
-        "reported_done",
+    let late = [
+        jobs.fail(first, "RUN_TIMED_OUT", Some("too_slow")).await,
+        jobs.cancel(first).await,
+        jobs.complete(first).await,
     ];
-    expected.sort_unstable();
-    crate::poll_until!(Duration::from_secs(15), {
-        let mut events = world.job_events(first).await;
-        events.sort_unstable();
-        (events == expected).then_some(())
-    });
+
+    // Then: once they are consumed, the first job's end is still the runner's
+    // and the file does not move: still PROCESSING its second step, which
+    // still opens the file
+    for message in late {
+        world.await_consumed(message).await;
+    }
+    assert_eq!(
+        world.job_end(first).await,
+        Some(("reported_done".to_string(), None))
+    );
     refute_delta(
         &mut files,
         "workspaceDriveChanged",

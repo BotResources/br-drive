@@ -13,7 +13,7 @@ pub(crate) use chain::{refresh_status, report_done, report_failed};
 pub use commands::Initiator;
 pub(crate) use commands::JobCancel;
 pub use log::{FileJob, RunProgress, kind as job_event};
-pub(crate) use log::{append as append_job_event, entry as job_entry};
+pub(crate) use log::{RunningFacts, request_cancel};
 pub use reactions::{
     CancelledFact, CompletedFact, CreationRejectedFact, DURABLE_CANCELLED, DURABLE_COMPLETED,
     DURABLE_CREATION_REJECTED, DURABLE_FAILED, DURABLE_PLAN_DECLARED, DURABLE_QUEUED,

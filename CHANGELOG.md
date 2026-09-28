@@ -9,6 +9,61 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.2.1 — 2026-09-28
+
+### Changed
+
+- **The job log is typed, insert-only fact tables** (migration `9121000009`),
+  the shape Jobs gives its own ledger; nothing is stored that is a state or
+  derives one. 0.2.0's `drive.file_job.seq` (a global order), `events` (a
+  jsonb array rewritten on every fact) and `outcome` (a stored generated
+  column) are gone, and so is the partial "one live job" index:
+  - `drive.file_job` — the job was created: `file_id`, `number` (1, 2, 3… per
+    file, assigned max + 1 under the file's row lock), `job_id` (unique),
+    `step_index`, `trigger`, `triggered_by_id` / `triggered_by_name`,
+    `created_at`; primary key `(file_id, number)`. The file row lock every
+    writer takes first, and the fact that a new job is only created once the
+    last one ended, keep one running job per file; the primary key refuses a
+    second job numbered alike should a writer skip the lock.
+  - `drive.file_job_end` — the job ended: `kind` (`reported_done`,
+    `reported_failed`, `failed`, `cancelled`, `creation_rejected`),
+    `reason_code` (required for the three failures, absent otherwise),
+    `message`, `at`; primary key `job_id`, so the first end wins by
+    construction (`ON CONFLICT DO NOTHING`) and a later one is not stored.
+  - `drive.file_job_cancel` — a user asked to cancel: `requested_by`
+    (anonymised by an erase), `at`; primary key `(job_id, number)`.
+  - `drive.file_job_plan` — the runner declared a plan (`run_id`, `labels`,
+    `declared_at`; the highest `number` is current; a redelivered declaration
+    of the current plan adds nothing) and `drive.file_job_step` — it started a
+    step of its plan (`run_id`, `plan_index`, `label`, `started_at`; primary
+    key `(job_id, run_id, plan_index)`, so a redelivery adds nothing and a
+    retry run starts its steps again).
+  - Jobs' `queued`, `started` and `completed` are no longer stored: nothing
+    read them. Their reactions stay bound and acknowledge them, so a host's
+    durables never hold them. Progress facts of a job that no longer runs are
+    not stored either.
+- The `drive.file_status` view reads the file's highest-numbered job and its
+  end (no end → `PROCESSING`; `reported_done` → `READY`; any other end →
+  `FAILED` with its reason), and, while the job runs, its current plan, its
+  latest step and whether a cancel was asked. Statuses, errors, progress,
+  gates and affordances are unchanged; so are the Rust API and the SDL.
+  `FileJob::events` now holds what the running job's reads need, built from
+  the fact tables when the job is read (the current plan, the latest step, a
+  cancel request), and is empty once the job ended.
+
+### Upgrading from 0.2.0
+
+- Migration `9121000009` explodes each 0.2.0 job row: its `number` follows
+  its file's former `seq` order; the first terminal entry of its `events`
+  becomes its `drive.file_job_end` row (a failure's reason: the stored
+  `reason`, else the failure report's `reason_code`, else Jobs'
+  `failure_cause`; a runner's declared message or Jobs' note as `message`);
+  every `cancel_requested` becomes a `drive.file_job_cancel` row (without a
+  requester: 0.2.0 did not record one); the `plan_declared` and
+  `step_started` entries become plan and step rows. Then `seq`, `events`,
+  `outcome`, `triggered_by` (now `triggered_by_id` / `triggered_by_name`) and
+  the `file_job_one_live_idx` / `file_job_file_idx` indexes go. One-way.
+
 ## 0.2.0 — 2026-09-28
 
 ### Fixed

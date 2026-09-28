@@ -63,6 +63,25 @@ async fn anonymising_a_person_rewrites_every_id_they_left_and_keeps_their_files(
         .await);
     let ruleset =
         Uuid::parse_str(world.rulesets(&person).await[0]["id"].as_str().unwrap()).unwrap();
+    // (no Jobs answers here: the person's cancel is recorded and the file
+    // keeps processing)
+    ok(&world
+        .gql(
+            &person,
+            "mutation($f:UUID!){workspaceCancelProcessing(fileId:$f){success}}",
+            serde_json::json!({ "f": file_id }),
+        )
+        .await);
+    let requester = || async {
+        sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT requested_by FROM drive.file_job_cancel WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&world.db.app)
+        .await
+        .unwrap()
+    };
+    assert_eq!(requester().await, Some(person_id));
 
     let outcome = world.erase(person_id).await;
     assert!(outcome.fresh);
@@ -105,16 +124,19 @@ async fn anonymising_a_person_rewrites_every_id_they_left_and_keeps_their_files(
             .await
             .unwrap();
     assert_eq!(link_by, REDACTED);
-    let initiator: serde_json::Value =
-        sqlx::query_scalar("SELECT triggered_by FROM drive.file_job WHERE job_id = $1")
-            .bind(job_id)
-            .fetch_one(&world.db.app)
-            .await
-            .unwrap();
-    assert_eq!(initiator["id"], REDACTED.to_string());
-    assert!(
-        initiator["display_name"].is_null(),
-        "the display name is gone: {initiator}"
+    let (initiator, initiator_name): (Option<Uuid>, Option<String>) = sqlx::query_as(
+        "SELECT triggered_by_id, triggered_by_name FROM drive.file_job WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&world.db.app)
+    .await
+    .unwrap();
+    assert_eq!(initiator, Some(REDACTED));
+    assert!(initiator_name.is_none(), "the display name is gone");
+    assert_eq!(
+        requester().await,
+        Some(REDACTED),
+        "the cancel request no longer names the person"
     );
     let file = world.file(&person, file_id).await;
     assert_eq!(
