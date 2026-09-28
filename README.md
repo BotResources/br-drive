@@ -24,7 +24,7 @@ The workspace's MSRV is Rust 1.94 — the floor of the pinned `contract-jobs`
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.3.0", version = "0.3.0" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.4.0", version = "0.4.0" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -36,6 +36,7 @@ The `version` beside the `tag` is required: a tag-only git dependency carries a
 | 0.1 | `v0.3.0` |
 | 0.2 | `v0.3.4` |
 | 0.3 | `v0.3.4` |
+| 0.4 | `v0.3.4` |
 
 ## What a host writes
 
@@ -69,8 +70,9 @@ The engine's "library slice" path, exactly as `example-lib-roster` does it:
    `br_drive::NoDriveOwner` has no host object to refresh and calls
    `br_drive::create_unowned_drive::<AppPrincipal>(cx, id, created_by)` with an
    id of its choosing instead — nothing in the library relies on it then.
-   `br_drive::set_protected` marks a file the users
-   may neither rename, move nor delete, `br_drive::set_metadata(ops, principal,
+   `br_drive::set_protected(ops, principal, file_id, protected)` marks a file
+   the users may neither rename, move nor delete (the principal is the hand
+   the audit trail records), `br_drive::set_metadata(ops, principal,
    file_id, metadata)` writes the host's free JSON on a file after asking the
    host's gate for that principal (`SetMetadata { file }`; both refuse an
    unchanged value with `NOTHING_TO_CHANGE`), and `br_drive::drive_of` answers which drive a file
@@ -487,9 +489,10 @@ two gestures never both see the same last job — and a new job is only ever
 created once the file's last job ended: at most one job runs per file. Should
 a writer ever skip the lock, the `(file_id, number)` primary key refuses the
 second job (`FILE_PROCESSING`). `ruleset_id` and `steps` stay on the File for replay;
-`progress` is `null` outside `PROCESSING`. `updatedAt` moves on every write
-that changes the status (a settling Jobs fact, a cancel request, the
-runner's end), never on a progress fact.
+`progress` is `null` outside `PROCESSING`. `updatedAt` moves on every
+change of the file the audit trail records (below) — a status change (a
+settling Jobs fact, a cancel request, the runner's end) included, never a
+progress fact.
 
 A file's results live apart from the file, in `drive.file_processed`: the
 indexer's triple, with the pages (`drive.file_page`) and the extracted images
@@ -570,6 +573,29 @@ The runner source presign (`<p>RunnerContext`'s `sourceUrl`) goes through the
 while that job is the file's running one — never a population of every
 in-flight file.
 
+## Audit trail
+
+What happens to a file, a page, a label or a rule is recorded as an
+append-only fact (`drive.fact`), the way the identity service keeps its own:
+`aggregate_type` (`file`, `page`, `label`, `ruleset`), `aggregate_id` (for a
+page, its file; `page_number` names the page), `correlation_id` (the gesture:
+a folder move's files, a report's pages share it; a reaction's message
+correlation), `fact_type` and `payload` (the change, as the library's cause:
+`Renamed`, `Retitled`, `Moved`, `FolderMoved`, `ProtectionChanged`,
+`MetadataChanged`, `UploadCommitted`, `ProcessingStarted`, `ReportStored`,
+`ProcessingFinished`, `ProcessingFailed`, `CancelRequested`, `Reported`,
+`Edited`, `Updated`, `Saved`), `actor_id` and `actor_kind` (`human`;
+`service` — a service account, Jobs included; `runner` — a service account
+holding the host's runner scope), `impersonator_id` (the admin behind an
+impersonated session: the trail never loses the real hand) and `occurred_at`.
+No column is overwritten to say who changed something last: `DriveFile`,
+`DriveLabel` and `DriveRuleset`'s `updatedAt` are their latest fact (their
+creation when none), a page's `updatedBy` / `updatedAt` its latest fact; the
+creation columns (`created_by`, `created_at`) are written once and stay. A
+host reads an object's history from its facts, newest first, served by an
+index. The last changes of 0.3 carried over as one fact each, of kind
+`unknown` (0.3 did not record who; a page's writer was kept).
+
 ## Erase
 
 The library implements the engine's `Erasable` for its rows and registers it
@@ -578,11 +604,12 @@ pipeline (`engine.eraser().erase(person)`), never through a GraphQL root, and
 the pipeline records the erasure, purges what the manifest names and emits
 the engine's `PersonErased` fact. `DriveHost::erase_mode` picks the mode:
 
-- `Anonymise` (default): every `created_by` / `updated_by` the person left on
-  drives, files, pages, labels, label links and rules, and the `triggered_by`
-  of the jobs they started and the `requested_by` of the cancels they asked
-  for, is rewritten to `br_drive::REDACTED_PERSON`
-  (the nil UUID); nothing is deleted.
+- `Anonymise` (default): every `created_by` the person left on drives,
+  files, labels, label links and rules, the `triggered_by` of the jobs they
+  started, the `requested_by` of the cancels they asked for, and every audit
+  fact naming them — as its actor or as the admin behind an impersonated
+  session — is rewritten to `br_drive::REDACTED_PERSON` (the nil UUID); the
+  facts themselves stay, nothing is deleted.
 - `Delete`: every file the person created is deleted (its pages, images and
   label links cascade, its objects are purged through the manifest), then the
   rest is anonymised. A job still running on such a file is not cancelled —
@@ -654,6 +681,9 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
   fires for it) — and past `BULK_RESET_THRESHOLD` deleted files, live
   `DriveChanged` sessions catch up on their next reset instead of receiving
   one `Remove` per file.
+- The audit facts outlive their object: a deleted file, label or rule keeps
+  its history (anonymised by an erase, like every fact). A retention rule, if
+  a host needs one, is not written yet.
 - `select_ruleset` reads the defaults of one trigger per gesture — fine at a
   host's scale (tens of rules), noted for the record.
 - The catalogue watch stamps `seen_at` from the database clock: it runs
