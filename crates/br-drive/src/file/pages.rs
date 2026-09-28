@@ -48,9 +48,6 @@ pub enum PageCause {
         origin: PageOrigin,
     },
     Edited,
-    Imported {
-        origin: PageOrigin,
-    },
     /// The chain ended with fewer pages than the file had: the page is gone.
     Trimmed,
 }

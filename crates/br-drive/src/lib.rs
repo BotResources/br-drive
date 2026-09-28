@@ -8,7 +8,6 @@ mod folders;
 mod host;
 mod host_window;
 mod image;
-mod import;
 mod label;
 mod media;
 mod owner;
@@ -45,7 +44,6 @@ pub use file::{
 pub use folders::{DeleteFolder, MoveFolder};
 pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
 pub use image::{ImageName, InvalidImageName, MAX_IMAGE_NAME_BYTES};
-pub use import::{ImportImage, ImportPages, ImportedPage, ImportedPageInput};
 pub use label::{
     CreateLabel, DeleteLabel, DriveLabel, DriveLabels, Label, LabelCause, LabelRow, LabelWindow,
     MAX_LABEL_DESCRIPTION_BYTES, MAX_LABEL_NAME_CHARS, SetFileLabels, UpdateLabel,

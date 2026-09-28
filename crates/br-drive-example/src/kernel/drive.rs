@@ -16,10 +16,6 @@ pub const NOT_THE_OWNER: Reason = Reason::new("NOT_THE_WORKSPACE_OWNER");
 pub const UNRENDERABLE_MEDIA_TYPE: Reason = Reason::new("UNRENDERABLE_MEDIA_TYPE");
 pub const FORBIDDEN_FOLDER: Reason = Reason::new("FORBIDDEN_FOLDER");
 pub const NOT_THE_UPLOADER: Reason = Reason::new("NOT_THE_UPLOADER");
-pub const NOT_AN_IMPORTER: Reason = Reason::new("NOT_AN_IMPORTER");
-/// The scope of the host's migration account: it may upload into any
-/// workspace and import into any file.
-pub const IMPORT_SCOPE: &str = "workspace:import";
 /// The scope of a host clean-up account: it may ask for a folder gesture in
 /// any workspace, but no single file is its to move or delete — so the
 /// library refuses its folder gestures whole.
@@ -55,8 +51,6 @@ impl DriveHost for AppPrincipal {
     #[cfg(not(feature = "workspace"))]
     type DriveOwner = br_drive::NoDriveOwner;
 
-    const IMPORT_SCOPE: Option<&'static str> = Some(IMPORT_SCOPE);
-
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate {
         if let DriveRequest::CreateFile { media_type, .. } = request
             && media_type.as_str() == UNRENDERABLE
@@ -78,29 +72,10 @@ impl DriveHost for AppPrincipal {
                     Gate::allowed()
                 };
             }
-            // A migration account (a service account holding the import
-            // scope, never a person) uploads into any workspace, then imports.
-            DriveRequest::CreateFile { .. } if self.is_importer() => {
-                return Gate::allowed();
-            }
-            // It commits only the uploads it made itself.
-            DriveRequest::CommitUpload { file }
-                if self.is_importer() && file.created_by == self.id().as_uuid() =>
-            {
-                return Gate::allowed();
-            }
             DriveRequest::MoveFolder { .. } | DriveRequest::DeleteFolder { .. }
                 if self.is_service() && self.holds_scope(SWEEP_SCOPE) =>
             {
                 return Gate::allowed();
-            }
-            // Imports are a migration's privilege, whoever owns the workspace.
-            DriveRequest::Import { .. } => {
-                return if self.holds_scope(IMPORT_SCOPE) {
-                    Gate::allowed()
-                } else {
-                    Gate::blocked(NOT_AN_IMPORTER)
-                };
             }
             // The catalogue is for the people of the host, never for a runner.
             DriveRequest::ReadLabels => {

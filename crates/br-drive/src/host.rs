@@ -25,10 +25,8 @@ pub enum DriveRequest<'a, H> {
         media_type: &'a MediaType,
         size: u64,
     },
-    /// Confirming a pending upload (`<p>CommitUpload`), the one commit
-    /// gesture: the row carries its uploader (`created_by`), so a host can
-    /// reserve the commit to them — its migration account (`is_importer`)
-    /// included, for the uploads it made.
+    /// Confirming a pending upload (`<p>CommitUpload`): the row carries its
+    /// uploader (`created_by`), so a host can reserve the commit to them.
     CommitUpload {
         file: &'a FileRow<H>,
     },
@@ -77,11 +75,6 @@ pub enum DriveRequest<'a, H> {
     SetFileLabels {
         file: &'a FileRow<H>,
     },
-    /// Writing a rendition or an image into a READY file without a runner or
-    /// a job (`<p>ImportPages`, `<p>ImportImage`): the host decides who may.
-    Import {
-        file: &'a FileRow<H>,
-    },
     /// Reading the host's label catalogue, live included.
     ReadLabels,
     /// Writing a file's free `metadata` through `br_drive::set_metadata`.
@@ -102,7 +95,6 @@ impl<H> DriveRequest<'_, H> {
             | Self::UpdateFile { file, .. }
             | Self::DeleteFile { file }
             | Self::RetitleFile { file }
-            | Self::Import { file }
             | Self::Process { file }
             | Self::CancelProcessing { file }
             | Self::EditPage { file }
@@ -143,25 +135,6 @@ pub trait DriveHost: Principal {
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;
 
     fn visible_drives(&self) -> Vec<Uuid>;
-
-    /// The scope a service account must hold to import a rendition into a
-    /// file (`<p>ImportPages`, `<p>ImportImage`); `None` (the default) means
-    /// the host offers no import. The host's `DriveRequest::Import` gate then
-    /// decides file by file. A migration commits its uploads with the
-    /// ordinary `<p>CommitUpload`: the host's `CommitUpload { file }` gate
-    /// lets its importer (`is_importer`) through for the uploads it made.
-    const IMPORT_SCOPE: Option<&'static str> = None;
-
-    fn is_importer(&self) -> bool {
-        let Some(import_scope) = Self::IMPORT_SCOPE else {
-            return false;
-        };
-        let passport = self.passport();
-        passport.service_account_id().is_some()
-            && passport
-                .claim::<Vec<String>>(SCOPES_CLAIM)
-                .is_some_and(|scopes| scopes.iter().any(|scope| scope == import_scope))
-    }
 
     fn is_runner(&self) -> bool {
         let passport = self.passport();
