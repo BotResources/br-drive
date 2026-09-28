@@ -147,7 +147,6 @@ pub struct ArchiveHost {
     pub base_url: String,
     stop: Arc<tokio::sync::Notify>,
     handle: tokio::task::JoinHandle<Result<(), EngineError>>,
-    catalogue: br_drive::CatalogueWatch,
     eraser: service_engine::Eraser<ArchivePrincipal>,
 }
 
@@ -221,7 +220,6 @@ impl ArchiveHost {
         let app = service_engine::app(graphql, state, readiness.clone());
         let stop = engine.shutdown_handle();
         let eraser = engine.eraser();
-        let catalogue = br_drive::watch_runner_types(engine.nats().clone(), db.app.clone());
         let listener = TcpListener::bind(addr)
             .await
             .expect("bind the archive host");
@@ -245,7 +243,6 @@ impl ArchiveHost {
             base_url: format!("http://{bound}"),
             stop,
             handle,
-            catalogue,
             eraser,
         }
     }
@@ -289,32 +286,15 @@ impl ArchiveHost {
     }
 
     pub async fn job_of(&self, file_id: Uuid) -> Option<Uuid> {
-        sqlx::query_scalar("SELECT job_id FROM drive.file WHERE id = $1")
-            .bind(file_id)
-            .fetch_one(&self.db.app)
-            .await
-            .expect("the archive file row")
-    }
-
-    pub async fn await_known_runner_type(&self, runner_type: &str) {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let found: Option<String> = sqlx::query_scalar(
-                "SELECT lifecycle FROM drive.known_runner_type WHERE runner_type = $1",
-            )
-            .bind(runner_type)
-            .fetch_optional(&self.db.app)
-            .await
-            .expect("read the archive catalogue mirror");
-            if found.as_deref() == Some("active") {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the archive mirror never showed {runner_type} active"
-            );
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
+        sqlx::query_scalar(
+            "SELECT last_job_id FROM drive.file_status \
+             WHERE file_id = $1 AND processing_state = 'processing'",
+        )
+        .bind(file_id)
+        .fetch_optional(&self.db.app)
+        .await
+        .expect("the archive file's status")
+        .flatten()
     }
 
     pub async fn file_state(
@@ -335,7 +315,6 @@ impl ArchiveHost {
     }
 
     pub async fn shutdown(self) {
-        self.catalogue.stop().await;
         self.stop.notify_one();
         let _ = self.handle.await;
         self.db.cleanup().await;

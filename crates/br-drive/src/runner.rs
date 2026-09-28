@@ -22,12 +22,14 @@ use crate::file::images::{
     references_image,
 };
 use crate::file::pages::{Page, PageCause, PageKey, RunnerPage, read_pages};
+use crate::file::processed;
 use crate::file::rendition::{apply_indexing, validate_rendition};
 use crate::file::store::{self, FileStore, PageWrite};
 use crate::file::{File, FileCause, FileRow, PageOrigin};
 use crate::host::DriveHost;
 use crate::image::ImageName;
 use crate::media::MediaType;
+use crate::ruleset::Trigger;
 use crate::upload::UploadTicket;
 
 pub const MAX_REPORT_PAGES: usize = 512;
@@ -256,6 +258,7 @@ pub(crate) async fn stage_image<H: DriveHost>(
             cx.save(&image).await?;
         }
         None => {
+            processed::ensure(cx.connection(), file.id).await?;
             let image = ImageRecord::<H>::new(file.id, name.clone(), facts, now);
             cx.create(&image).await?;
         }
@@ -338,16 +341,30 @@ pub fn runner_report<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.require_active_job(input.job_id)?;
+        let job = file
+            .active_job()
+            .cloned()
+            .ok_or(DriveFault::Refused(codes::JOB_NOT_ACTIVE))?;
         let by = cx.principal().id().as_uuid();
         let now = cx.now().as_datetime();
-        // A report is a sign of life of a started run: the step's deadline
-        // moves back (and the pickup stage is over, should the started fact
-        // come late).
-        crate::processing::run_alive(&mut file, now);
+
+        // A page a person edited is kept by an upload or a reprocess run; a
+        // page regeneration is asked for that very page, and overwrites it.
+        let kept = if job.trigger == Some(Trigger::RegeneratePage) {
+            Vec::new()
+        } else {
+            let numbers: Vec<i32> = input.pages.iter().map(|page| page.number).collect();
+            processed::edited_among(cx.connection(), file.id, &numbers).await?
+        };
+        let pages: Vec<&ReportedPage> = input
+            .pages
+            .iter()
+            .filter(|page| !kept.contains(&page.number))
+            .collect();
 
         let mut dropped = Vec::new();
         if input.origin == PageOrigin::Regenerated {
-            for page in &input.pages {
+            for page in &pages {
                 let unreferenced: Vec<String> =
                     image_names_of_page(cx.connection(), file.id, page.number)
                         .await?
@@ -360,8 +377,7 @@ pub fn runner_report<'m, H: DriveHost>(
                 dropped.extend(unreferenced);
             }
         }
-        let writes: Vec<PageWrite<'_>> = input
-            .pages
+        let writes: Vec<PageWrite<'_>> = pages
             .iter()
             .map(|page| PageWrite {
                 number: page.number,
@@ -370,7 +386,7 @@ pub fn runner_report<'m, H: DriveHost>(
             })
             .collect();
         store::upsert_pages(cx.connection(), file.id, &writes, by, now).await?;
-        for page in &input.pages {
+        for page in &pages {
             cx.impact_caused::<Page, _>(
                 &PageKey {
                     file_id: file.id,
@@ -385,43 +401,128 @@ pub fn runner_report<'m, H: DriveHost>(
         if !dropped.is_empty() {
             crate::file::file_changed::<H>(cx, &file, FileCause::ImagesDropped { names: dropped })?;
         }
-        let mut dirty = false;
-        let mut cause = None;
         if let (Some(summary), Some(page_count)) = (input.summary, input.page_count)
             && apply_indexing(&mut file, summary, page_count, input.estimated_tokens)
         {
-            dirty = true;
-            cause = Some(FileCause::ReportStored {
-                job_id: input.job_id,
-                done: input.done,
-            });
-        }
-        if input.done && file.done_at.is_none() {
-            file.done_at = Some(now);
-            dirty = true;
-            if file.completed_at.is_some() {
-                // Jobs already said the job is over: the report is what the
-                // chain was waiting for.
-                if dirty {
-                    file.updated_at = now;
-                }
-                if let Some(cause) = cause {
-                    crate::file::file_changed::<H>(cx, &file, cause)?;
-                }
-                crate::processing::advance(cx, &mut file).await?;
-                return Ok(());
-            }
-            crate::processing::finish_active_job(cx, &file)?;
-        }
-        // Saved every time for the step's sign of life; `updated_at` moves only
-        // with what the file shows.
-        if dirty {
+            processed::store_indexing(
+                cx.connection(),
+                file.id,
+                file.summary.as_deref(),
+                file.page_count,
+                file.estimated_tokens,
+            )
+            .await?;
             file.updated_at = now;
+            cx.save(&file).await?;
+            crate::file::file_changed::<H>(
+                cx,
+                &file,
+                FileCause::ReportStored {
+                    job_id: input.job_id,
+                    done: input.done,
+                },
+            )?;
         }
-        cx.save(&file).await?;
-        if let Some(cause) = cause {
-            crate::file::file_changed::<H>(cx, &file, cause)?;
+        // The final report ends the job, here: the chain moves on in this
+        // transaction and Jobs is told (`job.finish`); its `completed` then
+        // only confirms it.
+        if input.done {
+            crate::processing::report_done(cx, &mut file, &job).await?;
         }
         Ok(())
     })
+}
+
+/// The longest reason code a runner may declare.
+pub const MAX_FAILURE_REASON_BYTES: usize = 128;
+/// The longest message a runner may attach to a declared failure.
+pub const MAX_FAILURE_MESSAGE_BYTES: usize = 4096;
+
+#[derive(Debug, Deserialize)]
+pub struct RunnerReportFailure {
+    pub file_id: Uuid,
+    pub job_id: Uuid,
+    pub reason_code: String,
+    pub message: Option<String>,
+}
+
+impl MutationInput for RunnerReportFailure {
+    type Output = ();
+    type Error = DriveFault;
+    const NAME: &'static str = "drive_runner_report_failure";
+}
+
+/// A reason code as a runner declares it: `[a-z0-9_]`, starting with a
+/// letter, at most `MAX_FAILURE_REASON_BYTES` — a code a front can translate,
+/// never a sentence.
+fn valid_reason_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= MAX_FAILURE_REASON_BYTES
+        && code.starts_with(|c: char| c.is_ascii_lowercase())
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// The runner declares its job failed: the file lands FAILED with the given
+/// reason code (`processingError`), Jobs is told (`job.fail`), and what the
+/// run reported so far stays readable. Same checks as a report: the runner
+/// scope, then the file's running job.
+pub fn runner_report_failure<'m, H: DriveHost>(
+    cx: &'m mut Mutation<'m, H>,
+    input: RunnerReportFailure,
+) -> BoxFuture<'m, Result<(), DriveFault>> {
+    Box::pin(async move {
+        runner_only(cx.principal())?;
+        if !valid_reason_code(&input.reason_code)
+            || input
+                .message
+                .as_ref()
+                .is_some_and(|message| message.len() > MAX_FAILURE_MESSAGE_BYTES)
+        {
+            return Err(DriveFault::Refused(codes::INVALID_FAILURE_REASON));
+        }
+        let mut file = cx
+            .load::<FileRow<H>>(&input.file_id)
+            .await?
+            .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
+        file.require_active_job(input.job_id)?;
+        let job = file
+            .active_job()
+            .cloned()
+            .ok_or(DriveFault::Refused(codes::JOB_NOT_ACTIVE))?;
+        crate::processing::report_failed(
+            cx,
+            &mut file,
+            &job,
+            &input.reason_code,
+            input.message.as_deref(),
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_declared_reason_is_a_code_never_a_sentence() {
+        for good in ["ocr_timeout", "a", "unreadable_scan_2"] {
+            assert!(valid_reason_code(good), "{good}");
+        }
+        for bad in [
+            "",
+            "Timeout",
+            "the scan is unreadable",
+            "2fast",
+            "_x",
+            "ocr-timeout",
+            &"a".repeat(MAX_FAILURE_REASON_BYTES + 1),
+        ] {
+            assert!(!valid_reason_code(bad), "{bad}");
+        }
+        assert!(valid_reason_code(&"a".repeat(MAX_FAILURE_REASON_BYTES)));
+    }
 }

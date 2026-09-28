@@ -38,7 +38,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mutation: MutationRoot::default(),
         subscription: SubscriptionRoot::default(),
         declare_scopes: false,
-        register: br_drive_example::register::all_with(Arc::new(settings)),
+        register: {
+            let register = br_drive_example::register::all_with(Arc::new(settings));
+            move |engine: &mut service_engine::Engine<br_drive_example::kernel::AppPrincipal>| {
+                register(engine)?;
+                // The optional runner-type catalogue watch, on the engine's
+                // own handles; information only, so it runs detached until
+                // the process exits and nothing of the boot waits for it.
+                #[cfg(feature = "drive")]
+                br_drive::watch_runner_types_of(engine).detach();
+                Ok(())
+            }
+        },
     })
     .await?;
     Ok(())

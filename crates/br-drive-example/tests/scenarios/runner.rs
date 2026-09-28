@@ -6,7 +6,7 @@ use crate::harness::runner::{
     RUNNER_SCOPE, Report, context, image_ticket, install_render_rule, report, request_image,
     upload_image,
 };
-use crate::harness::upload::{UploadRequest, post_bytes, upload};
+use crate::harness::upload::{UploadRequest, post_bytes, upload_processed};
 use crate::harness::{
     JobsStandIn, World, WorldOptions, drain_with_a_rename, drive_subscription, error_code,
     manager_passport, next_drive_delta, next_page_delta, ok, pages_subscription, passport,
@@ -19,15 +19,15 @@ const IMAGE: &[u8] = b"\x89PNG fake image bytes";
 
 async fn file_with_job(world: &World, jobs: &JobsStandIn, owner: &str) -> (Uuid, Uuid, Uuid) {
     let manager = manager_passport(Uuid::now_v7(), "Ada");
-    install_render_rule(world, jobs, &manager).await;
+    install_render_rule(world, &manager).await;
     let drive = world.create_workspace(owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         world,
         owner,
         &UploadRequest::text(drive, "docs", "source.txt", SOURCE),
     )
     .await;
-    let job_id = world.await_job(file_id).await;
+    let job_id = jobs.await_create(file_id).await.job_id;
     (drive, file_id, job_id)
 }
 
@@ -540,7 +540,7 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
             pages: vec![],
             origin: None,
             indexer: Some(("A three-page document.", 3, 420)),
-            done: true,
+            done: false,
         },
     )
     .await);
@@ -548,7 +548,7 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
         node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ReportStored"
     })
     .await;
-    assert_eq!(done["cause"]["done"], true);
+    assert_eq!(done["cause"]["done"], false);
     assert_eq!(done["view"]["summary"], "A three-page document.");
     assert_eq!(done["view"]["pageCount"], 3);
     assert_eq!(done["view"]["estimatedTokens"], 420);
@@ -577,19 +577,6 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
     )
     .await;
     assert_eq!(error_code(&empty), "NOTHING_TO_CHANGE");
-    ok(&report(
-        &world,
-        &runner,
-        file_id,
-        Report {
-            job_id,
-            pages: vec![],
-            origin: None,
-            indexer: None,
-            done: true,
-        },
-    )
-    .await);
     let partial = world
         .gql(
             &runner,
@@ -702,6 +689,29 @@ async fn report_batches_upsert_by_number_and_a_replayed_batch_changes_nothing() 
     )
     .await;
     assert_eq!(error_code(&edited), "INVALID_PAGE_ORIGIN");
+
+    // An empty report is accepted when it is the final one, and ends the job:
+    // a replayed final report meets a job that no longer runs.
+    let final_report = || {
+        report(
+            &world,
+            &runner,
+            file_id,
+            Report {
+                job_id,
+                pages: vec![],
+                origin: None,
+                indexer: None,
+                done: true,
+            },
+        )
+    };
+    ok(&final_report().await);
+    jobs.await_finish(job_id).await;
+    world.await_state(&owner, file_id, "READY").await;
+    assert_eq!(error_code(&final_report().await), "JOB_NOT_ACTIVE");
+    assert_eq!(world.file_pages(&owner, file_id).await.len(), 3);
+    jobs.expect_no_command(Duration::from_millis(500)).await;
 
     world.cleanup().await;
 }

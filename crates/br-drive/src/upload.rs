@@ -15,12 +15,10 @@ use crate::blob::DriveSource;
 use crate::drive::DriveRow;
 use crate::fault::{DriveFault, DriveReactionFault, codes};
 use crate::file::store;
-use crate::file::{FileCause, FileRow, ProcessingState};
+use crate::file::{FileCause, FileRow, FileStatus};
 use crate::host::{DriveHost, DriveRequest};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
-use crate::processing;
-use crate::ruleset::{Trigger, select_ruleset};
 use crate::title::FileTitle;
 
 pub const UPLOAD_DEADLINE_AGGREGATE: &str = "drive_file";
@@ -123,32 +121,17 @@ pub fn request_upload<'m, H: DriveHost>(
                 .map_err(|_| DriveFault::Refused(codes::FILE_TOO_LARGE))?,
             sha256: *digest.as_bytes(),
             blob_ref: blob.reference().as_uuid(),
-            processing_state: ProcessingState::Pending,
-            processing_error: None,
+            committed_at: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             summary: None,
             page_count: None,
             estimated_tokens: None,
             ruleset_id: None,
             steps: None,
-            step_index: None,
-            step_count: None,
-            step_runner_type: None,
-            job_id: None,
-            plan: None,
-            progress_index: None,
-            progress_label: None,
-            progress_at: None,
-            triggered_by: None,
-            done_at: None,
-            completed_at: None,
-            step_entered_at: None,
-            step_alive_at: None,
-            run_started_at: None,
-            stray_job_id: None,
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,
+            status: FileStatus::pending(),
             host: PhantomData,
         };
         cx.create(&file).await?;
@@ -167,7 +150,6 @@ pub fn request_upload<'m, H: DriveHost>(
 #[derive(Debug, Deserialize)]
 pub struct CommitUpload {
     pub file_id: Uuid,
-    pub ruleset_id: Option<Uuid>,
 }
 
 impl MutationInput for CommitUpload {
@@ -176,6 +158,9 @@ impl MutationInput for CommitUpload {
     const NAME: &'static str = "drive_commit_upload";
 }
 
+/// Confirms a pending upload: the object is present and is the pinned bytes
+/// (a live storage HEAD), and the file is READY — stored, not processed.
+/// Processing is a gesture of its own (`ProcessFile`), right after or never.
 pub fn commit_upload<'m, H: DriveHost>(
     cx: &'m mut Mutation<'m, H>,
     input: CommitUpload,
@@ -188,24 +173,11 @@ pub fn commit_upload<'m, H: DriveHost>(
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.commit_gate(cx.principal()).require()?;
         require_landed(&reader, &file).await?;
-        file.processing_state = ProcessingState::Ready;
-        file.updated_at = cx.now().as_datetime();
-        let ruleset = select_ruleset(
-            cx.connection(),
-            Trigger::Upload,
-            &file.media_type,
-            input.ruleset_id,
-        )
-        .await?;
+        let now = cx.now().as_datetime();
+        file.committed_at = Some(now);
+        file.updated_at = now;
+        cx.save(&file).await?;
         crate::file::file_changed::<H>(cx, &file, FileCause::UploadCommitted)?;
-        match ruleset {
-            Some(ruleset) => {
-                let initiator = processing::Initiator::of(cx.principal());
-                let plan = processing::ChainPlan::from_ruleset(&ruleset, None);
-                processing::start_chain(cx, &mut file, plan, initiator).await?;
-            }
-            None => cx.save(&file).await?,
-        }
         Ok(())
     })
 }
@@ -267,7 +239,9 @@ pub fn upload_deadline<'r, H: DriveHost>(
         let Some(file) = cx.load::<FileRow<H>>(&message.file_id).await? else {
             return Ok(());
         };
-        if file.processing_state != ProcessingState::Pending {
+        // An upload never confirmed: its object never arrived, or arrived and
+        // was never committed.
+        if file.committed_at.is_some() {
             return Ok(());
         }
         cx.delete(&file).await?;

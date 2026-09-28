@@ -50,12 +50,6 @@ impl DriveHost for AppPrincipal {
 
     const BULK_RESET_THRESHOLD: usize = 3;
 
-    /// Short enough for the timeout scenarios to run in the suite; the pickup
-    /// deadline stays below the run-silence one, as the defaults do (1 h / 72 h).
-    const PICKUP_TIMEOUT: Duration = Duration::from_secs(20);
-
-    const STEP_TIMEOUT: Duration = Duration::from_secs(30);
-
     #[cfg(feature = "workspace")]
     type DriveOwner = crate::slices::workspace::Workspace;
     #[cfg(not(feature = "workspace"))]
@@ -89,19 +83,11 @@ impl DriveHost for AppPrincipal {
             DriveRequest::CreateFile { .. } if self.is_importer() => {
                 return Gate::allowed();
             }
-            // It commits only the uploads it made itself — the normal way,
-            // or without processing.
+            // It commits only the uploads it made itself.
             DriveRequest::CommitUpload { file }
                 if self.is_importer() && file.created_by == self.id().as_uuid() =>
             {
                 return Gate::allowed();
-            }
-            DriveRequest::ImportCommit { file } => {
-                return if self.is_importer() && file.created_by == self.id().as_uuid() {
-                    Gate::allowed()
-                } else {
-                    Gate::blocked(NOT_THE_UPLOADER)
-                };
             }
             DriveRequest::MoveFolder { .. } | DriveRequest::DeleteFolder { .. }
                 if self.is_service() && self.holds_scope(SWEEP_SCOPE) =>

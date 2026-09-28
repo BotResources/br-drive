@@ -1,3 +1,4 @@
+use contract_jobs::command::CancelJob;
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use service_engine::BlobRef;
@@ -218,20 +219,28 @@ pub fn delete_file<'m, H: DriveHost>(
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Process {
+pub struct ProcessFile {
     pub file_id: Uuid,
     pub ruleset_id: Option<Uuid>,
 }
 
-impl MutationInput for Process {
+impl MutationInput for ProcessFile {
     type Output = ();
     type Error = DriveFault;
-    const NAME: &'static str = "drive_process";
+    const NAME: &'static str = "drive_process_file";
 }
 
-pub fn process<'m, H: DriveHost>(
+/// The only way to start processing a file: right after its commit, later,
+/// or never. Allowed on a READY or a FAILED file (`FILE_NOT_READY` while the
+/// upload is not confirmed, `FILE_PROCESSING` while a chain runs). A file that
+/// never had a job runs its `upload` rule, any other its `reprocess` rule:
+/// the given rule (it must carry that trigger and match the media type), else
+/// the default one, else — for a reprocess — the file's own snapshot (a
+/// replay of what last ran), else `NO_RULESET_MATCHES`. Nothing is wiped: the
+/// previous results stay readable while the new run reports over them.
+pub fn process_file<'m, H: DriveHost>(
     cx: &'m mut Mutation<'m, H>,
-    input: Process,
+    input: ProcessFile,
 ) -> BoxFuture<'m, Result<(), DriveFault>> {
     Box::pin(async move {
         let mut file = cx
@@ -239,23 +248,21 @@ pub fn process<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.process_gate(cx.principal()).require()?;
-        // The given rule, else the default `reprocess` rule of the media type,
-        // else the file's own snapshot (a replay of what last ran).
-        let plan = match select_ruleset(
-            cx.connection(),
-            Trigger::Reprocess,
-            &file.media_type,
-            input.ruleset_id,
-        )
-        .await?
-        {
-            Some(ruleset) => processing::ChainPlan::from_ruleset(&ruleset, None),
-            None => processing::ChainPlan::replay(&file)
-                .ok_or(DriveFault::Refused(codes::NO_RULESET_MATCHES))?,
+        let trigger = if file.last_job().is_none() {
+            Trigger::Upload
+        } else {
+            Trigger::Reprocess
         };
-        processing::wipe_rendition(cx, &mut file).await?;
+        let selected =
+            select_ruleset(cx.connection(), trigger, &file.media_type, input.ruleset_id).await?;
+        let plan = match (selected, trigger) {
+            (Some(ruleset), _) => processing::ChainPlan::from_ruleset(&ruleset, None),
+            (None, Trigger::Reprocess) => processing::ChainPlan::replay(&file)
+                .ok_or(DriveFault::Refused(codes::NO_RULESET_MATCHES))?,
+            (None, _) => return Err(DriveFault::Refused(codes::NO_RULESET_MATCHES)),
+        };
         let initiator = processing::Initiator::of(cx.principal());
-        processing::start_chain(cx, &mut file, plan, initiator).await?;
+        processing::start_chain(cx, &mut file, plan, trigger, initiator).await?;
         Ok(())
     })
 }
@@ -301,13 +308,59 @@ pub fn regenerate_page<'m, H: DriveHost>(
         if let Some(comment) = input.comment {
             options.insert("comment".into(), serde_json::Value::String(comment));
         }
-        debug_assert_eq!(file.processing_state, ProcessingState::Ready);
+        debug_assert_eq!(file.processing_state(), ProcessingState::Ready);
         let initiator = processing::Initiator::of(cx.principal());
         let plan = processing::ChainPlan::from_ruleset(
             &ruleset,
             Some(&serde_json::Value::Object(options)),
         );
-        processing::start_chain(cx, &mut file, plan, initiator).await?;
+        processing::start_chain(cx, &mut file, plan, Trigger::RegeneratePage, initiator).await?;
+        Ok(())
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelProcessing {
+    pub file_id: Uuid,
+}
+
+impl MutationInput for CancelProcessing {
+    type Output = ();
+    type Error = DriveFault;
+    const NAME: &'static str = "drive_cancel_processing";
+}
+
+/// Asks Jobs to cancel the job running on a PROCESSING file. The request is
+/// logged on the job (`cancel_requested`) and the file stays PROCESSING until
+/// Jobs confirms with `cancelled`, which lands it FAILED `cancelled`, open to
+/// a reprocess. Asking again sends the cancel again — Jobs may not have
+/// consumed the job's creation yet when the first one reaches it.
+pub fn cancel_processing<'m, H: DriveHost>(
+    cx: &'m mut Mutation<'m, H>,
+    input: CancelProcessing,
+) -> BoxFuture<'m, Result<(), DriveFault>> {
+    Box::pin(async move {
+        let mut file = cx
+            .load::<FileRow<H>>(&input.file_id)
+            .await?
+            .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
+        file.cancel_processing_gate(cx.principal()).require()?;
+        let Some(job_id) = file.active_job().map(|job| job.job_id) else {
+            return Err(DriveFault::Refused(codes::FILE_NOT_PROCESSING));
+        };
+        let entry = processing::job_entry(
+            processing::job_event::CANCEL_REQUESTED,
+            cx.now().as_datetime(),
+            serde_json::json!({}),
+        )?;
+        processing::append_job_event(cx.connection(), job_id, entry).await?;
+        cx.command(processing::JobCancel {
+            payload: CancelJob { job_id },
+        })?;
+        processing::refresh_status(cx, &mut file).await?;
+        file.updated_at = cx.now().as_datetime();
+        cx.save(&file).await?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::CancelRequested { job_id })?;
         Ok(())
     })
 }

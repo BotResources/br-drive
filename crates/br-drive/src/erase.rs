@@ -57,8 +57,19 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
         .await?;
         rows += done.rows_affected();
     }
+    // Lock the files whose jobs name the person first: a chain advancing at
+    // the same moment copies the initiator into its next job under that lock,
+    // so the rewrites below — new statements, after the lock — see that job.
+    sqlx::query(
+        "SELECT id FROM drive.file WHERE id IN \
+           (SELECT file_id FROM drive.file_job WHERE triggered_by ->> 'id' = $1::text) \
+         ORDER BY id FOR UPDATE",
+    )
+    .bind(person)
+    .execute(&mut *conn)
+    .await?;
     let done = sqlx::query(
-        "UPDATE drive.file SET triggered_by = jsonb_set(triggered_by, '{id}', to_jsonb($2::text)) \
+        "UPDATE drive.file_job SET triggered_by = jsonb_set(triggered_by, '{id}', to_jsonb($2::text)) \
          WHERE triggered_by ->> 'id' = $1::text",
     )
     .bind(person)
@@ -67,7 +78,7 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
     .await?;
     rows += done.rows_affected();
     let done = sqlx::query(
-        "UPDATE drive.file SET triggered_by = triggered_by - 'display_name' || '{\"display_name\": null}'::jsonb \
+        "UPDATE drive.file_job SET triggered_by = triggered_by - 'display_name' || '{\"display_name\": null}'::jsonb \
          WHERE triggered_by ->> 'id' = $1::text",
     )
     .bind(REDACTED_PERSON)
@@ -123,7 +134,8 @@ impl<H: DriveHost> Erasable for DriveErasure<H> {
                     // running job cannot be cancelled from here: the deleted
                     // file refuses the runner's next call, and the job is
                     // left to Jobs' own backstops (none fires for a job no
-                    // runner ever picked up).
+                    // runner ever picked up; an administrator cancels it in
+                    // Jobs, the file being gone).
                     let deleted = store::delete_many(cx.connection(), &files).await?;
                     erased.rows(deleted);
                     for reference in sources.into_iter().chain(images) {

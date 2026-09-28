@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
 use crate::harness::runner::{RUNNER_SCOPE, Report, install_render_rule, report, upload_image};
-use crate::harness::upload::{UploadRequest, upload};
+use crate::harness::upload::{UploadRequest, upload, upload_processed};
 use crate::harness::{
     JobsStandIn, World, drive_subscription, error_code, manager_passport, next_drive_delta, ok,
     passport, service_passport,
@@ -59,9 +59,9 @@ async fn deleting_one_file_releases_its_image_blobs_with_its_source_and_closes_i
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
     let jobs = JobsStandIn::attach(&world).await;
-    install_render_rule(&world, &jobs, &manager_passport(Uuid::now_v7(), "Ada")).await;
+    install_render_rule(&world, &manager_passport(Uuid::now_v7(), "Ada")).await;
     let drive = world.create_workspace(&owner, "library").await;
-    let file_id = upload(
+    let file_id = upload_processed(
         &world,
         &owner,
         &UploadRequest::text(drive, "", "illustrated.txt", BYTES),
@@ -79,7 +79,7 @@ async fn deleting_one_file_releases_its_image_blobs_with_its_source_and_closes_i
             pages: vec![(1, "![a](p001-img01.png)"), (2, "![b](p002-img01.png)")],
             origin: None,
             indexer: None,
-            done: true,
+            done: false,
         },
     )
     .await);

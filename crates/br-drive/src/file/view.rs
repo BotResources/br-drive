@@ -19,7 +19,7 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use super::aggregate::{File, FileRow, ProcessingState, drive_memberships};
-use super::store::{self, FILE_COLUMNS, row_to_file};
+use super::store::{self, FILE_FROM, file_select, row_to_file};
 use crate::host::{DRIVE_DIM, DriveHost};
 use crate::ruleset::DriveStep;
 
@@ -61,7 +61,8 @@ async fn load_views<H: DriveHost>(
     keys: &[Uuid],
 ) -> Result<Vec<FileView<H>>, EngineError> {
     let rows = sqlx::query(&format!(
-        "SELECT {FILE_COLUMNS} FROM drive.file WHERE id = ANY($1)"
+        "SELECT {} FROM {FILE_FROM} WHERE f.id = ANY($1)",
+        file_select("")
     ))
     .bind(keys)
     .fetch_all(&mut *conn)
@@ -296,6 +297,27 @@ pub(crate) async fn visible_file_keys<H: DriveHost>(
         .collect())
 }
 
+/// Where the running chain is, while the file is PROCESSING: the step of
+/// the file's active job, and what that job's runner said of its run.
+fn progress_of<H>(row: &FileRow<H>) -> Option<DriveProgress> {
+    let job = row.active_job()?;
+    let steps = row.steps.as_deref().unwrap_or_default();
+    let run = job.progress();
+    Some(DriveProgress {
+        step_index: job.step_index,
+        step_count: i32::try_from(steps.len()).unwrap_or(i32::MAX),
+        runner_type: usize::try_from(job.step_index)
+            .ok()
+            .and_then(|index| steps.get(index))
+            .map(|step| step.runner_type.clone())
+            .unwrap_or_default(),
+        plan: run.plan,
+        current_index: run.current_index,
+        current_label: run.current_label,
+        at: run.at,
+    })
+}
+
 impl<H: DriveHost> Projector for DriveFiles<H> {
     type Principal = H;
     type Noun = File;
@@ -327,8 +349,8 @@ impl<H: DriveHost> Projector for DriveFiles<H> {
             media_type: row.media_type.as_str().to_string(),
             size_bytes: ByteCount(u64::try_from(row.size_bytes).unwrap_or(0)),
             sha256: hex(&row.sha256),
-            processing_state: row.processing_state,
-            processing_error: row.processing_error.clone(),
+            processing_state: row.processing_state(),
+            processing_error: row.processing_error().map(str::to_string),
             metadata: async_graphql::Json(row.metadata.clone()),
             summary: row.summary.clone(),
             page_count: row.page_count,
@@ -350,20 +372,7 @@ impl<H: DriveHost> Projector for DriveFiles<H> {
                 .steps
                 .as_ref()
                 .map(|steps| steps.iter().map(DriveStep::from).collect()),
-            progress: match (row.processing_state, row.step_index, row.step_count) {
-                (ProcessingState::Processing, Some(step_index), Some(step_count)) => {
-                    Some(DriveProgress {
-                        step_index,
-                        step_count,
-                        runner_type: row.step_runner_type.clone().unwrap_or_default(),
-                        plan: row.plan.clone().unwrap_or_default(),
-                        current_index: row.progress_index,
-                        current_label: row.progress_label.clone(),
-                        at: row.progress_at,
-                    })
-                }
-                _ => None,
-            },
+            progress: progress_of(row),
             created_by: row.created_by,
             created_at: row.created_at,
             updated_at: row.updated_at,

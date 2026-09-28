@@ -1,5 +1,5 @@
 use br_core_integration::CommandCoords;
-use contract_jobs::command::{CancelJob, CreateJob, FinishJob, TriggeredBy};
+use contract_jobs::command::{CancelJob, CreateJob, FailJob, FinishJob, TriggeredBy};
 use serde::{Deserialize, Serialize};
 use service_engine::pipeline::OutboundCommand;
 use uuid::Uuid;
@@ -36,6 +36,7 @@ outgoing!(
     FinishJob,
     contract_jobs::cmd_job_finish_v2_coords
 );
+outgoing!(JobFail, FailJob, contract_jobs::cmd_job_fail_v2_coords);
 outgoing!(
     JobCancel,
     CancelJob,

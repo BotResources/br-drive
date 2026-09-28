@@ -121,10 +121,13 @@ pub async fn file_counts(
     conn: &mut PgConnection,
     drives: &[Uuid],
 ) -> Result<HashMap<Uuid, FileCounts>, EngineError> {
+    // One pass over the drives' files through `file_drive_idx`, each file's
+    // last job by `file_job_file_idx`: the status view carries the drive, so
+    // the predicate reaches the file table itself.
     let rows = sqlx::query(
         "SELECT drive_id, count(*) AS files, \
                 count(*) FILTER (WHERE processing_state = $2) AS ready \
-         FROM drive.file WHERE drive_id = ANY($1) GROUP BY drive_id",
+         FROM drive.file_status WHERE drive_id = ANY($1) GROUP BY drive_id",
     )
     .bind(drives)
     .bind(ProcessingState::Ready.as_str())
