@@ -2,6 +2,7 @@ mod blob;
 mod catalogue;
 mod drive;
 mod erase;
+mod fact;
 mod fault;
 mod file;
 mod folders;
@@ -39,7 +40,7 @@ pub use file::{
     IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded,
     ImageRecord, Page, PageCause, PageKey, PageOrigin, PageWindow, ProcessFile, ProcessingState,
     REGENERATE_PAGE_ACTION, RegeneratePage, RetitleFile, RunnerPage, UnknownDbValue, UpdateFile,
-    drive_of, references_image, set_metadata, set_protected,
+    drive_of, references_image, set_metadata,
 };
 pub use folders::{DeleteFolder, MoveFolder};
 pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};

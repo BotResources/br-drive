@@ -138,7 +138,7 @@ impl World {
         let response = self
             .gql(
                 passport,
-                "query($id:UUID!){workspaceFile(fileId:$id){id driveId path name title protected metadata \
+                "query($id:UUID!){workspaceFile(fileId:$id){id driveId path name title metadata \
                  mediaType sizeBytes sha256 processingState processingError summary pageCount \
                  estimatedTokens images{name mediaType sizeBytes page} labelIds rulesetId \
                  steps{runnerType options} progress{stepIndex stepCount runnerType plan \
@@ -179,7 +179,7 @@ impl World {
         let response = self
             .gql(
                 passport,
-                "query($d:UUID!){workspaceDriveFiles(driveId:$d){id path name protected processingState}}",
+                "query($d:UUID!){workspaceDriveFiles(driveId:$d){id path name processingState}}",
                 serde_json::json!({ "d": drive }),
             )
             .await;
@@ -523,6 +523,28 @@ fn base_config(pod: &str, addr: SocketAddr) -> EngineConfig {
     .with_http_addr(addr)
 }
 
+/// A service account `id` holding `scopes`.
+pub fn service_passport_as(id: Uuid, scopes: &[&str]) -> String {
+    let mut map = serde_json::Map::new();
+    map.insert("scopes".to_string(), serde_json::json!(scopes));
+    Passport::service(id, PassportClaims::from_map(map)).to_header()
+}
+
+/// `user`'s session holding `scopes`, borrowed by the admin `impersonator`.
+pub fn impersonated_passport(user: Uuid, impersonator: Uuid, scopes: &[&str]) -> String {
+    let mut map = serde_json::Map::new();
+    map.insert("scopes".to_string(), serde_json::json!(scopes));
+    Passport::human(
+        user,
+        false,
+        true,
+        AuthMethod::Jwt,
+        Some(impersonator),
+        PassportClaims::from_map(map),
+    )
+    .to_header()
+}
+
 pub fn service_passport(scopes: &[&str]) -> String {
     let mut map = serde_json::Map::new();
     map.insert(
@@ -605,7 +627,7 @@ pub fn error_code(response: &serde_json::Value) -> String {
 pub const DRIVE_DELTAS: &str = "subscription($d:UUID!){workspaceDriveChanged(driveId:$d){\
     __typename \
     ... on DriveReset{revision views{... on DriveFile{id path name title processingState labelIds}}} \
-    ... on DriveUpsert{revision cause view{... on DriveFile{id path name title protected metadata processingState processingError affordances summary pageCount estimatedTokens images{name page} labelIds rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
+    ... on DriveUpsert{revision cause view{... on DriveFile{id path name title metadata processingState processingError affordances summary pageCount estimatedTokens images{name page} labelIds rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
     ... on DriveRemove{revision projector key cause}}}";
 
 pub const LABEL_DELTAS: &str = "subscription{workspaceLabelsChanged{\

@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::blob::DriveSource;
 use crate::drive::DriveRow;
+use crate::fact::Author;
 use crate::fault::{DriveFault, DriveReactionFault, codes};
 use crate::file::store;
 use crate::file::{FileCause, FileRow, FileStatus};
@@ -115,7 +116,6 @@ pub fn request_upload<'m, H: DriveHost>(
             path,
             name,
             title,
-            protected: false,
             media_type,
             size_bytes: i64::try_from(input.size)
                 .map_err(|_| DriveFault::Refused(codes::FILE_TOO_LARGE))?,
@@ -175,9 +175,9 @@ pub fn commit_upload<'m, H: DriveHost>(
         require_landed(&reader, &file).await?;
         let now = cx.now().as_datetime();
         file.committed_at = Some(now);
-        file.updated_at = now;
         cx.save(&file).await?;
-        crate::file::file_changed::<H>(cx, &file, FileCause::UploadCommitted)?;
+        let author = Author::of(cx.principal());
+        crate::file::file_recorded::<H>(cx, &author, &mut file, FileCause::UploadCommitted).await?;
         Ok(())
     })
 }

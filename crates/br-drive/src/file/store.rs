@@ -9,6 +9,7 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use super::aggregate::{FileRow, FileStatus, PageOrigin, ProcessingState};
+use crate::fact::{self, Author, Subject};
 use crate::host::{DRIVE_DIM, DriveHost};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
@@ -17,8 +18,8 @@ use crate::ruleset::Trigger;
 use crate::title::FileTitle;
 
 /// The columns of `drive.file` itself, in insert order.
-pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, title, protected, media_type, size_bytes, sha256, blob_ref, \
-     committed_at, metadata, ruleset_id, steps, created_by, created_at, updated_at";
+pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, title, media_type, size_bytes, sha256, blob_ref, \
+     committed_at, metadata, ruleset_id, steps, created_by, created_at";
 
 /// The columns of `drive.file_processed` a file row reads beside its own: what
 /// the workers produced (absent until the first result).
@@ -31,10 +32,13 @@ const STATUS_COLUMNS: &str = "processing_state, processing_error, last_job_id, l
      last_job_plan, last_job_plan_index, last_job_plan_label, last_job_plan_at, \
      last_job_cancel_requested_at";
 
-/// The file table joined to its computed status and to its results, aliased
-/// `f`, `s` and `r`.
+/// The file table joined to its computed status, to its results and to its
+/// last change (its latest fact), aliased `f`, `s`, `r` and `u`.
 pub(crate) const FILE_FROM: &str = "drive.file f JOIN drive.file_status s ON s.file_id = f.id \
-     LEFT JOIN drive.file_processed r ON r.file_id = f.id";
+     LEFT JOIN drive.file_processed r ON r.file_id = f.id \
+     LEFT JOIN LATERAL (SELECT x.occurred_at FROM drive.fact x \
+       WHERE x.aggregate_type = 'file' AND x.aggregate_id = f.id AND x.page_number IS NULL \
+       ORDER BY x.occurred_at DESC, x.id DESC LIMIT 1) u ON true";
 
 /// The select list of a file row read through `FILE_FROM`, every column
 /// named `{prefix}{column}`.
@@ -50,6 +54,10 @@ pub(crate) fn file_select(prefix: &str) -> String {
     aliased("f", FILE_COLUMNS)
         .chain(aliased("r", RESULT_COLUMNS))
         .chain(aliased("s", STATUS_COLUMNS))
+        // The last change is the file's latest fact, or its creation.
+        .chain(std::iter::once(format!(
+            "COALESCE(u.occurred_at, f.created_at) AS {prefix}updated_at"
+        )))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -151,7 +159,6 @@ pub(crate) fn row_to_file_prefixed<H>(
         path: DrivePath::parse(&path).map_err(config_error)?,
         name: FileName::parse(&name).map_err(config_error)?,
         title: FileTitle::parse(&title).map_err(config_error)?,
-        protected: row.get(column("protected").as_str()),
         media_type: MediaType::parse(&media_type).map_err(config_error)?,
         size_bytes: row.get(column("size_bytes").as_str()),
         sha256: sha256(row.get(column("sha256").as_str()))?,
@@ -252,19 +259,16 @@ impl<H: DriveHost> Persistence for FileStore<H> {
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
             sqlx::query(
-                "UPDATE drive.file SET drive_id = $2, path = $3, name = $4, protected = $5, \
-                   committed_at = $6, metadata = $7, updated_at = $8, ruleset_id = $9, \
-                   steps = $10, title = $11 \
+                "UPDATE drive.file SET drive_id = $2, path = $3, name = $4, committed_at = $5, \
+                   metadata = $6, ruleset_id = $7, steps = $8, title = $9 \
                  WHERE id = $1",
             )
             .bind(file.id)
             .bind(file.drive_id)
             .bind(file.path.as_str())
             .bind(file.name.as_str())
-            .bind(file.protected)
             .bind(file.committed_at)
             .bind(&file.metadata)
-            .bind(file.updated_at)
             .bind(file.ruleset_id)
             .bind(encode_json("a file's steps snapshot", file.steps.as_ref())?)
             .bind(file.title.as_str())
@@ -282,15 +286,13 @@ impl<H: DriveHost> Persistence for FileStore<H> {
         Box::pin(async move {
             sqlx::query(&format!(
                 "INSERT INTO drive.file ({FILE_COLUMNS}) VALUES \
-                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                  $16, $17)"
+                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
             ))
             .bind(file.id)
             .bind(file.drive_id)
             .bind(file.path.as_str())
             .bind(file.name.as_str())
             .bind(file.title.as_str())
-            .bind(file.protected)
             .bind(file.media_type.as_str())
             .bind(file.size_bytes)
             .bind(file.sha256.to_vec())
@@ -301,7 +303,6 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(encode_json("a file's steps snapshot", file.steps.as_ref())?)
             .bind(file.created_by)
             .bind(file.created_at)
-            .bind(file.updated_at)
             .execute(conn)
             .await?;
             Ok(())
@@ -462,8 +463,11 @@ pub async fn entries_under_prefix(
         .collect())
 }
 
+/// Moves the files `ids` from under `from` to under `to`, and records the
+/// move as a fact of each.
 pub async fn rebase_paths(
     conn: &mut PgConnection,
+    author: &Author,
     ids: &[Uuid],
     from: &DrivePath,
     to: &DrivePath,
@@ -471,14 +475,21 @@ pub async fn rebase_paths(
 ) -> Result<u64, EngineError> {
     let done = sqlx::query(
         "UPDATE drive.file \
-         SET path = trim(both '/' from $3 || '/' || substr(path, length($2) + 2)), updated_at = $4 \
+         SET path = trim(both '/' from $3 || '/' || substr(path, length($2) + 2)) \
          WHERE id = ANY($1)",
     )
     .bind(ids)
     .bind(from.as_str())
     .bind(to.as_str())
-    .bind(now)
-    .execute(conn)
+    .execute(&mut *conn)
+    .await?;
+    fact::record(
+        conn,
+        author,
+        Subject::Files(ids),
+        super::FileCause::FolderMoved,
+        now,
+    )
     .await?;
     Ok(done.rows_affected())
 }
@@ -489,11 +500,14 @@ pub struct PageWrite<'a> {
     pub origin: PageOrigin,
 }
 
+/// Writes `pages` of `file_id` (by number) and records each write as a fact
+/// of its page: `cause`, by `author`, at `at`.
 pub async fn upsert_pages(
     conn: &mut PgConnection,
+    author: &Author,
     file_id: Uuid,
     pages: &[PageWrite<'_>],
-    by: Uuid,
+    cause: &super::PageCause,
     at: DateTime<Utc>,
 ) -> Result<(), EngineError> {
     if pages.is_empty() {
@@ -504,22 +518,29 @@ pub async fn upsert_pages(
     let markdowns: Vec<&str> = pages.iter().map(|page| page.markdown).collect();
     let origins: Vec<&str> = pages.iter().map(|page| page.origin.as_str()).collect();
     sqlx::query(
-        "INSERT INTO drive.file_page (file_id, number, markdown, origin, updated_by, updated_at) \
-         SELECT $1, number, markdown, origin, $5, $6 \
+        "INSERT INTO drive.file_page (file_id, number, markdown, origin) \
+         SELECT $1, number, markdown, origin \
          FROM unnest($2::int[], $3::text[], $4::text[]) AS batch(number, markdown, origin) \
          ON CONFLICT (file_id, number) DO UPDATE SET markdown = EXCLUDED.markdown, \
-           origin = EXCLUDED.origin, updated_by = EXCLUDED.updated_by, \
-           updated_at = EXCLUDED.updated_at",
+           origin = EXCLUDED.origin",
     )
     .bind(file_id)
     .bind(&numbers)
     .bind(&markdowns)
     .bind(&origins)
-    .bind(by)
-    .bind(at)
-    .execute(conn)
+    .execute(&mut *conn)
     .await?;
-    Ok(())
+    fact::record(
+        conn,
+        author,
+        Subject::Pages {
+            file_id,
+            numbers: &numbers,
+        },
+        cause,
+        at,
+    )
+    .await
 }
 
 pub async fn page_exists(

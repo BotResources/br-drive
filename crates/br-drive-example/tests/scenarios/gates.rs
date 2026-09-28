@@ -106,20 +106,19 @@ const ANNOTATE: &str =
     "mutation($f:UUID!){workspaceAnnotateFile(fileId:$f,metadata:{by:\"stranger\"}){success}}";
 const SET_LABELS: &str =
     "mutation($f:UUID!){workspaceSetFileLabels(fileId:$f,labelIds:[]){success}}";
-const PROTECT: &str =
-    "mutation($f:UUID!){workspaceProtectFile(fileId:$f,protected:false){success}}";
 
 fn snapshot(file: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
-        "state": file["processingState"], "protected": file["protected"],
+        "state": file["processingState"],
         "name": file["name"], "metadata": file["metadata"], "updatedAt": file["updatedAt"],
     })
 }
 
 #[tokio::test]
 async fn a_stranger_learns_nothing_of_a_file_it_cannot_see_and_changes_nothing() {
-    // Given: in an owner's workspace, a file being processed, a protected file
-    // and a pending upload; and a stranger with a workspace of its own
+    // Given: in an owner's workspace, a file being processed, a file the host
+    // holds (its own per-file rule) and a pending upload; and a stranger with a
+    // workspace of its own
     let world = World::start("pod-gate-order").await;
     let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
@@ -147,8 +146,8 @@ async fn a_stranger_learns_nothing_of_a_file_it_cannot_see_and_changes_nothing()
     ok(&world
         .gql(
             &owner,
-            "mutation($f:UUID!,$p:Boolean!){workspaceProtectFile(fileId:$f,protected:$p){success}}",
-            serde_json::json!({ "f": kept, "p": true }),
+            "mutation($f:UUID!){workspaceAnnotateFile(fileId:$f,metadata:{hold:true}){success}}",
+            serde_json::json!({ "f": kept }),
         )
         .await);
     let pending = Uuid::now_v7();
@@ -201,7 +200,7 @@ async fn a_stranger_learns_nothing_of_a_file_it_cannot_see_and_changes_nothing()
         assert_eq!(on_file, "FILE_NOT_FOUND", "{mutation}");
         assert_eq!(on_file, on_unknown, "{mutation}");
     }
-    // And: a move of the protected file into the stranger's own drive is not found either
+    // And: a move of the held file into the stranger's own drive is not found either
     assert_eq!(
         code(
             &world,
@@ -211,11 +210,6 @@ async fn a_stranger_learns_nothing_of_a_file_it_cannot_see_and_changes_nothing()
         )
         .await,
         "FILE_NOT_FOUND"
-    );
-    // And: the host's own protect gesture refuses the stranger too
-    assert_eq!(
-        code(&world, &stranger, PROTECT, serde_json::json!({ "f": kept })).await,
-        "NOT_THE_WORKSPACE_OWNER"
     );
 
     // And: nothing moved — no delta, no job asked for, every file as it was
@@ -230,13 +224,14 @@ async fn a_stranger_learns_nothing_of_a_file_it_cannot_see_and_changes_nothing()
     }
     assert_eq!(after, snapshots);
 
-    // And: the owner, whom the host allows, meets the state refusals
+    // And: the owner, whom the host lets see the files, meets the state
+    // refusals and the host's own per-file rule
     for (mutation, file, state) in [
         (PROCESS, processing, "FILE_PROCESSING"),
         (EDIT_PAGE, processing, "FILE_PROCESSING"),
         (REGENERATE, processing, "FILE_PROCESSING"),
-        (DELETE, kept, "FILE_PROTECTED"),
-        (RENAME, kept, "FILE_PROTECTED"),
+        (DELETE, kept, "FILE_ON_HOLD"),
+        (RENAME, kept, "FILE_ON_HOLD"),
     ] {
         assert_eq!(
             code(&world, &owner, mutation, serde_json::json!({ "f": file })).await,

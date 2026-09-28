@@ -9,6 +9,7 @@ use service_engine::pipeline::{Bulk, MutationInput};
 use uuid::Uuid;
 
 use crate::drive::DriveRow;
+use crate::fact::Author;
 use crate::fault::{DriveFault, codes};
 use crate::file::store;
 use crate::file::{DriveFiles, DrivePages, File, FileCause, FileRow};
@@ -17,7 +18,7 @@ use crate::path::DrivePath;
 
 /// The files under `prefix`, each one allowed to the principal by the same
 /// decision the per-file gesture asks (`gate`: `UpdateFile` for a move,
-/// `DeleteFile` for a delete, protection included) — all or nothing, so a
+/// `DeleteFile` for a delete) — all or nothing, so a
 /// folder gesture never reaches a file its principal could not move or delete
 /// one by one (`folder_verdict`). The decisions are in memory over the rows
 /// the gesture loads anyway: they add no statement, whatever the folder's size.
@@ -42,8 +43,8 @@ pub(crate) async fn folder_members<H: DriveHost>(
 /// An empty folder is `FOLDER_NOT_FOUND`. A file refused as not found (the
 /// principal cannot see it) makes the whole folder `FOLDER_NOT_FOUND` too,
 /// wherever it sorts, so neither an invisible file nor its place is ever
-/// disclosed. Otherwise the first refusal answers: the host's code, or
-/// `FILE_PROTECTED`.
+/// disclosed. Otherwise the first refusal in path order answers: the host's
+/// code.
 pub(crate) fn folder_verdict(
     refusals: impl IntoIterator<Item = Option<Reason>>,
 ) -> Result<(), Reason> {
@@ -167,7 +168,16 @@ pub fn move_folder<'m, H: DriveHost>(
         }
         let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
         let now = cx.now().as_datetime();
-        store::rebase_paths(cx.connection(), &ids, &old_prefix, &new_prefix, now).await?;
+        let author = Author::of(cx.principal());
+        store::rebase_paths(
+            cx.connection(),
+            &author,
+            &ids,
+            &old_prefix,
+            &new_prefix,
+            now,
+        )
+        .await?;
         H::folder_moved(cx, input.drive_id, &old_prefix, &new_prefix).await?;
         impact_rows(cx, input.drive_id, &ids, FileCause::FolderMoved)
     })
@@ -219,6 +229,7 @@ mod tests {
     use super::*;
 
     const HELD: Reason = Reason::new("FILE_ON_HOLD");
+    const NOT_YOURS: Reason = Reason::new("NOT_THE_UPLOADER");
 
     #[test]
     fn an_empty_folder_is_not_found() {
@@ -233,13 +244,10 @@ mod tests {
     #[test]
     fn the_first_refusal_in_path_order_answers_for_the_folder() {
         assert_eq!(
-            folder_verdict([None, Some(codes::FILE_PROTECTED), Some(HELD)]),
-            Err(codes::FILE_PROTECTED)
+            folder_verdict([None, Some(NOT_YOURS), Some(HELD)]),
+            Err(NOT_YOURS)
         );
-        assert_eq!(
-            folder_verdict([Some(HELD), Some(codes::FILE_PROTECTED)]),
-            Err(HELD)
-        );
+        assert_eq!(folder_verdict([Some(HELD), Some(NOT_YOURS)]), Err(HELD));
     }
 
     #[test]

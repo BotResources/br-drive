@@ -20,7 +20,6 @@ pub fn register(engine: &mut Engine<AppPrincipal>) -> Result<(), EngineError> {
     engine.register_bulk::<mutations::DeleteWorkspace, _>(mutations::delete_workspace)?;
     engine.register_mutation::<mutations::TransferWorkspace, _>(mutations::transfer_workspace)?;
     #[cfg(feature = "drive")]
-    engine.register_mutation::<mutations::ProtectFile, _>(mutations::protect_file)?;
     #[cfg(feature = "drive")]
     engine.register_mutation::<mutations::AnnotateFile, _>(mutations::annotate_file)?;
     engine.register_schema_slice(

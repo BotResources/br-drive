@@ -20,8 +20,7 @@ pub const NOT_THE_UPLOADER: Reason = Reason::new("NOT_THE_UPLOADER");
 /// any workspace, but no single file is its to move or delete — so the
 /// library refuses its folder gestures whole.
 pub const SWEEP_SCOPE: &str = "workspace:sweep";
-/// The host's own per-file rule, beside the library's `protected`: a file
-/// whose metadata says `{"hold": true}` may be neither moved nor deleted.
+/// The host's own per-file rule: a file whose metadata says `{"hold": true}` may be neither moved nor deleted.
 pub const FILE_ON_HOLD: Reason = Reason::new("FILE_ON_HOLD");
 pub const HOLD_KEY: &str = "hold";
 

@@ -1,3 +1,4 @@
+mod audit;
 mod bulk;
 mod cancellation;
 mod cascade;

@@ -12,6 +12,7 @@ use super::store::{
     serialize_labels,
 };
 use super::{Label, LabelCause, LabelRow, validate_color, validate_description, validate_name};
+use crate::fact::{Author, Subject};
 use crate::fault::{DriveFault, codes};
 use crate::file::{DriveFiles, File, FileCause, FileRow};
 use crate::host::{DriveHost, DriveRequest};
@@ -110,8 +111,18 @@ pub fn update_label<'m, H: DriveHost>(
         label.name = name;
         label.color = color;
         label.description = description;
-        label.updated_at = cx.now().as_datetime();
         cx.save(&label).await?;
+        let now = cx.now().as_datetime();
+        let author = Author::of(cx.principal());
+        crate::fact::record(
+            cx.connection(),
+            &author,
+            Subject::Label(label.id),
+            LabelCause::Updated,
+            now,
+        )
+        .await?;
+        label.updated_at = now;
         cx.impact_caused::<Label, _>(&label.id, LabelCause::Updated)?;
         Ok(())
     })

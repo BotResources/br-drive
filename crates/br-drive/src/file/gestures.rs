@@ -10,6 +10,7 @@ use super::aggregate::{FileCause, FileRow, PageOrigin, ProcessingState};
 use super::pages::{Page, PageCause, PageKey};
 use super::store::{self, PageWrite};
 use crate::drive::DriveRow;
+use crate::fact::Author;
 use crate::fault::{DriveFault, codes};
 use crate::host::DriveHost;
 use crate::path::{DrivePath, FileName};
@@ -43,17 +44,18 @@ pub fn edit_page<'m, H: DriveHost>(
         if !store::page_exists(cx.connection(), file.id, input.number).await? {
             return Err(DriveFault::Refused(codes::PAGE_NOT_FOUND));
         }
-        let by = cx.principal().id().as_uuid();
+        let author = Author::of(cx.principal());
         let now = cx.now().as_datetime();
         store::upsert_pages(
             cx.connection(),
+            &author,
             file.id,
             &[PageWrite {
                 number: input.number,
                 markdown: &input.markdown,
                 origin: PageOrigin::Edited,
             }],
-            by,
+            &PageCause::Edited,
             now,
         )
         .await?;
@@ -139,12 +141,12 @@ pub fn update_file<'m, H: DriveHost>(
         file.drive_id = target_drive;
         file.path = target_path;
         file.name = target_name;
-        file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
         if from_drive != target_drive {
             crate::owner::touch::<H>(cx, from_drive)?;
         }
-        crate::file::file_changed::<H>(cx, &file, cause)?;
+        let author = Author::of(cx.principal());
+        crate::file::file_recorded::<H>(cx, &author, &mut file, cause).await?;
         Ok(())
     })
 }
@@ -179,9 +181,9 @@ pub fn retitle_file<'m, H: DriveHost>(
             return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
         }
         file.title = title;
-        file.updated_at = cx.now().as_datetime();
         cx.save(&file).await?;
-        crate::file::file_changed::<H>(cx, &file, FileCause::Retitled)?;
+        let author = Author::of(cx.principal());
+        crate::file::file_recorded::<H>(cx, &author, &mut file, FileCause::Retitled).await?;
         Ok(())
     })
 }
@@ -262,7 +264,8 @@ pub fn process_file<'m, H: DriveHost>(
             (None, _) => return Err(DriveFault::Refused(codes::NO_RULESET_MATCHES)),
         };
         let initiator = processing::Initiator::of(cx.principal());
-        processing::start_chain(cx, &mut file, plan, trigger, initiator).await?;
+        let author = Author::of(cx.principal());
+        processing::start_chain(cx, &author, &mut file, plan, trigger, initiator).await?;
         Ok(())
     })
 }
@@ -314,7 +317,16 @@ pub fn regenerate_page<'m, H: DriveHost>(
             &ruleset,
             Some(&serde_json::Value::Object(options)),
         );
-        processing::start_chain(cx, &mut file, plan, Trigger::RegeneratePage, initiator).await?;
+        let author = Author::of(cx.principal());
+        processing::start_chain(
+            cx,
+            &author,
+            &mut file,
+            plan,
+            Trigger::RegeneratePage,
+            initiator,
+        )
+        .await?;
         Ok(())
     })
 }
@@ -355,9 +367,14 @@ pub fn cancel_processing<'m, H: DriveHost>(
             payload: CancelJob { job_id },
         })?;
         processing::refresh_status(cx, &mut file).await?;
-        file.updated_at = cx.now().as_datetime();
-        cx.save(&file).await?;
-        crate::file::file_changed::<H>(cx, &file, FileCause::CancelRequested { job_id })?;
+        let author = Author::of(cx.principal());
+        crate::file::file_recorded::<H>(
+            cx,
+            &author,
+            &mut file,
+            FileCause::CancelRequested { job_id },
+        )
+        .await?;
         Ok(())
     })
 }

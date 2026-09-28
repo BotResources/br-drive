@@ -9,6 +9,56 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.4.0 — 2026-09-28
+
+### Added
+
+- **An audit trail of append-only facts** (`drive.fact`, migration
+  `9121000010`), shaped like the identity service's: every change of a file
+  (rename, move, folder move, retitle, metadata, commit,
+  processing started, report stored, processing finished or failed, cancel
+  requested), of a page (reported, edited), of a label (updated) or of a rule
+  (saved) is a fact naming its `actor_id`, its `actor_kind` (`human`,
+  `service`, `runner`), the admin behind an impersonated session
+  (`impersonator_id`), the gesture's `correlation_id`, the change
+  (`fact_type`, `payload`) and `occurred_at`. The engine keeps no such trail
+  (its `event_log` serves event-sourced aggregates only and records no actor),
+  so the library does, once.
+
+### Changed
+
+- The columns overwritten on every change are gone — `drive.file.updated_at`,
+  `drive.file_page.updated_by` / `updated_at`, `drive.label.updated_at`,
+  `drive.ruleset.updated_at`: the last change is read from the facts. The
+  GraphQL fields stay, with the same shape: `DriveFile`, `DriveLabel` and
+  `DriveRuleset`'s `updatedAt` are the object's latest fact (its creation when
+  none); `DrivePage.updatedBy` / `updatedAt` and `RunnerPage.updatedAt` the
+  page's latest fact. `FileRow`, `LabelRow`, `RulesetRow` and `PageRecord` keep
+  their fields, read the same way.
+- An erase anonymises the facts naming the person, as actor or as
+  impersonator; the facts stay.
+
+### Removed
+
+- The `protected` mark — no host uses it: `br_drive::set_protected`, the
+  `drive.file.protected` column (dropped by migration `9121000010`),
+  `DriveFile.protected` and `FileRow.protected`, the `FILE_PROTECTED` code and
+  every refusal of a rename, a move, a delete or a folder gesture on a
+  protected file, the `FileCause::ProtectionChanged` cause (and fact), the
+  example host's `workspaceProtectFile`. A host keeps such a rule in its own
+  gate.
+
+### Upgrading from 0.3
+
+- A host that called `set_protected` or matched `FILE_PROTECTED` or
+  `ProtectionChanged` moves that rule into its own gate (on the row's
+  metadata, say, as the example host's `{"hold": true}`).
+- Migration `9121000010` carries each object's last change over as one fact
+  (`LastChangeCarriedOver`, actor kind `unknown`: 0.3 did not record who; a
+  page keeps its recorded writer as the fact's actor), for every page and for
+  every file, label and rule changed since its creation, then drops the
+  overwritten columns and `drive.file.protected`. One-way.
+
 ## 0.3.0 — 2026-09-28
 
 ### Added

@@ -301,82 +301,6 @@ async fn renaming_and_moving_a_file_updates_its_path_and_a_taken_name_is_refused
     world.cleanup().await;
 }
 
-#[tokio::test]
-async fn a_protected_file_refuses_user_rename_move_and_delete_and_says_so_in_its_affordances() {
-    let world = World::start("pod-protected").await;
-    let owner = passport(Uuid::now_v7());
-    let drive = world.create_workspace(&owner, "library").await;
-    let ids = seed_tree(&world, &owner, drive).await;
-    let mut sub = drive_subscription(&world, &owner, drive).await;
-
-    ok(&world
-        .gql(
-            &owner,
-            "mutation($f:UUID!,$p:Boolean!){workspaceProtectFile(fileId:$f,protected:$p){success}}",
-            serde_json::json!({ "f": ids["a.txt"], "p": true }),
-        )
-        .await);
-    let protected = next_drive_delta(&mut sub, |node| {
-        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProtectionChanged"
-    })
-    .await;
-    for action in ["delete", "rename", "move"] {
-        assert_eq!(
-            protected["view"]["affordances"][action]["allowed"], false,
-            "{action} is not afforded on a protected file"
-        );
-        assert_eq!(
-            protected["view"]["affordances"][action]["reason"],
-            "FILE_PROTECTED"
-        );
-    }
-    assert_eq!(
-        protected["view"]["affordances"]["download"]["allowed"], true,
-        "protection restricts curation, not reading"
-    );
-
-    let renamed = update_file(
-        &world,
-        &owner,
-        ids["a.txt"],
-        serde_json::json!({ "n": "nope.txt" }),
-    )
-    .await;
-    assert_eq!(error_code(&renamed), "FILE_PROTECTED");
-    let deleted = world
-        .gql(
-            &owner,
-            "mutation($f:UUID!){workspaceDeleteFile(fileId:$f){success}}",
-            serde_json::json!({ "f": ids["a.txt"] }),
-        )
-        .await;
-    assert_eq!(error_code(&deleted), "FILE_PROTECTED");
-    let moved = move_folder(&world, &owner, drive, "docs", "elsewhere").await;
-    assert_eq!(error_code(&moved), "FILE_PROTECTED");
-    let removed = delete_folder(&world, &owner, drive, "docs").await;
-    assert_eq!(error_code(&removed), "FILE_PROTECTED");
-    assert_eq!(
-        paths(&world.drive_files(&owner, drive).await).len(),
-        3,
-        "nothing moved or vanished"
-    );
-
-    ok(&world
-        .gql(
-            &owner,
-            "mutation($f:UUID!,$p:Boolean!){workspaceProtectFile(fileId:$f,protected:$p){success}}",
-            serde_json::json!({ "f": ids["a.txt"], "p": false }),
-        )
-        .await);
-    assert_eq!(
-        world.file(&owner, ids["a.txt"]).await["affordances"]["delete"]["allowed"],
-        true
-    );
-    ok(&delete_folder(&world, &owner, drive, "docs").await);
-
-    world.cleanup().await;
-}
-
 const ANNOTATE: &str =
     "mutation($f:UUID!,$m:JSON!){workspaceAnnotateFile(fileId:$f,metadata:$m){success}}";
 const SWEEP_SCOPE: &str = "workspace:sweep";
@@ -428,35 +352,6 @@ async fn a_folder_gesture_asks_every_file_the_per_file_rule_and_is_refused_whole
         );
     }
     let before = paths(&world.drive_files(&owner, drive).await);
-    quiet(&mut sub).await;
-
-    // When: another file of the folder, earlier in path order than the held
-    // one (docs/d.txt before docs/sub/b.txt) but later by id, is protected too
-    ok(&world
-        .gql(
-            &owner,
-            "mutation($f:UUID!,$p:Boolean!){workspaceProtectFile(fileId:$f,protected:$p){success}}",
-            serde_json::json!({ "f": ids["d.txt"], "p": true }),
-        )
-        .await);
-    quiet(&mut sub).await;
-
-    // Then: the folder gestures answer the first refusal in path order
-    assert_eq!(
-        error_code(&move_folder(&world, &owner, drive, "docs", "archive").await),
-        "FILE_PROTECTED"
-    );
-    assert_eq!(
-        error_code(&delete_folder(&world, &owner, drive, "docs").await),
-        "FILE_PROTECTED"
-    );
-    ok(&world
-        .gql(
-            &owner,
-            "mutation($f:UUID!,$p:Boolean!){workspaceProtectFile(fileId:$f,protected:$p){success}}",
-            serde_json::json!({ "f": ids["d.txt"], "p": false }),
-        )
-        .await);
     quiet(&mut sub).await;
 
     // When: the owner, whom the host lets act on the folder, moves or deletes it

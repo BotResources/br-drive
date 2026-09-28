@@ -8,8 +8,8 @@ mod log;
 mod reactions;
 mod roots;
 
-pub use chain::{ChainPlan, cancel_active_job, start_chain};
-pub(crate) use chain::{refresh_status, report_done, report_failed};
+pub use chain::{ChainPlan, cancel_active_job};
+pub(crate) use chain::{refresh_status, report_done, report_failed, start_chain};
 pub use commands::Initiator;
 pub(crate) use commands::JobCancel;
 pub use log::{FileJob, RunProgress, kind as job_event};

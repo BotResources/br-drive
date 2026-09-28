@@ -3,30 +3,12 @@ use uuid::Uuid;
 
 use super::aggregate::{FileCause, FileRow};
 use super::store;
+use crate::fact::Author;
 use crate::fault::{DriveFault, codes};
 use crate::host::DriveHost;
 
 pub async fn drive_of(ops: &mut Ops<'_>, file_id: Uuid) -> Result<Option<Uuid>, DriveFault> {
     Ok(store::drive_of(ops.connection(), file_id).await?)
-}
-
-pub async fn set_protected<H: DriveHost>(
-    ops: &mut Ops<'_>,
-    file_id: Uuid,
-    protected: bool,
-) -> Result<(), DriveFault> {
-    let mut file = ops
-        .load::<FileRow<H>>(&file_id)
-        .await?
-        .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
-    if file.protected == protected {
-        return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
-    }
-    file.protected = protected;
-    file.updated_at = ops.now().as_datetime();
-    ops.save(&file).await?;
-    crate::file::file_changed::<H>(ops, &file, FileCause::ProtectionChanged { protected })?;
-    Ok(())
 }
 
 /// Writes the host's free JSON on a file, asking the host's gate
@@ -46,8 +28,8 @@ pub async fn set_metadata<H: DriveHost>(
         return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
     }
     file.metadata = metadata;
-    file.updated_at = ops.now().as_datetime();
     ops.save(&file).await?;
-    crate::file::file_changed::<H>(ops, &file, FileCause::MetadataChanged)?;
+    let author = Author::of(principal);
+    crate::file::file_recorded::<H>(ops, &author, &mut file, FileCause::MetadataChanged).await?;
     Ok(())
 }

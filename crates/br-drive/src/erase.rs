@@ -14,9 +14,9 @@ use crate::file::store;
 use crate::file::{File, FileCause};
 use crate::host::DriveHost;
 
-/// The person id every anonymised `created_by` / `updated_by` / `triggered_by`
-/// / `requested_by` is rewritten to: the nil UUID, which no real principal
-/// carries.
+/// The person id every anonymised `created_by` / `triggered_by` /
+/// `requested_by` / fact `actor_id` / `impersonator_id` is rewritten to: the
+/// nil UUID, which no real principal carries.
 pub const REDACTED_PERSON: Uuid = Uuid::nil();
 
 /// What the library does with a person's rows when the host erases them.
@@ -44,7 +44,6 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
     for (table, column) in [
         ("drive.drive", "created_by"),
         ("drive.file", "created_by"),
-        ("drive.file_page", "updated_by"),
         ("drive.label", "created_by"),
         ("drive.file_label", "created_by"),
         ("drive.ruleset", "created_by"),
@@ -82,9 +81,21 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
         sqlx::query("UPDATE drive.file_job_cancel SET requested_by = $2 WHERE requested_by = $1")
             .bind(person)
             .bind(REDACTED_PERSON)
-            .execute(conn)
+            .execute(&mut *conn)
             .await?;
     rows += done.rows_affected();
+    // The audit trail keeps what happened and loses who did it: the person's
+    // hand, acting or impersonating.
+    for column in ["actor_id", "impersonator_id"] {
+        let done = sqlx::query(&format!(
+            "UPDATE drive.fact SET {column} = $2 WHERE {column} = $1"
+        ))
+        .bind(person)
+        .bind(REDACTED_PERSON)
+        .execute(&mut *conn)
+        .await?;
+        rows += done.rows_affected();
+    }
     Ok(rows)
 }
 

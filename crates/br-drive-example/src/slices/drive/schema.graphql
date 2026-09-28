@@ -17,7 +17,6 @@ type DriveFile {
 	path: String!
 	name: String!
 	title: String!
-	protected: Boolean!
 	mediaType: String!
 	sizeBytes: ByteCount!
 	sha256: String!

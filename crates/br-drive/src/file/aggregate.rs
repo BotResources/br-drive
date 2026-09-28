@@ -103,9 +103,6 @@ pub enum FileCause {
         from_drive: Uuid,
     },
     FolderMoved,
-    ProtectionChanged {
-        protected: bool,
-    },
     MetadataChanged,
     ImageRequested {
         name: String,
@@ -148,7 +145,6 @@ pub struct FileRow<H> {
     pub path: DrivePath,
     pub name: FileName,
     pub title: FileTitle,
-    pub protected: bool,
     pub media_type: MediaType,
     pub size_bytes: i64,
     pub sha256: [u8; 32],
@@ -199,7 +195,6 @@ impl<H> Clone for FileRow<H> {
             path: self.path.clone(),
             name: self.name.clone(),
             title: self.title.clone(),
-            protected: self.protected,
             media_type: self.media_type.clone(),
             size_bytes: self.size_bytes,
             sha256: self.sha256,
@@ -292,16 +287,6 @@ fn host_then<H: DriveHost>(
     }
 }
 
-fn unprotected<H: DriveHost>(
-    file: &FileRow<H>,
-    principal: &H,
-    request: DriveRequest<'_, H>,
-) -> Gate {
-    host_then(file, principal, request, || {
-        file.protected.then_some(codes::FILE_PROTECTED)
-    })
-}
-
 fn ready<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
     host_then(file, principal, request, || match file.status.state {
         ProcessingState::Ready => None,
@@ -328,23 +313,23 @@ service_engine::gated! {
     generics [H: DriveHost];
     FileRow<H>, H;
     "delete" => fn delete_gate(this, principal) {
-        unprotected(this, principal, DriveRequest::DeleteFile { file: this })
+        host_gate(this, principal, &DriveRequest::DeleteFile { file: this })
     }
     "rename" => fn rename_gate(this, principal) {
-        unprotected(
+        host_gate(
             this,
             principal,
-            DriveRequest::UpdateFile {
+            &DriveRequest::UpdateFile {
                 file: this,
                 target_drive: this.drive_id,
             },
         )
     }
     "move" => fn move_gate(this, principal) {
-        unprotected(
+        host_gate(
             this,
             principal,
-            DriveRequest::UpdateFile {
+            &DriveRequest::UpdateFile {
                 file: this,
                 target_drive: this.drive_id,
             },
@@ -392,6 +377,27 @@ pub(crate) fn file_changed<H: DriveHost>(
     ops.impact_caused::<File, _>(&file.id, cause)
 }
 
+/// Records a change of `file` as a fact (`cause`, by `author`, now) — its
+/// last change moves — and stages its impact (`file_changed`).
+pub(crate) async fn file_recorded<H: DriveHost>(
+    ops: &mut service_engine::pipeline::Ops<'_>,
+    author: &crate::fact::Author,
+    file: &mut FileRow<H>,
+    cause: FileCause,
+) -> Result<(), service_engine::error::EngineError> {
+    let now = ops.now().as_datetime();
+    crate::fact::record(
+        ops.connection(),
+        author,
+        crate::fact::Subject::File(file.id),
+        &cause,
+        now,
+    )
+    .await?;
+    file.updated_at = now;
+    file_changed::<H>(ops, file, cause)
+}
+
 /// Stages the progress of `file`'s running job: its own views, with the
 /// `ProgressChanged` cause. The host object is not touched: progress never
 /// changes the drive's counts.
@@ -404,10 +410,10 @@ pub(crate) fn file_progressed<H: DriveHost>(
 
 impl<H: DriveHost> FileRow<H> {
     pub fn move_to_gate(&self, principal: &H, target_drive: Uuid) -> Gate {
-        unprotected(
+        host_gate(
             self,
             principal,
-            DriveRequest::UpdateFile {
+            &DriveRequest::UpdateFile {
                 file: self,
                 target_drive,
             },

@@ -16,6 +16,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::blob::DriveImage;
+use crate::fact::Author;
 use crate::fault::{DriveFault, codes};
 use crate::file::images::{
     BlobFacts, ImageKey, ImageRecord, drop_images, image_names_of, image_names_of_page,
@@ -344,7 +345,7 @@ pub fn runner_report<'m, H: DriveHost>(
             .active_job()
             .cloned()
             .ok_or(DriveFault::Refused(codes::JOB_NOT_ACTIVE))?;
-        let by = cx.principal().id().as_uuid();
+        let author = Author::of(cx.principal());
         let now = cx.now().as_datetime();
 
         // A page a person edited is kept by an upload or a reprocess run; a
@@ -384,17 +385,18 @@ pub fn runner_report<'m, H: DriveHost>(
                 origin: input.origin,
             })
             .collect();
-        store::upsert_pages(cx.connection(), file.id, &writes, by, now).await?;
+        let reported = PageCause::Reported {
+            job_id: input.job_id,
+            origin: input.origin,
+        };
+        store::upsert_pages(cx.connection(), &author, file.id, &writes, &reported, now).await?;
         for page in &pages {
             cx.impact_caused::<Page, _>(
                 &PageKey {
                     file_id: file.id,
                     number: page.number,
                 },
-                PageCause::Reported {
-                    job_id: input.job_id,
-                    origin: input.origin,
-                },
+                reported.clone(),
             )?;
         }
         if !dropped.is_empty() {
@@ -411,22 +413,22 @@ pub fn runner_report<'m, H: DriveHost>(
                 file.estimated_tokens,
             )
             .await?;
-            file.updated_at = now;
-            cx.save(&file).await?;
-            crate::file::file_changed::<H>(
+            crate::file::file_recorded::<H>(
                 cx,
-                &file,
+                &author,
+                &mut file,
                 FileCause::ReportStored {
                     job_id: input.job_id,
                     done: input.done,
                 },
-            )?;
+            )
+            .await?;
         }
         // The final report ends the job, here: the chain moves on in this
         // transaction and Jobs is told (`job.finish`); its `completed` then
         // only confirms it.
         if input.done {
-            crate::processing::report_done(cx, &mut file, &job).await?;
+            crate::processing::report_done(cx, &author, &mut file, &job).await?;
         }
         Ok(())
     })
@@ -490,8 +492,10 @@ pub fn runner_report_failure<'m, H: DriveHost>(
             .active_job()
             .cloned()
             .ok_or(DriveFault::Refused(codes::JOB_NOT_ACTIVE))?;
+        let author = Author::of(cx.principal());
         crate::processing::report_failed(
             cx,
+            &author,
             &mut file,
             &job,
             &input.reason_code,
