@@ -1,5 +1,4 @@
-//! The rules every rendition write obeys, whoever writes it — a runner's
-//! report or a host's import.
+//! The rules every rendition a runner reports obeys.
 
 use std::collections::HashSet;
 
@@ -7,8 +6,7 @@ use crate::fault::{DriveFault, codes};
 use crate::file::FileRow;
 use crate::runner::MAX_REPORT_PAGES;
 
-/// The rules every rendition write obeys, from a runner or from an import:
-/// at most `MAX_REPORT_PAGES` pages, numbered from 1 and distinct; the summary
+/// The rules every rendition a runner reports obeys: at most `MAX_REPORT_PAGES` pages, numbered from 1 and distinct; the summary
 /// and the page count together, the token estimate optional and only with
 /// them, none negative. Answers whether the write carries an indexing.
 pub(crate) fn validate_rendition(

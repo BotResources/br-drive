@@ -281,7 +281,7 @@ async fn renaming_and_moving_a_file_updates_its_path_and_a_taken_name_is_refused
         .gql(
             &owner,
             "mutation($f:UUID!,$m:JSON!){workspaceAnnotateFile(fileId:$f,metadata:$m){success}}",
-            serde_json::json!({ "f": ids["c.txt"], "m": { "origin": "import", "page": 3 } }),
+            serde_json::json!({ "f": ids["c.txt"], "m": { "origin": "scan", "page": 3 } }),
         )
         .await);
     let annotated = next_drive_delta(&mut sub, |node| {
@@ -293,7 +293,7 @@ async fn renaming_and_moving_a_file_updates_its_path_and_a_taken_name_is_refused
         .gql(
             &owner,
             "mutation($f:UUID!,$m:JSON!){workspaceAnnotateFile(fileId:$f,metadata:$m){success}}",
-            serde_json::json!({ "f": ids["c.txt"], "m": { "origin": "import", "page": 3 } }),
+            serde_json::json!({ "f": ids["c.txt"], "m": { "origin": "scan", "page": 3 } }),
         )
         .await;
     assert_eq!(error_code(&again), "NOTHING_TO_CHANGE");

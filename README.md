@@ -24,7 +24,7 @@ The workspace's MSRV is Rust 1.94 — the floor of the pinned `contract-jobs`
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.2.1", version = "0.2.1" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.3.0", version = "0.3.0" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -35,6 +35,7 @@ The `version` beside the `tag` is required: a tag-only git dependency carries a
 |---|---|
 | 0.1 | `v0.3.0` |
 | 0.2 | `v0.3.4` |
+| 0.3 | `v0.3.4` |
 
 ## What a host writes
 
@@ -87,7 +88,7 @@ rolls them together. The host never writes to the `drive` schema directly.
 
 1. **Compose**: `slice drive ["drive"] from br_drive::drive_slice { query = drive::DriveQuery, mutation = drive::DriveMutation, subscription = drive::DriveSubscription }` under the host's `prefix`; every root below appears at that prefix.
 2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and both of the library's self-commands (`upload-deadline`, `image-landed`) arrive as a service actor, and a resolver that rejects services parks all ten reactions.
-3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `IMPORT_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `visible_drives` (never a service principal), `display_name`, `upload_window`, `erase_mode`, the two folder hooks.
+3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `visible_drives` (never a service principal), `display_name`, `upload_window`, `erase_mode`, the two folder hooks.
 4. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
 5. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
 6. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
@@ -102,7 +103,6 @@ impl DriveHost for AppPrincipal {
     const SERVICE: &'static str = "workspace";          // the host service name
     const RUNNER_SCOPE: &'static str = "workspace:runner";
     const VISIBILITY_DEPS: Deps = Deps::from_bits(1 << OWNERSHIP_DEP);
-    const IMPORT_SCOPE: Option<&'static str> = Some("workspace:import"); // default None: no import
     type DriveOwner = Workspace;                        // or br_drive::NoDriveOwner
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate { … }
@@ -129,7 +129,7 @@ every `RequestUpload`.
   `DeleteFolder { drive, prefix }`, `Process { file }` (every
   `ProcessFile`, the first one included),
   `CancelProcessing { file }`, `EditPage { file }`,
-  `RegeneratePage { file, number }`, `RetitleFile { file }`, `Import { file }`, `ManageRulesets`, `ReadRulesets`,
+  `RegeneratePage { file, number }`, `RetitleFile { file }`, `ManageRulesets`, `ReadRulesets`,
   `ManageLabels`, `ReadLabels`, `SetFileLabels { file }`,
   `SetMetadata { file }`. The host answers `Gate::allowed()`
   or `Gate::blocked(<its own reason code>)` — to refuse a media type it cannot
@@ -185,10 +185,6 @@ every `RequestUpload`.
   &drive_ids)` answers the files and READY files of several drives in one
   statement, served by an index. Cost: each such impact re-runs the window
   query of every live session holding a window on the host noun.
-- `IMPORT_SCOPE` (default `None`): the scope a service account must hold to
-  import a rendition (`<p>ImportPages`, `<p>ImportImage`). `None` means the
-  host offers no import at all: the library refuses with
-  `IMPORT_SCOPE_REQUIRED` before any gate, as it does for the runner scope.
 - `visible_drives` is the cohort membership of the reactive views (dimension
   `drive`, `Cohort::uuid("drive", drive_id)`): a principal sees the files of the
   drives it lists. When that answer changes, the host stages
@@ -224,7 +220,7 @@ renders it, is committed at
 | Root | Shape |
 |---|---|
 | `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256, title?): UploadTicket!` | `title` trimmed, 1–255 characters, one line, no control or bidirectional-override character (`INVALID_TITLE`); absent, it is the requested `name` without its extension (`report.pdf` → `report`; a name with no stem is kept whole; a collision renames the file, never its title); gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). |
-| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then the file is `READY` — stored, not processed: a commit never runs a rule. A second commit is `FILE_NOT_PENDING`. The one commit gesture, a migration's included: the host's gate lets its migration account (`DriveHost::is_importer`, the `IMPORT_SCOPE`) commit the uploads it made — upload, `CommitUpload`, then `ImportPages` / `ImportImage` (the example host does exactly that). |
+| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then the file is `READY` — stored, not processed: a commit never runs a rule. A second commit is `FILE_NOT_PENDING`. |
 | `<p>ProcessFile(fileId, rulesetId?): MutationAck!` | the only way to start processing, right after the commit, later, or never: gate `Process { file }`, then a `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload, `FILE_PROCESSING` while a chain runs). A file that never had a job runs its `upload` rule, any other its `reprocess` rule (see "Processing rules": `RULESET_NOT_FOUND`, `RULESET_MISMATCH`, `NO_RULESET_MATCHES`). Nothing is wiped: the previous results stay readable while the new run reports over them. Affordance `process`. |
 | `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; logs `cancel_requested` on the running job and stages `job.cancel.v2` for it (`CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). Affordance `cancelProcessing`. |
 | `<p>RegeneratePage(fileId, number, comment?, rulesetId?): MutationAck!` | run the `regenerate_page` rule on one page of a `READY` file: `page` and `comment` are merged into the first step's options; `PAGE_NOT_FOUND`, `NO_RULESET_MATCHES`. Affordance `regeneratePage` on the page. |
@@ -276,12 +272,12 @@ lane notices. `cause` is one of the library's file causes (`UploadRequested`,
 `UploadCommitted`, `UploadAbandoned`, `SourceAvailable`, `Renamed`, `Retitled`, `Moved {
 from_drive }`, `FolderMoved`, `ProtectionChanged { protected }`,
 `MetadataChanged`, `ImageRequested { name }`, `ImageAvailable { name }`,
-`ImagesDropped { names }`, `ReportStored { job_id, done }`, `RenditionImported`,
+`ImagesDropped { names }`, `ReportStored { job_id, done }`,
 `ProcessingStarted { job_id, step }`, `ProgressChanged`,
 `ProcessingFinished`, `ProcessingFailed { reason }`, `CancelRequested { job_id }`, `LabelsChanged {
 detached }`, `Erased`, `Deleted`, `FolderDeleted`, `DriveDeleted`), page
 causes (`Reported { job_id, origin
-}`, `Edited`, `Imported { origin }`), label causes (`Created`, `Updated`, `Deleted`) or rule causes
+}`, `Edited`), label causes (`Created`, `Updated`, `Deleted`) or rule causes
 (`Saved { unknown_runner_types }`, `Deleted`) on a delta the engine attributes
 to an impact; a key that
 **enters or leaves** a live session's window (a created or deleted file, a
@@ -319,8 +315,6 @@ runner reports and never interprets a media type.
 |---|---|
 | `<p>RunnerContext(fileId, jobId): RunnerContext!` | `{ fileId, mediaType, name, pageCount, summary, pages[] { number, markdown, origin, updatedAt }, images[], sourceUrl }` — a **fresh** presigned GET on the source (inline) at every call, plus the current rendition read directly by file id, so an indexer or a page-regeneration runner reads the pages, not the source. `FILE_NOT_FOUND` for an unknown file, `JOB_NOT_ACTIVE` for any job but the file's, `SOURCE_NOT_AVAILABLE` while the engine reaper has not promoted the source yet (retry). |
 | `<p>RunnerRequestImageUpload(fileId, jobId, name, mediaType, size: ByteCount, sha256): UploadTicket!` | a verified presigned POST for a `drive_image` blob (the runner hashes first; `FILE_TOO_LARGE` past `DriveHost::IMAGE_MAX_BYTES`) and the `file_image` row, unique per file by name. An existing name is **replaced only when the new object lands**: until then the old image stays readable and a failed replacement upload changes nothing; when it lands, the row swaps and the old object is released in the same transaction. A re-request for a name whose upload is still in flight is refused with `IMAGE_UPLOAD_PENDING` (the first ticket stands, one blob per request — the same posture as the source's `KEY_REUSED`); past the host's `upload_window` a re-request replaces the abandoned blob. |
-| `<p>ImportPages(fileId, pages: [ImportedPageInput!]!, summary, pageCount, estimatedTokens): MutationAck!` | the host-privileged import of an existing rendition: a service account holding the host's `IMPORT_SCOPE` (`IMPORT_SCOPE_REQUIRED` otherwise, before anything else), then the gate `Import { file }`, then a `READY` file (`FILE_PROCESSING`, `FILE_NOT_READY` otherwise) — no job, no runner scope. Pages `{ number, markdown, origin? }` (`RUNNER` by default; `EDITED` keeps a page a person had corrected; `REGENERATED` is refused, `INVALID_PAGE_ORIGIN`; an imported page records the importer and the import time as its `updatedBy` / `updatedAt`) are upserted by number under the same rules as a report (≤ 512 per call, numbers ≥ 1 and distinct, the indexing pair together, the estimate optional); each reaches `<p>FilePages` (`Imported { origin }`), an indexing reaches the file (`RenditionImported`); the file stays `READY`; `NOTHING_TO_CHANGE` for an empty import. For a downstream project moving an existing corpus in without re-running its conversions. |
-| `<p>ImportImage(fileId, name, mediaType, size: ByteCount, sha256): UploadTicket!` | same scope, gate and state; the runner's verified image path (page-scoped name, replacement on landing) without its job. |
 | `<p>RunnerReport(fileId, jobId, pages: [ReportedPageInput!], origin: PageOrigin, summary, pageCount, estimatedTokens, done): MutationAck!` | pages in one or several batches of at most `MAX_REPORT_PAGES` (512, `BATCH_TOO_LARGE`), **upserted by number** (a replayed batch changes nothing; a number twice in one batch is `INVALID_PAGE`) — except that the run of an `upload` or `reprocess` chain never overwrites a page whose origin is `EDITED` (a person's correction is kept; a `regenerate_page` run does overwrite it); each page written reaches `<p>FilePages` on its own key (`Reported { job_id, origin }`) and the file row is touched only by the indexer's triple. `origin` `RUNNER` (default) or `REGENERATED` — on a regenerated page the images of that page that its new markdown no longer references (matched on the whole name, `![…](p001-img01.png)`, never as a substring) are dropped and released (`ImagesDropped { names }` on the file); `summary` and `pageCount` are the indexer's pair and move together, `estimatedTokens` is optional and only rides along with them (`INDEXER_FIELDS_TOGETHER` otherwise, `INVALID_INDEXER_VALUE` when negative; an indexing without an estimate clears a previous one; `ReportStored { job_id, done }` on the file when any of the three changes); an empty report is `NOTHING_TO_CHANGE` unless `done`; `done: true` ends the job in the report's transaction — the chain moves on and `job.finish.v2` is staged (see "Processing rules"); a replayed final report meets a job that no longer runs (`JOB_NOT_ACTIVE`). |
 | `<p>RunnerReportFailure(fileId, jobId, reasonCode, message?): MutationAck!` | the runner declares its job failed: the same runner-scope and running-job checks as a report; `reasonCode` is a code, `[a-z][a-z0-9_]*` up to 128 bytes, `message` free text up to 4 KiB (`INVALID_FAILURE_REASON` otherwise). The job ends there: the file is `FAILED` with `reasonCode` as its `processingError` (`ProcessingFailed { reason }`), `job.fail.v2` is staged with `"{reasonCode}: {message}"` as its note, and what the run reported so far stays readable. |
 
@@ -340,7 +334,8 @@ nothing. **A runner that retries its final report after a lost ack must take
 Job config (what `job.create` carries, so a runner can be written against
 it): `host` (the host service name), `file_id`, `job_id`, `context_root`
 (`<p>RunnerContext`), `image_upload_root` (`<p>RunnerRequestImageUpload`),
-`report_root` (`<p>RunnerReport`), `step` (the index in the rule), `options`
+`report_root` (`<p>RunnerReport`), `failure_root`
+(`<p>RunnerReportFailure`), `step` (the index in the rule), `options`
 (the ruleset step's options; `options.page` and `options.comment` on a page
 regeneration). The config never carries a presigned URL — the runner mints one
 through `RunnerContext` when it needs it.
@@ -500,7 +495,7 @@ A file's results live apart from the file, in `drive.file_processed`: the
 indexer's triple, with the pages (`drive.file_page`) and the extracted images
 (`drive.file_image`) hanging off it — what the workers produced, nothing
 else. The row is created by the first write that needs it (a report, an
-image request, an import, a page edit) and goes with its file.
+image request, a page edit) and goes with its file.
 
 **Reprocessing rewrites in place.** Nothing is wiped when a chain starts:
 the previous pages, images and indexing stay readable while the new run
@@ -602,13 +597,36 @@ the engine's `PersonErased` fact. `DriveHost::erase_mode` picks the mode:
 A second erase of the same person is absorbed by the engine (`fresh: false`)
 and changes nothing.
 
+## Data migrated directly into the schema
+
+The library offers no import gesture: a host that moves an existing corpus
+in writes the `drive` schema itself, in its own migration. Such rows must
+hold the invariants the library's own writes hold, or the library will
+misread them:
+
+- a file is confirmed (`committed_at` set) once its source object is stored
+  and verified; a file without it is a pending upload — `PENDING`, neither
+  downloadable nor processable;
+- the source and image objects are engine blobs (`service_engine.blob`), under
+  the object keys and with the size and SHA-256 the engine records for them —
+  the library never reads a key or a digest it did not mint;
+- a file's results live in `drive.file_processed` (the indexing), with its
+  pages and images hanging off that row; a page's `origin` says who wrote it
+  (`runner`, `regenerated`, or `edited` for a person's correction, which a
+  later reprocess keeps);
+- no row of `drive.file_job` or its fact tables unless the job exists in Jobs:
+  a migrated file with results and no job is `READY`, and a user's
+  `ProcessFile` runs its `upload` rule from there;
+- every id is a UUIDv7 (Jobs refuses any other as a source entity), and
+  `created_by` names a person the host's erase knows.
+
 ## Reason codes
 
 `DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`, `FILE_PROTECTED`,
 `FILE_NOT_PENDING`, `FILE_NOT_READY`, `FILE_PROCESSING`, `FILE_TOO_LARGE`,
 `UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_FILE_ID`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,
 `INVALID_NAME`, `INVALID_TITLE`, `NAME_TAKEN`, `FOLDER_INTO_ITSELF`, `NOTHING_TO_CHANGE`,
-`KEY_REUSED`, `RUNNER_SCOPE_REQUIRED`, `IMPORT_SCOPE_REQUIRED`, `JOB_NOT_ACTIVE`, `SOURCE_NOT_AVAILABLE`,
+`KEY_REUSED`, `RUNNER_SCOPE_REQUIRED`, `JOB_NOT_ACTIVE`, `SOURCE_NOT_AVAILABLE`,
 `INVALID_IMAGE_NAME`, `IMAGE_UPLOAD_PENDING`, `INVALID_PAGE`,
 `INVALID_PAGE_ORIGIN`, `PAGE_NOT_FOUND`, `INDEXER_FIELDS_TOGETHER`,
 `INVALID_INDEXER_VALUE`, `BATCH_TOO_LARGE`, `RULESET_NOT_FOUND`,

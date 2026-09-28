@@ -215,8 +215,7 @@ pub fn runner_request_image_upload<'m, H: DriveHost>(
 }
 
 /// Stages a verified image upload on `file`: a new row, or the replacement of
-/// an existing name that swaps only when the new object lands. Shared by the
-/// runner's image ticket and the host's import.
+/// an existing name that swaps only when the new object lands.
 pub(crate) async fn stage_image<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &FileRow<H>,

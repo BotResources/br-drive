@@ -9,6 +9,39 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.3.0 — 2026-09-28
+
+### Added
+
+- The job config sent with `job.create` names the failure-declaration root,
+  `failure_root` (`<p>RunnerReportFailure`), beside `context_root`,
+  `image_upload_root` and `report_root`; `br_drive::RootNames` gains
+  `failure_root`. A runner declares its failure on the root its config
+  names.
+
+### Removed
+
+- The host-privileged import: `<p>ImportPages` and `<p>ImportImage` (and
+  `br_drive::ImportPages`, `ImportImage`, `ImportedPage`,
+  `ImportedPageInput`), `DriveRequest::Import { file }`,
+  `FileRow::import_gate`, `DriveHost::IMPORT_SCOPE` and
+  `DriveHost::is_importer`, the `IMPORT_SCOPE_REQUIRED` code, the
+  `FileCause::RenditionImported` and `PageCause::Imported { origin }` causes.
+  A host that moves an existing corpus in writes the `drive` schema itself;
+  the README lists the invariants such rows must hold ("Data migrated
+  directly into the schema").
+- The example host's migration account (`workspace:import`, its upload,
+  commit and import rules, `NOT_AN_IMPORTER`): a commit is the uploader's
+  only.
+
+### Upgrading from 0.2
+
+- Drop `IMPORT_SCOPE` from the `DriveHost` impl, every `is_importer()` call
+  and the `DriveRequest::Import` arm of `drive_gate`; a gate that let an
+  import account through `CommitUpload { file }` loses that rule. A client of
+  `ImportPages` / `ImportImage` moves to a migration writing the schema
+  directly. No schema change: the migrations stay 01 to 09.
+
 ## 0.2.1 — 2026-09-28
 
 ### Changed

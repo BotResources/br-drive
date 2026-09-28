@@ -120,7 +120,6 @@ pub enum FileCause {
         job_id: Uuid,
         done: bool,
     },
-    RenditionImported,
     ProcessingStarted {
         job_id: Uuid,
         step: i32,
@@ -413,12 +412,6 @@ impl<H: DriveHost> FileRow<H> {
                 target_drive,
             },
         )
-    }
-
-    /// The host's `Import` gate, then a READY file: an import never races a
-    /// running chain nor lands on an upload that is not confirmed.
-    pub fn import_gate(&self, principal: &H) -> Gate {
-        ready(self, principal, DriveRequest::Import { file: self })
     }
 
     pub fn read_gate(&self, principal: &H) -> Gate {
