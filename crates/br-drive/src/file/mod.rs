@@ -13,7 +13,7 @@ pub use aggregate::{
     File, FileCause, FileRow, FileStatus, FileVisibility, PageOrigin, ProcessingState,
     UnknownDbValue,
 };
-pub(crate) use aggregate::{file_changed, file_progressed};
+pub(crate) use aggregate::{file_changed, file_progressed, file_recorded};
 pub use curation::{drive_of, set_metadata, set_protected};
 pub use delta::{DriveDelta, DriveRemove, DriveReset, DriveUpsert, DriveView};
 pub use gestures::{

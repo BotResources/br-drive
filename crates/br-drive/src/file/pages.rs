@@ -20,7 +20,7 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use super::aggregate::{File, FileRow, PageOrigin, drive_memberships};
-use super::store::{FileStore, config_error, file_select, row_to_file_prefixed};
+use super::store::{FILE_FROM, FileStore, config_error, file_select, row_to_file_prefixed};
 use crate::host::{DRIVE_DIM, DriveHost};
 
 pub const EDIT_PAGE_ACTION: ActionName = ActionName::from_static("editPage");
@@ -86,16 +86,20 @@ pub(crate) async fn load_pages<H: DriveHost>(
 ) -> Result<Vec<PageRecord<H>>, EngineError> {
     let files: Vec<Uuid> = keys.iter().map(|key| key.file_id).collect();
     let numbers: Vec<i32> = keys.iter().map(|key| key.number).collect();
+    // A page's last writer and instant are its latest fact; a page with none
+    // (never, since every write records one) reads as the file's creation.
     let rows = sqlx::query(&format!(
-        "SELECT p.file_id, p.number, p.markdown, p.origin, p.updated_by, p.updated_at, {} \
-         FROM drive.file_page p \
-         JOIN drive.file f ON f.id = p.file_id \
-         JOIN drive.file_status s ON s.file_id = f.id \
-         LEFT JOIN drive.file_processed r ON r.file_id = f.id \
+        "SELECT p.file_id, p.number, p.markdown, p.origin, \
+                COALESCE(pc.actor_id, '00000000-0000-0000-0000-000000000000'::uuid) AS updated_by, \
+                COALESCE(pc.occurred_at, f.created_at) AS updated_at, {} \
+         FROM {FILE_FROM} \
+         JOIN drive.file_page p ON p.file_id = f.id \
          JOIN unnest($1::uuid[], $2::int[]) AS wanted(file_id, number) \
            ON wanted.file_id = p.file_id AND wanted.number = p.number \
+         {} \
          ORDER BY p.file_id, p.number",
-        file_select("f_")
+        file_select("f_"),
+        crate::fact::last_page_change("pc", "p.file_id", "p.number"),
     ))
     .bind(&files)
     .bind(&numbers)
@@ -301,10 +305,13 @@ pub async fn read_pages(
     conn: &mut PgConnection,
     file_id: Uuid,
 ) -> Result<Vec<RunnerPage>, EngineError> {
-    let rows = sqlx::query(
-        "SELECT number, markdown, origin, updated_at FROM drive.file_page \
-         WHERE file_id = $1 ORDER BY number",
-    )
+    let rows = sqlx::query(&format!(
+        "SELECT p.number, p.markdown, p.origin, \
+                COALESCE(pc.occurred_at, f.created_at) AS updated_at \
+         FROM drive.file_page p JOIN drive.file f ON f.id = p.file_id {} \
+         WHERE p.file_id = $1 ORDER BY p.number",
+        crate::fact::last_page_change("pc", "p.file_id", "p.number"),
+    ))
     .bind(file_id)
     .fetch_all(conn)
     .await?;

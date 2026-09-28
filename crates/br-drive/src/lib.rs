@@ -2,6 +2,7 @@ mod blob;
 mod catalogue;
 mod drive;
 mod erase;
+mod fact;
 mod fault;
 mod file;
 mod folders;

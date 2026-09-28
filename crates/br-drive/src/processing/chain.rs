@@ -8,6 +8,7 @@ use uuid::Uuid;
 use super::commands::{Initiator, JobCancel, JobCreate, JobFail, JobFinish};
 use super::log::{End, EndKind, FileJob, end, insert_job};
 use super::roots::roots;
+use crate::fact::Author;
 use crate::fault::{DriveFault, codes};
 use crate::file::images::drop_images;
 use crate::file::{FileCause, FileRow, Page, PageKey, processed, store};
@@ -148,8 +149,9 @@ fn live_job_taken(error: EngineError) -> DriveFault {
 /// Starts a chain on a READY or FAILED file: the plan becomes the file's
 /// snapshot and its first step a job. Nothing of the previous results is
 /// touched — they stay readable while the new run reports over them.
-pub async fn start_chain<H: DriveHost>(
+pub(crate) async fn start_chain<H: DriveHost>(
     cx: &mut Ops<'_>,
+    author: &Author,
     file: &mut FileRow<H>,
     plan: ChainPlan,
     trigger: Trigger,
@@ -157,12 +159,17 @@ pub async fn start_chain<H: DriveHost>(
 ) -> Result<(), DriveFault> {
     file.ruleset_id = plan.ruleset_id;
     file.steps = Some(plan.steps);
-    file.updated_at = cx.now().as_datetime();
     cx.save(file).await?;
     let Some(job_id) = launch_step(cx, file, 0, Some(trigger), Some(initiator)).await? else {
         return Err(DriveFault::Refused(codes::INVALID_RULESET));
     };
-    crate::file::file_changed::<H>(cx, file, FileCause::ProcessingStarted { job_id, step: 0 })?;
+    crate::file::file_recorded::<H>(
+        cx,
+        author,
+        file,
+        FileCause::ProcessingStarted { job_id, step: 0 },
+    )
+    .await?;
     Ok(())
 }
 
@@ -175,6 +182,7 @@ pub async fn start_chain<H: DriveHost>(
 /// nothing left to stop and the file is READY.
 pub(crate) async fn report_done<H: DriveHost>(
     cx: &mut Ops<'_>,
+    author: &Author,
     file: &mut FileRow<H>,
     job: &FileJob,
 ) -> Result<(), DriveFault> {
@@ -194,7 +202,7 @@ pub(crate) async fn report_done<H: DriveHost>(
     let next = usize::try_from(job.step_index).unwrap_or(0) + 1;
     let has_next = file.steps.as_ref().is_some_and(|steps| next < steps.len());
     if job.cancel_requested() && has_next {
-        return stop_before(cx, file, next, job).await;
+        return stop_before(cx, author, file, next, job).await;
     }
     let cause = match launch_step(cx, file, next, job.trigger, job.triggered_by.clone()).await? {
         Some(job_id) => FileCause::ProcessingStarted {
@@ -207,9 +215,8 @@ pub(crate) async fn report_done<H: DriveHost>(
             FileCause::ProcessingFinished
         }
     };
-    file.updated_at = now;
     cx.save(file).await?;
-    crate::file::file_changed::<H>(cx, file, cause)?;
+    crate::file::file_recorded::<H>(cx, author, file, cause).await?;
     Ok(())
 }
 
@@ -253,6 +260,7 @@ async fn conclude<H: DriveHost>(cx: &mut Ops<'_>, file: &FileRow<H>) -> Result<(
 /// reported so far stay.
 pub(crate) async fn report_failed<H: DriveHost>(
     cx: &mut Ops<'_>,
+    author: &Author,
     file: &mut FileRow<H>,
     job: &FileJob,
     reason_code: &str,
@@ -281,15 +289,15 @@ pub(crate) async fn report_failed<H: DriveHost>(
         },
     })?;
     refresh_status(cx, file).await?;
-    file.updated_at = now;
-    cx.save(file).await?;
-    crate::file::file_changed::<H>(
+    crate::file::file_recorded::<H>(
         cx,
+        author,
         file,
         FileCause::ProcessingFailed {
             reason: reason_code.to_string(),
         },
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -297,6 +305,7 @@ pub(crate) async fn report_failed<H: DriveHost>(
 /// never sent to Jobs, ended at once by the library's `cancelled`.
 async fn stop_before<H: DriveHost>(
     cx: &mut Ops<'_>,
+    author: &Author,
     file: &mut FileRow<H>,
     next: usize,
     ended: &FileJob,
@@ -325,15 +334,15 @@ async fn stop_before<H: DriveHost>(
     )
     .await?;
     refresh_status(cx, file).await?;
-    file.updated_at = now;
-    cx.save(file).await?;
-    crate::file::file_changed::<H>(
+    crate::file::file_recorded::<H>(
         cx,
+        author,
         file,
         FileCause::ProcessingFailed {
             reason: super::CANCELLED.to_string(),
         },
-    )?;
+    )
+    .await?;
     Ok(())
 }
 

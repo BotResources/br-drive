@@ -8,8 +8,17 @@ use super::{RulesetRow, Trigger};
 use crate::fault::{DriveFault, codes};
 use crate::media::MediaType;
 
-const COLUMNS: &str =
-    "id, name, trigger, media_types, steps, is_default, created_by, created_at, updated_at";
+/// The columns a rule is inserted with.
+const COLUMNS: &str = "id, name, trigger, media_types, steps, is_default, created_by, created_at";
+
+/// A rule as read: its columns, and its last change — its latest fact, or its
+/// creation.
+const SELECT: &str = "SELECT r.id, r.name, r.trigger, r.media_types, r.steps, r.is_default, \
+       r.created_by, r.created_at, COALESCE(u.occurred_at, r.created_at) AS updated_at \
+     FROM drive.ruleset r \
+     LEFT JOIN LATERAL (SELECT x.occurred_at FROM drive.fact x \
+       WHERE x.aggregate_type = 'ruleset' AND x.aggregate_id = r.id AND x.page_number IS NULL \
+       ORDER BY x.occurred_at DESC, x.id DESC LIMIT 1) u ON true";
 
 fn row_to_ruleset(row: &sqlx::postgres::PgRow) -> Result<RulesetRow, EngineError> {
     let trigger: String = row.get("trigger");
@@ -42,12 +51,10 @@ impl Persistence for RulesetStore {
         key: &'a Uuid,
     ) -> BoxFuture<'a, Result<Option<RulesetRow>, EngineError>> {
         Box::pin(async move {
-            let row = sqlx::query(&format!(
-                "SELECT {COLUMNS} FROM drive.ruleset WHERE id = $1"
-            ))
-            .bind(key)
-            .fetch_optional(conn)
-            .await?;
+            let row = sqlx::query(&format!("{SELECT} WHERE r.id = $1"))
+                .bind(key)
+                .fetch_optional(conn)
+                .await?;
             row.as_ref().map(row_to_ruleset).transpose()
         })
     }
@@ -64,12 +71,10 @@ impl Persistence for RulesetStore {
         keys: &'a [Uuid],
     ) -> BoxFuture<'a, Result<Vec<(Uuid, RulesetRow)>, EngineError>> {
         Box::pin(async move {
-            let rows = sqlx::query(&format!(
-                "SELECT {COLUMNS} FROM drive.ruleset WHERE id = ANY($1)"
-            ))
-            .bind(keys)
-            .fetch_all(conn)
-            .await?;
+            let rows = sqlx::query(&format!("{SELECT} WHERE r.id = ANY($1)"))
+                .bind(keys)
+                .fetch_all(conn)
+                .await?;
             rows.iter()
                 .map(|row| row_to_ruleset(row).map(|ruleset| (ruleset.id, ruleset)))
                 .collect()
@@ -84,7 +89,7 @@ impl Persistence for RulesetStore {
         Box::pin(async move {
             sqlx::query(
                 "UPDATE drive.ruleset SET name = $2, trigger = $3, media_types = $4, steps = $5, \
-                   is_default = $6, updated_at = $7 WHERE id = $1",
+                   is_default = $6 WHERE id = $1",
             )
             .bind(ruleset.id)
             .bind(&ruleset.name)
@@ -97,7 +102,6 @@ impl Persistence for RulesetStore {
                 })?,
             )
             .bind(ruleset.is_default)
-            .bind(ruleset.updated_at)
             .execute(conn)
             .await?;
             Ok(())
@@ -111,7 +115,7 @@ impl Persistence for RulesetStore {
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
             sqlx::query(&format!(
-                "INSERT INTO drive.ruleset ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+                "INSERT INTO drive.ruleset ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
             ))
             .bind(ruleset.id)
             .bind(&ruleset.name)
@@ -126,7 +130,6 @@ impl Persistence for RulesetStore {
             .bind(ruleset.is_default)
             .bind(ruleset.created_by)
             .bind(ruleset.created_at)
-            .bind(ruleset.updated_at)
             .execute(conn)
             .await?;
             Ok(())
@@ -166,12 +169,10 @@ async fn defaults_of(
     conn: &mut PgConnection,
     trigger: Trigger,
 ) -> Result<Vec<RulesetRow>, EngineError> {
-    let rows = sqlx::query(&format!(
-        "SELECT {COLUMNS} FROM drive.ruleset WHERE is_default AND trigger = $1"
-    ))
-    .bind(trigger.as_str())
-    .fetch_all(conn)
-    .await?;
+    let rows = sqlx::query(&format!("{SELECT} WHERE r.is_default AND r.trigger = $1"))
+        .bind(trigger.as_str())
+        .fetch_all(conn)
+        .await?;
     rows.iter().map(row_to_ruleset).collect()
 }
 

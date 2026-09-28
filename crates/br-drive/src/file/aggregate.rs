@@ -392,6 +392,27 @@ pub(crate) fn file_changed<H: DriveHost>(
     ops.impact_caused::<File, _>(&file.id, cause)
 }
 
+/// Records a change of `file` as a fact (`cause`, by `author`, now) — its
+/// last change moves — and stages its impact (`file_changed`).
+pub(crate) async fn file_recorded<H: DriveHost>(
+    ops: &mut service_engine::pipeline::Ops<'_>,
+    author: &crate::fact::Author,
+    file: &mut FileRow<H>,
+    cause: FileCause,
+) -> Result<(), service_engine::error::EngineError> {
+    let now = ops.now().as_datetime();
+    crate::fact::record(
+        ops.connection(),
+        author,
+        crate::fact::Subject::File(file.id),
+        &cause,
+        now,
+    )
+    .await?;
+    file.updated_at = now;
+    file_changed::<H>(ops, file, cause)
+}
+
 /// Stages the progress of `file`'s running job: its own views, with the
 /// `ProgressChanged` cause. The host object is not touched: progress never
 /// changes the drive's counts.

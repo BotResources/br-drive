@@ -9,7 +9,17 @@ use uuid::Uuid;
 
 use super::LabelRow;
 
-const COLUMNS: &str = "id, name, color, description, created_by, created_at, updated_at";
+/// The columns a label is inserted with.
+const COLUMNS: &str = "id, name, color, description, created_by, created_at";
+
+/// A label as read: its columns, and its last change — its latest fact, or its
+/// creation.
+const SELECT: &str = "SELECT l.id, l.name, l.color, l.description, l.created_by, l.created_at, \
+       COALESCE(u.occurred_at, l.created_at) AS updated_at \
+     FROM drive.label l \
+     LEFT JOIN LATERAL (SELECT x.occurred_at FROM drive.fact x \
+       WHERE x.aggregate_type = 'label' AND x.aggregate_id = l.id AND x.page_number IS NULL \
+       ORDER BY x.occurred_at DESC, x.id DESC LIMIT 1) u ON true";
 
 fn row_to_label(row: &sqlx::postgres::PgRow) -> LabelRow {
     LabelRow {
@@ -37,7 +47,7 @@ impl Persistence for LabelStore {
         key: &'a Uuid,
     ) -> BoxFuture<'a, Result<Option<LabelRow>, EngineError>> {
         Box::pin(async move {
-            let row = sqlx::query(&format!("SELECT {COLUMNS} FROM drive.label WHERE id = $1"))
+            let row = sqlx::query(&format!("{SELECT} WHERE l.id = $1"))
                 .bind(key)
                 .fetch_optional(conn)
                 .await?;
@@ -57,12 +67,10 @@ impl Persistence for LabelStore {
         keys: &'a [Uuid],
     ) -> BoxFuture<'a, Result<Vec<(Uuid, LabelRow)>, EngineError>> {
         Box::pin(async move {
-            let rows = sqlx::query(&format!(
-                "SELECT {COLUMNS} FROM drive.label WHERE id = ANY($1)"
-            ))
-            .bind(keys)
-            .fetch_all(conn)
-            .await?;
+            let rows = sqlx::query(&format!("{SELECT} WHERE l.id = ANY($1)"))
+                .bind(keys)
+                .fetch_all(conn)
+                .await?;
             Ok(rows
                 .iter()
                 .map(|row| {
@@ -80,14 +88,12 @@ impl Persistence for LabelStore {
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
             sqlx::query(
-                "UPDATE drive.label SET name = $2, color = $3, description = $4, updated_at = $5 \
-                 WHERE id = $1",
+                "UPDATE drive.label SET name = $2, color = $3, description = $4 WHERE id = $1",
             )
             .bind(label.id)
             .bind(&label.name)
             .bind(&label.color)
             .bind(&label.description)
-            .bind(label.updated_at)
             .execute(conn)
             .await?;
             Ok(())
@@ -101,7 +107,7 @@ impl Persistence for LabelStore {
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
             sqlx::query(&format!(
-                "INSERT INTO drive.label ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                "INSERT INTO drive.label ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6)"
             ))
             .bind(label.id)
             .bind(&label.name)
@@ -109,7 +115,6 @@ impl Persistence for LabelStore {
             .bind(&label.description)
             .bind(label.created_by)
             .bind(label.created_at)
-            .bind(label.updated_at)
             .execute(conn)
             .await?;
             Ok(())

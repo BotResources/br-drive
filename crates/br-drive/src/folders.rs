@@ -9,6 +9,7 @@ use service_engine::pipeline::{Bulk, MutationInput};
 use uuid::Uuid;
 
 use crate::drive::DriveRow;
+use crate::fact::Author;
 use crate::fault::{DriveFault, codes};
 use crate::file::store;
 use crate::file::{DriveFiles, DrivePages, File, FileCause, FileRow};
@@ -167,7 +168,16 @@ pub fn move_folder<'m, H: DriveHost>(
         }
         let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
         let now = cx.now().as_datetime();
-        store::rebase_paths(cx.connection(), &ids, &old_prefix, &new_prefix, now).await?;
+        let author = Author::of(cx.principal());
+        store::rebase_paths(
+            cx.connection(),
+            &author,
+            &ids,
+            &old_prefix,
+            &new_prefix,
+            now,
+        )
+        .await?;
         H::folder_moved(cx, input.drive_id, &old_prefix, &new_prefix).await?;
         impact_rows(cx, input.drive_id, &ids, FileCause::FolderMoved)
     })

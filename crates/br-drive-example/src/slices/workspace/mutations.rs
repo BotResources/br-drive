@@ -137,7 +137,9 @@ pub fn protect_file<'m>(
             .await?
             .ok_or(AppFault::Refused(WORKSPACE_NOT_FOUND))?;
         workspace.transfer_gate(cx.principal()).require()?;
-        br_drive::set_protected::<AppPrincipal>(cx, input.file_id, input.protected).await?;
+        let principal = cx.principal().clone();
+        br_drive::set_protected::<AppPrincipal>(cx, &principal, input.file_id, input.protected)
+            .await?;
         Ok(())
     })
 }

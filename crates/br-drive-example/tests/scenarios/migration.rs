@@ -194,6 +194,15 @@ async fn upgrade_and_drive(db: TestDb) {
             .expect("a seeded file")
             .1
     };
+    // The ready file was last changed an hour after its creation.
+    let last_change: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "UPDATE drive.file SET updated_at = created_at + interval '1 hour' \
+         WHERE id = $1 RETURNING updated_at",
+    )
+    .bind(id("ready.txt"))
+    .fetch_one(&owner_pool)
+    .await
+    .expect("seed a last change");
     // The ready file carries 0.1's results: an indexing, a page, an image.
     sqlx::query(
         "UPDATE drive.file SET summary = 'Old summary.', page_count = 1, estimated_tokens = 5 \
@@ -302,6 +311,16 @@ async fn upgrade_and_drive(db: TestDb) {
     let pages = world.file_pages(&owner, id("ready.txt")).await;
     assert_eq!(pages.len(), 1);
     assert_eq!(pages[0]["markdown"], "old page ![i](p001-img01.png)");
+    // And: the last changes carried over became facts: the page's writer, and
+    // the file's last change, read as before
+    assert_eq!(pages[0]["updatedBy"], owner_id.to_string());
+    let carried: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(ready["updatedAt"].clone()).unwrap();
+    assert_eq!(
+        carried.timestamp_micros(),
+        last_change.timestamp_micros(),
+        "the file's last change survives the upgrade"
+    );
     // And: the host object counts its drive's files through the status view
     let counted = world
         .gql(

@@ -10,6 +10,7 @@ use super::{
     RulesetCause, RulesetRow, RulesetStep, Trigger,
 };
 use crate::catalogue;
+use crate::fact::{Author, Subject};
 use crate::fault::{DriveFault, codes};
 use crate::host::{DriveHost, DriveRequest};
 use crate::media::MediaType;
@@ -233,10 +234,22 @@ pub fn update_ruleset<'m, H: DriveHost>(
         ruleset.media_types = media_types;
         ruleset.steps = steps;
         ruleset.is_default = is_default;
-        ruleset.updated_at = cx.now().as_datetime();
         cx.save(&ruleset).await?;
         let unknown_runner_types =
             catalogue::not_known_active(cx.connection(), &ruleset.runner_types()).await?;
+        let now = cx.now().as_datetime();
+        let author = Author::of(cx.principal());
+        crate::fact::record(
+            cx.connection(),
+            &author,
+            Subject::Ruleset(ruleset.id),
+            RulesetCause::Saved {
+                unknown_runner_types: unknown_runner_types.clone(),
+            },
+            now,
+        )
+        .await?;
+        ruleset.updated_at = now;
         cx.impact_caused::<Ruleset, _>(
             &ruleset.id,
             RulesetCause::Saved {

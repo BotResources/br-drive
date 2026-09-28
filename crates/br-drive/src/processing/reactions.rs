@@ -11,6 +11,7 @@ use uuid::Uuid;
 use super::chain::refresh_status;
 use super::commands::JobCancel;
 use super::log::{self, End, EndKind, FileJob};
+use crate::fact::Author;
 use crate::fault::DriveReactionFault;
 use crate::file::{FileCause, FileRow};
 use crate::host::DriveHost;
@@ -98,14 +99,19 @@ async fn record_end<H: DriveHost>(
         return Ok(false);
     }
     refresh_status(cx, &mut target.file).await?;
-    target.file.updated_at = now;
-    cx.save(&target.file).await?;
     let reason = target
         .file
         .processing_error()
         .unwrap_or(super::CANCELLED)
         .to_string();
-    crate::file::file_changed::<H>(cx, &target.file, FileCause::ProcessingFailed { reason })?;
+    let author = Author::of_reaction(cx);
+    crate::file::file_recorded::<H>(
+        cx,
+        &author,
+        &mut target.file,
+        FileCause::ProcessingFailed { reason },
+    )
+    .await?;
     Ok(true)
 }
 

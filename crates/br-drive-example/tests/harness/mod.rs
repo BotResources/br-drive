@@ -523,6 +523,28 @@ fn base_config(pod: &str, addr: SocketAddr) -> EngineConfig {
     .with_http_addr(addr)
 }
 
+/// A service account `id` holding `scopes`.
+pub fn service_passport_as(id: Uuid, scopes: &[&str]) -> String {
+    let mut map = serde_json::Map::new();
+    map.insert("scopes".to_string(), serde_json::json!(scopes));
+    Passport::service(id, PassportClaims::from_map(map)).to_header()
+}
+
+/// `user`'s session holding `scopes`, borrowed by the admin `impersonator`.
+pub fn impersonated_passport(user: Uuid, impersonator: Uuid, scopes: &[&str]) -> String {
+    let mut map = serde_json::Map::new();
+    map.insert("scopes".to_string(), serde_json::json!(scopes));
+    Passport::human(
+        user,
+        false,
+        true,
+        AuthMethod::Jwt,
+        Some(impersonator),
+        PassportClaims::from_map(map),
+    )
+    .to_header()
+}
+
 pub fn service_passport(scopes: &[&str]) -> String {
     let mut map = serde_json::Map::new();
     map.insert(

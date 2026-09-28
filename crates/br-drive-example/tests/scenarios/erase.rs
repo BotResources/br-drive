@@ -107,16 +107,25 @@ async fn anonymising_a_person_rewrites_every_id_they_left_and_keeps_their_files(
         created_by(&world, "drive.ruleset", "created_by", ruleset).await,
         REDACTED
     );
-    let page_by: Uuid =
-        sqlx::query_scalar("SELECT updated_by FROM drive.file_page WHERE file_id = $1")
-            .bind(file_id)
-            .fetch_one(&world.db.app)
-            .await
-            .unwrap();
+    let page_by = world.file_pages(&person, file_id).await[0]["updatedBy"].clone();
     assert!(
-        page_by != REDACTED && page_by != person_id,
+        page_by != REDACTED.to_string() && page_by != person_id.to_string(),
         "the runner wrote the page, not the person: {page_by}"
     );
+    // The audit trail keeps every change the person made — the commit, the
+    // processing, the cancel — and no longer names them.
+    let (theirs, redacted): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE actor_id = $1), count(*) FILTER (WHERE actor_id = $2) \
+         FROM drive.fact WHERE aggregate_id = $3",
+    )
+    .bind(person_id)
+    .bind(REDACTED)
+    .bind(file_id)
+    .fetch_one(&world.db.app)
+    .await
+    .unwrap();
+    assert_eq!(theirs, 0, "no fact names the erased person");
+    assert!(redacted >= 3, "their facts stay, anonymised: {redacted}");
     let link_by: Uuid =
         sqlx::query_scalar("SELECT created_by FROM drive.file_label WHERE file_id = $1")
             .bind(file_id)
