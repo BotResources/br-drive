@@ -208,9 +208,9 @@ async fn a_retitle_changes_the_title_only_and_a_rename_or_move_never_touches_it(
 }
 
 #[tokio::test]
-async fn a_protected_file_keeps_its_name_and_place_but_can_be_retitled() {
-    // Given: a file its host protected, watched by its owner
-    let world = World::start("pod-title-protected").await;
+async fn a_file_the_host_holds_keeps_its_name_and_place_but_can_be_retitled() {
+    // Given: a file its host holds (its own per-file rule), watched by its owner
+    let world = World::start("pod-title-held").await;
     let owner = passport(Uuid::now_v7());
     let drive = world.create_workspace(&owner, "library").await;
     let file_id = upload(
@@ -222,18 +222,18 @@ async fn a_protected_file_keeps_its_name_and_place_but_can_be_retitled() {
     ok(&world
         .gql(
             &owner,
-            "mutation($f:UUID!,$p:Boolean!){workspaceProtectFile(fileId:$f,protected:$p){success}}",
-            serde_json::json!({ "f": file_id, "p": true }),
+            "mutation($f:UUID!){workspaceAnnotateFile(fileId:$f,metadata:{hold:true}){success}}",
+            serde_json::json!({ "f": file_id }),
         )
         .await);
     world.await_source_promoted(file_id).await;
     let mut files = drive_subscription(&world, &owner, drive).await;
     quiet(&mut files).await;
 
-    // Then: rename and move are blocked by the protection, retitle is not
+    // Then: rename and move are blocked by the host's rule, retitle is not
     let file = world.file(&owner, file_id).await;
-    assert_eq!(file["affordances"]["rename"]["reason"], "FILE_PROTECTED");
-    assert_eq!(file["affordances"]["move"]["reason"], "FILE_PROTECTED");
+    assert_eq!(file["affordances"]["rename"]["reason"], "FILE_ON_HOLD");
+    assert_eq!(file["affordances"]["move"]["reason"], "FILE_ON_HOLD");
     assert_eq!(file["affordances"]["retitle"]["allowed"], true);
 
     // When: the owner retitles it
@@ -260,8 +260,8 @@ async fn a_protected_file_keeps_its_name_and_place_but_can_be_retitled() {
             serde_json::json!({ "f": file_id }),
         )
         .await;
-    // Then: the protection holds, and nothing moves
-    assert_eq!(error_code(&renamed), "FILE_PROTECTED");
+    // Then: the host's rule holds, and nothing moves
+    assert_eq!(error_code(&renamed), "FILE_ON_HOLD");
     files
         .expect_silence(std::time::Duration::from_millis(600))
         .await;

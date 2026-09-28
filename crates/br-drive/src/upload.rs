@@ -116,7 +116,6 @@ pub fn request_upload<'m, H: DriveHost>(
             path,
             name,
             title,
-            protected: false,
             media_type,
             size_bytes: i64::try_from(input.size)
                 .map_err(|_| DriveFault::Refused(codes::FILE_TOO_LARGE))?,

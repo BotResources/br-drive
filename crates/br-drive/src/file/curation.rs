@@ -11,36 +11,6 @@ pub async fn drive_of(ops: &mut Ops<'_>, file_id: Uuid) -> Result<Option<Uuid>, 
     Ok(store::drive_of(ops.connection(), file_id).await?)
 }
 
-/// Marks a file the users may neither rename, move nor delete (or lifts the
-/// mark), on behalf of `principal`: a host-internal gesture with no library
-/// gate — the host checks its own permission first — recorded as a fact of
-/// the file by that principal.
-pub async fn set_protected<H: DriveHost>(
-    ops: &mut Ops<'_>,
-    principal: &H,
-    file_id: Uuid,
-    protected: bool,
-) -> Result<(), DriveFault> {
-    let mut file = ops
-        .load::<FileRow<H>>(&file_id)
-        .await?
-        .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
-    if file.protected == protected {
-        return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
-    }
-    file.protected = protected;
-    ops.save(&file).await?;
-    let author = Author::of(principal);
-    crate::file::file_recorded::<H>(
-        ops,
-        &author,
-        &mut file,
-        FileCause::ProtectionChanged { protected },
-    )
-    .await?;
-    Ok(())
-}
-
 /// Writes the host's free JSON on a file, asking the host's gate
 /// (`DriveRequest::SetMetadata`) on behalf of `principal` first.
 pub async fn set_metadata<H: DriveHost>(

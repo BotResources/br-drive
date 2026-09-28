@@ -9,7 +9,6 @@ pub mod codes {
     pub const DRIVE_NOT_FOUND: Reason = Reason::new("DRIVE_NOT_FOUND");
     pub const FILE_NOT_FOUND: Reason = Reason::new("FILE_NOT_FOUND");
     pub const FOLDER_NOT_FOUND: Reason = Reason::new("FOLDER_NOT_FOUND");
-    pub const FILE_PROTECTED: Reason = Reason::new("FILE_PROTECTED");
     pub const FILE_NOT_PENDING: Reason = Reason::new("FILE_NOT_PENDING");
     pub const FILE_NOT_READY: Reason = Reason::new("FILE_NOT_READY");
     pub const FILE_TOO_LARGE: Reason = Reason::new("FILE_TOO_LARGE");

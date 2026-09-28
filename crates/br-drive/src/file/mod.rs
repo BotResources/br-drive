@@ -14,7 +14,7 @@ pub use aggregate::{
     UnknownDbValue,
 };
 pub(crate) use aggregate::{file_changed, file_progressed, file_recorded};
-pub use curation::{drive_of, set_metadata, set_protected};
+pub use curation::{drive_of, set_metadata};
 pub use delta::{DriveDelta, DriveRemove, DriveReset, DriveUpsert, DriveView};
 pub use gestures::{
     CancelProcessing, DeleteFile, EditPage, ProcessFile, RegeneratePage, RetitleFile, UpdateFile,
@@ -52,7 +52,6 @@ pub(crate) mod tests_support {
             path: DrivePath::root(),
             name: FileName::parse("a.txt").expect("a sound name"),
             title: crate::title::FileTitle::parse("a").expect("a sound title"),
-            protected: false,
             media_type: MediaType::parse("text/plain").expect("a sound media type"),
             size_bytes: 1,
             sha256: [0; 32],

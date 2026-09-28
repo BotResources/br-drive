@@ -103,9 +103,6 @@ pub enum FileCause {
         from_drive: Uuid,
     },
     FolderMoved,
-    ProtectionChanged {
-        protected: bool,
-    },
     MetadataChanged,
     ImageRequested {
         name: String,
@@ -148,7 +145,6 @@ pub struct FileRow<H> {
     pub path: DrivePath,
     pub name: FileName,
     pub title: FileTitle,
-    pub protected: bool,
     pub media_type: MediaType,
     pub size_bytes: i64,
     pub sha256: [u8; 32],
@@ -199,7 +195,6 @@ impl<H> Clone for FileRow<H> {
             path: self.path.clone(),
             name: self.name.clone(),
             title: self.title.clone(),
-            protected: self.protected,
             media_type: self.media_type.clone(),
             size_bytes: self.size_bytes,
             sha256: self.sha256,
@@ -292,16 +287,6 @@ fn host_then<H: DriveHost>(
     }
 }
 
-fn unprotected<H: DriveHost>(
-    file: &FileRow<H>,
-    principal: &H,
-    request: DriveRequest<'_, H>,
-) -> Gate {
-    host_then(file, principal, request, || {
-        file.protected.then_some(codes::FILE_PROTECTED)
-    })
-}
-
 fn ready<H: DriveHost>(file: &FileRow<H>, principal: &H, request: DriveRequest<'_, H>) -> Gate {
     host_then(file, principal, request, || match file.status.state {
         ProcessingState::Ready => None,
@@ -328,23 +313,23 @@ service_engine::gated! {
     generics [H: DriveHost];
     FileRow<H>, H;
     "delete" => fn delete_gate(this, principal) {
-        unprotected(this, principal, DriveRequest::DeleteFile { file: this })
+        host_gate(this, principal, &DriveRequest::DeleteFile { file: this })
     }
     "rename" => fn rename_gate(this, principal) {
-        unprotected(
+        host_gate(
             this,
             principal,
-            DriveRequest::UpdateFile {
+            &DriveRequest::UpdateFile {
                 file: this,
                 target_drive: this.drive_id,
             },
         )
     }
     "move" => fn move_gate(this, principal) {
-        unprotected(
+        host_gate(
             this,
             principal,
-            DriveRequest::UpdateFile {
+            &DriveRequest::UpdateFile {
                 file: this,
                 target_drive: this.drive_id,
             },
@@ -425,10 +410,10 @@ pub(crate) fn file_progressed<H: DriveHost>(
 
 impl<H: DriveHost> FileRow<H> {
     pub fn move_to_gate(&self, principal: &H, target_drive: Uuid) -> Gate {
-        unprotected(
+        host_gate(
             self,
             principal,
-            DriveRequest::UpdateFile {
+            &DriveRequest::UpdateFile {
                 file: self,
                 target_drive,
             },

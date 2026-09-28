@@ -18,7 +18,7 @@ use crate::path::DrivePath;
 
 /// The files under `prefix`, each one allowed to the principal by the same
 /// decision the per-file gesture asks (`gate`: `UpdateFile` for a move,
-/// `DeleteFile` for a delete, protection included) — all or nothing, so a
+/// `DeleteFile` for a delete) — all or nothing, so a
 /// folder gesture never reaches a file its principal could not move or delete
 /// one by one (`folder_verdict`). The decisions are in memory over the rows
 /// the gesture loads anyway: they add no statement, whatever the folder's size.
@@ -43,8 +43,8 @@ pub(crate) async fn folder_members<H: DriveHost>(
 /// An empty folder is `FOLDER_NOT_FOUND`. A file refused as not found (the
 /// principal cannot see it) makes the whole folder `FOLDER_NOT_FOUND` too,
 /// wherever it sorts, so neither an invisible file nor its place is ever
-/// disclosed. Otherwise the first refusal answers: the host's code, or
-/// `FILE_PROTECTED`.
+/// disclosed. Otherwise the first refusal in path order answers: the host's
+/// code.
 pub(crate) fn folder_verdict(
     refusals: impl IntoIterator<Item = Option<Reason>>,
 ) -> Result<(), Reason> {
@@ -229,6 +229,7 @@ mod tests {
     use super::*;
 
     const HELD: Reason = Reason::new("FILE_ON_HOLD");
+    const NOT_YOURS: Reason = Reason::new("NOT_THE_UPLOADER");
 
     #[test]
     fn an_empty_folder_is_not_found() {
@@ -243,13 +244,10 @@ mod tests {
     #[test]
     fn the_first_refusal_in_path_order_answers_for_the_folder() {
         assert_eq!(
-            folder_verdict([None, Some(codes::FILE_PROTECTED), Some(HELD)]),
-            Err(codes::FILE_PROTECTED)
+            folder_verdict([None, Some(NOT_YOURS), Some(HELD)]),
+            Err(NOT_YOURS)
         );
-        assert_eq!(
-            folder_verdict([Some(HELD), Some(codes::FILE_PROTECTED)]),
-            Err(HELD)
-        );
+        assert_eq!(folder_verdict([Some(HELD), Some(NOT_YOURS)]), Err(HELD));
     }
 
     #[test]

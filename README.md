@@ -70,15 +70,13 @@ The engine's "library slice" path, exactly as `example-lib-roster` does it:
    `br_drive::NoDriveOwner` has no host object to refresh and calls
    `br_drive::create_unowned_drive::<AppPrincipal>(cx, id, created_by)` with an
    id of its choosing instead — nothing in the library relies on it then.
-   `br_drive::set_protected(ops, principal, file_id, protected)` marks a file
-   the users may neither rename, move nor delete (the principal is the hand
-   the audit trail records), `br_drive::set_metadata(ops, principal,
-   file_id, metadata)` writes the host's free JSON on a file after asking the
-   host's gate for that principal (`SetMetadata { file }`; both refuse an
-   unchanged value with `NOTHING_TO_CHANGE`), and `br_drive::drive_of` answers which drive a file
-   belongs to. `set_protected` is a host-internal function with no library
-   gate: the host checks its own permission before calling it (the example
-   host's `workspaceProtectFile` reserves it to the workspace owner).
+   `br_drive::set_metadata(ops, principal, file_id, metadata)` writes the
+   host's free JSON on a file after asking the host's gate for that
+   principal (`SetMetadata { file }`; an unchanged value is
+   `NOTHING_TO_CHANGE`), and `br_drive::drive_of` answers which drive a file
+   belongs to. A host that wants a file its users may not rename, move or
+   delete says so in its own gate (the example host refuses them on a file
+   whose metadata holds `{"hold": true}`).
 
 Every root field the library contributes is prefixed by the host; the value
 types (`DriveFile`, `DriveDelta`, …) keep their names in every embed, so a
@@ -95,7 +93,7 @@ rolls them together. The host never writes to the `drive` schema directly.
 5. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
 6. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
 7. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
-8. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_protected`, `set_metadata`, `drive_of` for curation.
+8. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_metadata`, `drive_of` for curation.
 9. **Catalogue watch (optional, information only)**: a host booting through the engine's `run_service` / `BootPlan` starts it at the end of its `register` closure, on the engine's own NATS and PostgreSQL handles, and lets it run until the process exits: `register: move |engine| { register(engine)?; br_drive::watch_runner_types_of(engine).detach(); Ok(()) }` (see `src/bin/service.rs` of the example). A host assembling the engine by hand calls `br_drive::watch_runner_types(nats, pool)` once its boot can no longer fail and `CatalogueWatch::stop` at shutdown. The watch fills the local copy of Jobs' runner-type catalogue that the save's `unknownRunnerTypes` warning and `<p>RunnerTypes` read. Only a host that starts it needs the `PUBLISHED_LANGUAGE` KV bucket on its broker. Nothing waits for it and no launch consults it: a host without it launches every step all the same, reports every step's type as unknown at save and lists no type.
 
 ### The `DriveHost` seam
@@ -141,8 +139,7 @@ every `RequestUpload`.
   answered `FILE_NOT_FOUND` — exactly what an unknown id answers, so neither
   the existence nor the state of an invisible file is ever disclosed. A
   principal who sees the file gets the host's own code, then the state
-  refusals (`FILE_PROCESSING`, `FILE_NOT_READY`, `FILE_NOT_PENDING`,
-  `FILE_PROTECTED`). A gesture addressed to a drive (`CreateFile`,
+  refusals (`FILE_PROCESSING`, `FILE_NOT_READY`, `FILE_NOT_PENDING`). A gesture addressed to a drive (`CreateFile`,
   `MoveFolder`, `DeleteFolder`) keeps the host's code, and a move toward an
   unknown drive answers the host's refusal before `DRIVE_NOT_FOUND`. The
   same decision feeds the mutation guard and the `affordances` on
@@ -156,10 +153,10 @@ every `RequestUpload`.
   `MoveFolder` / `DeleteFolder` ask the host about the folder first, then,
   for **every file under the prefix**, the very decision the per-file gesture
   asks — `UpdateFile { file, target_drive }` for a move, `DeleteFile { file }`
-  for a delete, `FILE_PROTECTED` included — so a principal cannot move or
+  for a delete — so a principal cannot move or
   delete through a folder a file it could not move or delete on its own. All
   or nothing: the first refusal in path order refuses the whole gesture with
-  that code (the host's, or `FILE_PROTECTED`); a refusal about a file the
+  that code (the host's); a refusal about a file the
   principal cannot see (`FILE_NOT_FOUND`, above) anywhere in the folder
   answers `FOLDER_NOT_FOUND` for the whole gesture, what a prefix holding
   nothing answers — so an invisible file is neither named, nor placed, nor
@@ -226,10 +223,10 @@ renders it, is committed at
 | `<p>ProcessFile(fileId, rulesetId?): MutationAck!` | the only way to start processing, right after the commit, later, or never: gate `Process { file }`, then a `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload, `FILE_PROCESSING` while a chain runs). A file that never had a job runs its `upload` rule, any other its `reprocess` rule (see "Processing rules": `RULESET_NOT_FOUND`, `RULESET_MISMATCH`, `NO_RULESET_MATCHES`). Nothing is wiped: the previous results stay readable while the new run reports over them. Affordance `process`. |
 | `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; logs `cancel_requested` on the running job and stages `job.cancel.v2` for it (`CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). Affordance `cancelProcessing`. |
 | `<p>RegeneratePage(fileId, number, comment?, rulesetId?): MutationAck!` | run the `regenerate_page` rule on one page of a `READY` file: `page` and `comment` are merged into the first step's options; `PAGE_NOT_FOUND`, `NO_RULESET_MATCHES`. Affordance `regeneratePage` on the page. |
-| `<p>UpdateFile(fileId, name?, path?, driveId?): MutationAck!` | rename, move, or move to another drive of the same host; both drives are locked before the sibling check, so a concurrent collision answers `NAME_TAKEN`, never a database error; `NOTHING_TO_CHANGE` when nothing differs, `FILE_PROTECTED` on a protected file. |
-| `<p>RetitleFile(fileId, title): MutationAck!` | gate `RetitleFile { file }` (affordance `retitle`); changes the title and nothing else — never the name, the path, the drive or the state, and `UpdateFile` never touches the title; `INVALID_TITLE`, `NOTHING_TO_CHANGE` for the same title; the host decides whether a `protected` file may be retitled (the row is in the request). |
+| `<p>UpdateFile(fileId, name?, path?, driveId?): MutationAck!` | rename, move, or move to another drive of the same host; both drives are locked before the sibling check, so a concurrent collision answers `NAME_TAKEN`, never a database error; `NOTHING_TO_CHANGE` when nothing differs. |
+| `<p>RetitleFile(fileId, title): MutationAck!` | gate `RetitleFile { file }` (affordance `retitle`); changes the title and nothing else — never the name, the path, the drive or the state, and `UpdateFile` never touches the title; `INVALID_TITLE`, `NOTHING_TO_CHANGE` for the same title; the host's rule sees the row (a host may allow a retitle where it refuses a rename). |
 | `<p>DeleteFile(fileId): MutationAck!` | cascade; the source blob is released in the same transaction. |
-| `<p>MoveFolder(driveId, oldPrefix, newPrefix): MutationAck!` | gate `MoveFolder`, then the `move` decision of every file under the prefix (all or nothing: the first refusal's code, `FILE_PROTECTED` included; `FOLDER_NOT_FOUND` for a file the caller cannot see); bulk pipeline: one `UPDATE` on the prefix (the rows are locked first), then `folder_moved`; `FOLDER_NOT_FOUND`, `FOLDER_INTO_ITSELF`, `NAME_TAKEN` (refused as a whole), `INVALID_PATH` for the root or a rebased path over 1024 bytes. |
+| `<p>MoveFolder(driveId, oldPrefix, newPrefix): MutationAck!` | gate `MoveFolder`, then the `move` decision of every file under the prefix (all or nothing: the first refusal's code; `FOLDER_NOT_FOUND` for a file the caller cannot see); bulk pipeline: one `UPDATE` on the prefix (the rows are locked first), then `folder_moved`; `FOLDER_NOT_FOUND`, `FOLDER_INTO_ITSELF`, `NAME_TAKEN` (refused as a whole), `INVALID_PATH` for the root or a rebased path over 1024 bytes. |
 | `<p>DeleteFolder(driveId, prefix): MutationAck!` | gate `DeleteFolder`, then the `delete` decision of every file under the prefix (same all-or-nothing rule); bulk pipeline: one `DELETE` for every file under the prefix, one blob release per file, then `folder_deleted`. |
 | `<p>File(fileId): DriveFile` | the file as the caller sees it, or `null`. |
 | `<p>DriveFiles(driveId): [DriveFile!]!` | the drive's files as the caller sees them (the tree is a path prefix; empty folders do not exist). |
@@ -246,7 +243,7 @@ renders it, is committed at
 
 `DriveFile`: `id`, `driveId`, `path` (normalized, `""` = root), `name`,
 `title` (the human-facing title, independent of the name),
-`protected`, `mediaType`, `sizeBytes` (`ByteCount`, a 64-bit JSON number —
+`mediaType`, `sizeBytes` (`ByteCount`, a 64-bit JSON number —
 GraphQL `Int` is 32-bit), `sha256` (hex), `processingState`
 (`PENDING | PROCESSING | READY | FAILED`), `processingError`, `metadata`
 (JSON), `summary`, `pageCount`, `estimatedTokens`, `images[] { name,
@@ -272,7 +269,7 @@ cause }`, `DriveRemove { revision, projector, key, cause }` (`projector` is
 `drive_files` or `drive_pages`; a page key is `{ fileId, number }`), plus the
 lane notices. `cause` is one of the library's file causes (`UploadRequested`,
 `UploadCommitted`, `UploadAbandoned`, `SourceAvailable`, `Renamed`, `Retitled`, `Moved {
-from_drive }`, `FolderMoved`, `ProtectionChanged { protected }`,
+from_drive }`, `FolderMoved`,
 `MetadataChanged`, `ImageRequested { name }`, `ImageAvailable { name }`,
 `ImagesDropped { names }`, `ReportStored { job_id, done }`,
 `ProcessingStarted { job_id, step }`, `ProgressChanged`,
@@ -367,7 +364,7 @@ never reported; affordance `editPage` on the page) — one `DriveUpsert` on the
 page, nothing on the file. Deleting a file (per row, per folder or with its
 drive) drops its pages and images and releases every image object with the
 source in the same transaction; the File aggregate never loads its rendition,
-so a rename, a protection change, a metadata write or a folder gesture costs
+so a rename, a metadata write or a folder gesture costs
 the same on a 3-page file and on a 3000-page one.
 
 ## Processing rules (milestone 4)
@@ -581,7 +578,7 @@ append-only fact (`drive.fact`), the way the identity service keeps its own:
 page, its file; `page_number` names the page), `correlation_id` (the gesture:
 a folder move's files, a report's pages share it; a reaction's message
 correlation), `fact_type` and `payload` (the change, as the library's cause:
-`Renamed`, `Retitled`, `Moved`, `FolderMoved`, `ProtectionChanged`,
+`Renamed`, `Retitled`, `Moved`, `FolderMoved`,
 `MetadataChanged`, `UploadCommitted`, `ProcessingStarted`, `ReportStored`,
 `ProcessingFinished`, `ProcessingFailed`, `CancelRequested`, `Reported`,
 `Edited`, `Updated`, `Saved`), `actor_id` and `actor_kind` (`human`;
@@ -649,7 +646,7 @@ misread them:
 
 ## Reason codes
 
-`DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`, `FILE_PROTECTED`,
+`DRIVE_NOT_FOUND`, `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND`,
 `FILE_NOT_PENDING`, `FILE_NOT_READY`, `FILE_PROCESSING`, `FILE_TOO_LARGE`,
 `UPLOAD_NOT_LANDED`, `INVALID_SHA256`, `INVALID_FILE_ID`, `INVALID_MEDIA_TYPE`, `INVALID_PATH`,
 `INVALID_NAME`, `INVALID_TITLE`, `NAME_TAKEN`, `FOLDER_INTO_ITSELF`, `NOTHING_TO_CHANGE`,
@@ -734,7 +731,7 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
 `crates/br-drive-example` is the reference host: a thin kernel (principal,
 facts, faults, the `DriveHost` impl), one `workspace` slice (the host object a
 drive hangs off, owner-only gate: `workspaceCreate` / `workspaceDelete` /
-`workspaceTransfer` / `workspaceProtectFile`; the `workspace:manage` scope on
+`workspaceTransfer`; the `workspace:manage` scope on
 a human passport is its `ManageRulesets` gate, any human reads the rules), the
 embedded `drive` slice (its `ProcessFile` and `CancelProcessing` gates allow a
 workspace's owner, like every per-file gesture), the catalogue watch — started from the `register` closure in

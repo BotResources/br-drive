@@ -79,6 +79,10 @@ FROM drive.ruleset r
 WHERE r.updated_at > r.created_at;
 
 ALTER TABLE drive.file DROP COLUMN updated_at;
+
+-- The `protected` mark goes: no host uses it. A host keeps its own per-file
+-- rules in its gate (on the row's metadata, say).
+ALTER TABLE drive.file DROP COLUMN protected;
 ALTER TABLE drive.file_page DROP COLUMN updated_by, DROP COLUMN updated_at;
 ALTER TABLE drive.label DROP COLUMN updated_at;
 ALTER TABLE drive.ruleset DROP COLUMN updated_at;

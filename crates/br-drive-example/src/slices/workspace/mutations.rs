@@ -111,41 +111,6 @@ pub fn transfer_workspace<'m>(
 
 #[cfg(feature = "drive")]
 #[derive(Debug, Deserialize)]
-pub struct ProtectFile {
-    pub file_id: Uuid,
-    pub protected: bool,
-}
-
-#[cfg(feature = "drive")]
-impl MutationInput for ProtectFile {
-    type Output = ();
-    type Error = AppFault;
-    const NAME: &'static str = "protect_file";
-}
-
-#[cfg(feature = "drive")]
-pub fn protect_file<'m>(
-    cx: &'m mut Mutation<'m, AppPrincipal>,
-    input: ProtectFile,
-) -> BoxFuture<'m, Result<(), AppFault>> {
-    Box::pin(async move {
-        let drive = br_drive::drive_of(cx, input.file_id)
-            .await?
-            .ok_or(AppFault::Refused(br_drive::codes::FILE_NOT_FOUND))?;
-        let workspace = cx
-            .load::<WorkspaceRow>(&drive)
-            .await?
-            .ok_or(AppFault::Refused(WORKSPACE_NOT_FOUND))?;
-        workspace.transfer_gate(cx.principal()).require()?;
-        let principal = cx.principal().clone();
-        br_drive::set_protected::<AppPrincipal>(cx, &principal, input.file_id, input.protected)
-            .await?;
-        Ok(())
-    })
-}
-
-#[cfg(feature = "drive")]
-#[derive(Debug, Deserialize)]
 pub struct AnnotateFile {
     pub file_id: Uuid,
     pub metadata: serde_json::Value,

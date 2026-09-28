@@ -18,7 +18,7 @@ use crate::ruleset::Trigger;
 use crate::title::FileTitle;
 
 /// The columns of `drive.file` itself, in insert order.
-pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, title, protected, media_type, size_bytes, sha256, blob_ref, \
+pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, title, media_type, size_bytes, sha256, blob_ref, \
      committed_at, metadata, ruleset_id, steps, created_by, created_at";
 
 /// The columns of `drive.file_processed` a file row reads beside its own: what
@@ -159,7 +159,6 @@ pub(crate) fn row_to_file_prefixed<H>(
         path: DrivePath::parse(&path).map_err(config_error)?,
         name: FileName::parse(&name).map_err(config_error)?,
         title: FileTitle::parse(&title).map_err(config_error)?,
-        protected: row.get(column("protected").as_str()),
         media_type: MediaType::parse(&media_type).map_err(config_error)?,
         size_bytes: row.get(column("size_bytes").as_str()),
         sha256: sha256(row.get(column("sha256").as_str()))?,
@@ -260,16 +259,14 @@ impl<H: DriveHost> Persistence for FileStore<H> {
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
             sqlx::query(
-                "UPDATE drive.file SET drive_id = $2, path = $3, name = $4, protected = $5, \
-                   committed_at = $6, metadata = $7, ruleset_id = $8, steps = $9, \
-                   title = $10 \
+                "UPDATE drive.file SET drive_id = $2, path = $3, name = $4, committed_at = $5, \
+                   metadata = $6, ruleset_id = $7, steps = $8, title = $9 \
                  WHERE id = $1",
             )
             .bind(file.id)
             .bind(file.drive_id)
             .bind(file.path.as_str())
             .bind(file.name.as_str())
-            .bind(file.protected)
             .bind(file.committed_at)
             .bind(&file.metadata)
             .bind(file.ruleset_id)
@@ -289,15 +286,13 @@ impl<H: DriveHost> Persistence for FileStore<H> {
         Box::pin(async move {
             sqlx::query(&format!(
                 "INSERT INTO drive.file ({FILE_COLUMNS}) VALUES \
-                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                  $16)"
+                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
             ))
             .bind(file.id)
             .bind(file.drive_id)
             .bind(file.path.as_str())
             .bind(file.name.as_str())
             .bind(file.title.as_str())
-            .bind(file.protected)
             .bind(file.media_type.as_str())
             .bind(file.size_bytes)
             .bind(file.sha256.to_vec())
