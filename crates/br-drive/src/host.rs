@@ -53,6 +53,8 @@ pub enum DriveRequest<'a, H> {
         drive: Uuid,
         prefix: &'a DrivePath,
     },
+    /// Starting a chain on a READY or FAILED file (`<p>ProcessFile`), its first
+    /// processing included: a commit never processes.
     Process {
         file: &'a FileRow<H>,
     },
@@ -78,9 +80,10 @@ pub enum DriveRequest<'a, H> {
     Import {
         file: &'a FileRow<H>,
     },
-    /// Committing a PENDING upload without processing it (`<p>ImportCommit`),
-    /// by a principal holding `IMPORT_SCOPE`: the pending row carries its
-    /// uploader, so a host can reserve it to the uploads its migration made.
+    /// Committing a PENDING upload through the import privilege
+    /// (`<p>ImportCommit`), by a principal holding `IMPORT_SCOPE`: the pending
+    /// row carries its uploader, so a host can reserve it to the uploads its
+    /// migration made.
     ImportCommit {
         file: &'a FileRow<H>,
     },

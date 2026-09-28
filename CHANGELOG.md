@@ -70,33 +70,77 @@ single git tag `v{version}` releases the set. Format follows
   answers `FOLDER_NOT_FOUND`, as an empty prefix does. The decisions run in
   memory over the rows the bulk path already loads, past the reset threshold
   too.
-- A file no runner picks up no longer stays `PROCESSING` with no way out:
-  its user cancels it (`<p>CancelProcessing`, see Added), Jobs' `cancelled`
-  lands it `FAILED`, and a reprocess starts over.
+- A file whose job no runner picks up (a runner type Jobs never declared, no
+  live instance) can be cancelled by its user (`<p>CancelProcessing`, see
+  Added): Jobs' `cancelled` lands it `FAILED`, and a reprocess starts over. A
+  job Jobs no longer holds live is not rescued by it (see the README's
+  Follow-ups).
 
 ### Changed
 
 - **A file's processing state is computed, never stored.** Every Jobs job the
   library creates for a file (one per chain step) is a row of the new
-  `drive.file_job` log (migration `9121000007`): the job, its step, its
-  initiator, and the append-only list of every Jobs fact received about it
-  (`queued`, `creation_rejected`, `started`, `plan_declared`, `step_started`,
-  `completed`, `failed`, `cancelled`, each `{kind, at, ...payload}`), plus the
-  user's `cancel_requested`. The `drive.file_status` view computes
-  `PENDING | PROCESSING | READY | FAILED` and the error from the file's last
-  job and the new `drive.file.committed_at`; `processingState`,
-  `processingError` and `progress` are read from it (the SDL is unchanged),
-  and so are every gate, affordance and `file_counts`. A fact updates only
-  its own job, so a late fact of an older job changes nothing; a job settles
-  on its first terminal fact, so a step fact arriving after the completion
-  (the facts ride separate durables) changes nothing either. A partial
-  unique index keeps at most one unsettled job per file; "last job" follows
-  an identity sequence, never the pods' clocks. An erase locks the files
-  whose jobs name the person before rewriting the jobs' initiators.
-- The chain advances only on Jobs' `completed`, which Jobs publishes only
-  after the owner's `job.finish` — sent with the runner's `done` report. A
-  `completed` that "arrives before the report" cannot happen; the branch that
-  waited for it is gone.
+  `drive.file_job` log (migration `9121000007`): the job, its step, the
+  gesture that started its chain (`trigger`), its initiator, and the
+  append-only list of what is known of it, each `{kind, at, ...payload}` —
+  every Jobs fact received (`queued`, `creation_rejected`, `started`,
+  `plan_declared`, `step_started`, `completed`, `failed`, `cancelled`) and what
+  the library writes itself (`reported_done`, `reported_failed`,
+  `cancel_requested`). The `drive.file_status` view computes
+  `PENDING | PROCESSING | READY | FAILED` (the shared vocabulary is unchanged)
+  and the error from the file's last job and the new
+  `drive.file.committed_at`: no job and not committed → `PENDING`; no job and
+  committed → `READY` (stored, unprocessed); a last job whose first terminal
+  entry is `reported_done` → `READY`; `reported_failed`, `failed`,
+  `cancelled` or `creation_rejected` → `FAILED` with the error read from that
+  entry; otherwise `PROCESSING`. `processingState`, `processingError` and
+  `progress` are read from it (the SDL is unchanged), and so are every gate,
+  affordance and `file_counts`. A fact updates only its own job, so a late
+  fact of an older job changes nothing; a job settles on its first terminal
+  entry, so anything arriving after it (the facts ride separate durables) is
+  logged and changes nothing. A partial unique index keeps at most one
+  unsettled job per file; "last job" follows an identity sequence, never the
+  pods' clocks. An erase locks the files whose jobs name the person before
+  rewriting the jobs' initiators.
+- **The runner declares the end of its job; the library tells Jobs.** The
+  runner's final report (`done: true`) ends the job in its own transaction:
+  its results are stored, `reported_done` is logged, the chain moves on (the
+  next step's job is created in the same transaction, or the chain is over
+  and the file `READY`) and `job.finish.v2` is staged. Jobs' `completed` is
+  logged as information and changes nothing. A declared failure (the new
+  `<p>RunnerReportFailure`, see Added) logs `reported_failed` and stages
+  `job.fail.v2`. Jobs' own `failed`, `cancelled` and `creation_rejected` stay
+  terminal, the safety net for a runner that crashed or a user's cancel. A
+  replayed final report meets a job that no longer runs (`JOB_NOT_ACTIVE`).
+- **Committing and processing are two gestures.** `CommitUpload` only
+  confirms the upload (the storage check, `committed_at`): the file is
+  `READY`, stored and unprocessed, whatever rule matches. `<p>ProcessFile`
+  (see Added) is the only way to start a chain.
+- **Reprocessing rewrites in place.** Nothing is wiped when a chain starts:
+  the previous pages, images and indexing stay readable while the new run
+  reports over them. A reported page replaces the page of the same number,
+  except that an upload or reprocess run keeps a page whose origin is
+  `EDITED`; a `regenerate_page` run overwrites it. Images are replaced by
+  name as reported; the indexing when a report carries one. When the chain's
+  last step lands its final report, the pages numbered above the file's page
+  count are deleted — edited ones included — and the images no page's
+  markdown references any more are dropped and their objects released
+  (`ImagesDropped`). A failed reprocess leaves the file `FAILED` with the
+  previous results still readable.
+- **A file's results have their own table.** `summary`, `page_count` and
+  `estimated_tokens` move from `drive.file` to the new
+  `drive.file_processed` (migration `9121000008`), which holds only what the
+  workers produce; `drive.file_page` and `drive.file_image` hang off it
+  (cascade). The row is created by the first write that needs it (a report,
+  an image request, an import). `DriveFile` still exposes `summary`,
+  `pageCount` and `estimatedTokens`; `drive.file` keeps the plan
+  (`ruleset_id`, `steps`) and `committed_at`.
+- `updatedAt` moves on every write that changes the file's status: a Jobs
+  fact that settles the running job, a cancel request, the runner's final
+  report or declared failure. Progress facts (`ProgressChanged`) no longer
+  touch the host object — they never change a count — and `file_counts`
+  reads the status view by drive (the view carries `drive_id`), served by
+  `file_drive_idx` and the job log's index.
 - `FileRow`'s `processing_state` and `processing_error` fields became
   computed accessors, `processing_state()` / `processing_error()`, beside
   `last_job()` / `active_job()` (`br_drive::FileJob`) and `committed_at`; the
@@ -123,9 +167,29 @@ single git tag `v{version}` releases the set. Format follows
 - The token estimate of a runner report is optional: `summary` and
   `pageCount` still move together, `estimatedTokens` may be absent (it may not
   come alone). An indexing without an estimate clears a previous one.
+- `FileCause` is `#[non_exhaustive]`; new variant `CancelRequested { job_id }`.
+- `FileJob` carries its chain's `trigger`; `DriveRequest::Process { file }` is
+  now asked for every processing, the first one included.
+- `br_drive::create_drive::<H>(ops, owner, created_by)` takes the host object
+  the drive hangs off (`&<H::DriveOwner as DriveOwnerNoun>::Object`) and gives
+  the drive its key, instead of a free id: a drive's id is its host object's
+  id by construction, which the host refresh (`DriveOwner`) relies on.
+  `DriveOwnerNoun` gains `type Object` (a host aggregate keyed by a UUID);
+  `NoDriveOwner`'s is `Unowned`, which has no value.
+- A chain step never names a `parent_job_id` (see Fixed).
+- Image names accept wider page and index numbers (see Fixed).
+- Engine pin `v0.3.0` → `v0.3.4`: authenticated bodies are bounded (0.3.3),
+  and subscriptions are served over graphql-sse on `POST /graphql`, the
+  transport the gateway uses (0.3.4). The e2e harness's owner role is
+  `BYPASSRLS`, as `migrate` now asserts (0.3.1).
 
 ### Removed
 
+- `<p>Process` (folded into `<p>ProcessFile`) and `CommitUpload`'s
+  `rulesetId`: a commit never processes.
+- The wipe of the pages, images and indexing at the start of a reprocess
+  (`br_drive::wipe_rendition`), and `br_drive::finish_job` (the chain stages
+  `job.finish` itself).
 - Every use of the runner-type catalogue copy as a condition:
   `drive.catalogue_scan` (the "catalogue was read" record), the deferred
   launch (`launch-retry`, `LAUNCH_RETRY_AFTER`, `LAUNCH_RETRY_CAP`,
@@ -139,12 +203,29 @@ single git tag `v{version}` releases the set. Format follows
   `timed_out` failure. The upload deadline stays, keyed on `committed_at`.
 - The stray job kept on a file after a `duplicate_active_entity` rejection,
   and the automatic relaunch when a cancel and a create crossed.
-- The unreleased migrations of the 0.2 lots (`processing_backstops`,
-  `file_counts_index`, `run_started_at`): the chain goes from 0.1's schema to
-  the job log directly; the title migration is now `9121000006`.
+- The migrations `main` carried unreleased since 0.1.0
+  (`processing_backstops`, `file_counts_index`, `run_started_at`): the chain
+  goes from 0.1's schema to the job log directly; the title migration is now
+  `9121000006`.
 
 ### Added
 
+- `<p>ProcessFile(fileId, rulesetId?)`: the user starts processing a stored
+  file — right after its commit, later, or never — through the host's
+  `DriveRequest::Process { file }` gate (affordance `process`). Allowed on a
+  `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload,
+  `FILE_PROCESSING` while a chain runs). A file that never had a job runs
+  its `upload` rule, any other its `reprocess` rule: the given rule (it must
+  carry that trigger, `RULESET_MISMATCH` otherwise), else the default of that
+  trigger for the media type, else — for a reprocess — the file's own
+  snapshot, else `NO_RULESET_MATCHES`. Exposed in the example host.
+- `<p>RunnerReportFailure(fileId, jobId, reasonCode, message?)`: the runner
+  declares its job failed, with the same checks as a report (the runner
+  scope, the file's running job). `reasonCode` is a code, `[a-z][a-z0-9_]*`
+  up to 128 bytes, `message` up to 4 KiB (`INVALID_FAILURE_REASON`
+  otherwise). The file lands `FAILED` with that code as `processingError`
+  (`ProcessingFailed { reason }`), `job.fail.v2` is staged with the code and
+  the message as its note, and the results reported so far stay.
 - `<p>RunnerTypes: [DriveRunnerType!]!` (`br_drive::known_runner_types`): the
   whole local catalogue copy — `{ runnerType, lifecycle: ACTIVE | DEPRECATED,
   seenAt }` in name order — for a host's rule-editing screen. Gated by the
@@ -157,18 +238,18 @@ single git tag `v{version}` releases the set. Format follows
   `CancelRequested { job_id }`) and `job.cancel.v2` is staged; the file stays
   `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to
   a reprocess. It may be asked again (a cancel Jobs consumed before the job's
-  creation is dropped). A cancel that crosses a step's completion stops the
+  creation is dropped). A cancel that crosses a step's final report stops the
   chain there: the next step is recorded as never started (`cancelled`, a
-  row of the library's own, never sent to Jobs). The example host exposes it
-  to a workspace's owner.
-- `<p>ImportCommit(fileId)`: commits a pending upload **without processing**
-  — the file lands `READY` and no rule runs, even when an `upload` rule
-  matches — so a host that declared its processing rules before migrating a
-  corpus can still import into it. The same right as an import
-  (`IMPORT_SCOPE`), then a gate of its own, the new
+  row of the library's own, never sent to Jobs) and the file is `FAILED`
+  `cancelled`; one that crosses the last step's final report has nothing
+  left to stop — the file is `READY`. The example host exposes it to a
+  workspace's owner.
+- `<p>ImportCommit(fileId)`: commits a pending upload the way `CommitUpload`
+  does — the file lands `READY`, no rule runs — for a migration account: the
+  same right as an import (`IMPORT_SCOPE`), then a gate of its own, the new
   `DriveRequest::ImportCommit { file }` on the pending row (its uploader
   included), then `FILE_NOT_PENDING` and the commit's storage check
-  (`UPLOAD_NOT_LANDED`). `CommitUpload` is unchanged.
+  (`UPLOAD_NOT_LANDED`).
 - `br_drive::create_unowned_drive::<H>(ops, id, created_by)`, for a host whose
   `DriveOwner` is `NoDriveOwner` only.
 - A host-privileged **import** of an existing rendition:
@@ -189,8 +270,7 @@ single git tag `v{version}` releases the set. Format follows
   noun — an object carrying file counts — recompute and republish while files
   land, fail, move and go. No host callback; the noun and its key are
   compiler-checked. `br_drive::file_counts` reads the file and READY counts
-  of several drives in one statement, from the computed status (migration
-  `9121000007`). The example host's `WorkspaceView` gains `fileCount` and
+  of several drives in one statement, from the computed status. The example host's `WorkspaceView` gains `fileCount` and
   `readyFileCount`, live.
 - `DriveHost::IMPORT_SCOPE` (default `None`: no import): the scope a service
   account must hold to import, checked by the library before the host's gate
@@ -218,22 +298,6 @@ single git tag `v{version}` releases the set. Format follows
   service principals out of the label catalogue, and its metadata mutation
   relies on the library's gate.
 
-### Changed
-
-- `FileCause` is `#[non_exhaustive]`; new variant `CancelRequested { job_id }`.
-- `br_drive::create_drive::<H>(ops, owner, created_by)` takes the host object
-  the drive hangs off (`&<H::DriveOwner as DriveOwnerNoun>::Object`) and gives
-  the drive its key, instead of a free id: a drive's id is its host object's
-  id by construction, which the host refresh (`DriveOwner`) relies on.
-  `DriveOwnerNoun` gains `type Object` (a host aggregate keyed by a UUID);
-  `NoDriveOwner`'s is `Unowned`, which has no value.
-- A chain step never names a `parent_job_id` (see Fixed).
-- Image names accept wider page and index numbers (see Fixed).
-- Engine pin `v0.3.0` → `v0.3.4`: authenticated bodies are bounded (0.3.3),
-  and subscriptions are served over graphql-sse on `POST /graphql`, the
-  transport the gateway uses (0.3.4). The e2e harness's owner role is
-  `BYPASSRLS`, as `migrate` now asserts (0.3.1).
-
 ### Upgrading from 0.1
 
 - Pin `br-service-engine` `v0.3.4`, the same tag as `br-drive`. The
@@ -258,21 +322,42 @@ single git tag `v{version}` releases the set. Format follows
   create a file (`title` is `NOT NULL`).
 - Migration `9121000007` replaces the stored processing state with the job
   log, one-way: `committed_at` is backfilled from `updated_at` for every file
-  past `PENDING`; a job in flight becomes its file's log (empty, so the file
-  stays `PROCESSING` and the job's next fact lands in it); a `FAILED` file
-  keeps its error as a synthetic `failed` entry of a synthetic job (never
-  sent to Jobs); a `PROCESSING` file without a job, should one exist, lands
-  `FAILED` `interrupted`. Then the stored state, step, job, plan, progress,
-  initiator and clock columns and `drive.catalogue_scan` are dropped;
-  `drive.known_runner_type` is kept as it is. A database that ran this branch's
-  unreleased migrations `9121000006`–`9121000009` must be recreated.
+  past `PENDING`. A job in flight becomes its file's log: with no final report
+  yet, an empty log (the file stays `PROCESSING`, and the runner's next report
+  or Jobs' next fact lands in it); with the final report received
+  (`done_at`), `reported_done` — the end of the chain on its last step
+  (`READY`), else the chain is recorded as interrupted before the next step,
+  which 0.1 had not asked of Jobs yet (`FAILED` `interrupted`, open to a
+  reprocess); with only Jobs' completion (`completed_at`, unreachable with the
+  real Jobs), `completed` then `failed` `interrupted`. A `FAILED` file keeps its
+  error as a synthetic `failed` entry of a synthetic job (never sent to
+  Jobs); a `PROCESSING` file without a job, should one exist, lands `FAILED`
+  `interrupted`. Then the stored state, step, job, plan, progress, initiator
+  and clock columns and `drive.catalogue_scan` are dropped;
+  `drive.known_runner_type` is kept as it is.
+- Migration `9121000008` moves each file's `summary`, `page_count` and
+  `estimated_tokens` to `drive.file_processed` for every file holding any
+  result (an indexing, a page or an image) and repoints the foreign keys of
+  `drive.file_page` and `drive.file_image` to it. One-way.
+- A database that ran migrations `main` carried unreleased since 0.1.0
+  (`9121000006`–`9121000009` there) must be recreated; a 0.1.0 database
+  upgrades in place.
+- `CommitUpload` no longer processes and takes no `rulesetId`: a front that
+  wants a file processed calls `<p>ProcessFile` after the commit (the
+  `process` affordance says when it may). `<p>Process` is now
+  `<p>ProcessFile`; `DriveRequest::Process { file }` is now also asked for a
+  file's first processing. A runner may declare its failure through
+  `<p>RunnerReportFailure` instead of failing its run with Jobs; a runner
+  that retried a lost final report gets `JOB_NOT_ACTIVE` once the first one
+  landed.
 - `DriveRequest::CancelProcessing { file }` is new: decide it explicitly (a
   wildcard arm answers it). A host that started `br_drive::watch_runner_types`
   keeps it (optional, information only); one that set `PICKUP_TIMEOUT` / `STEP_TIMEOUT` drops them.
   A host that read `file.processing_state` / `file.processing_error` calls
   the accessors. A host that matched `RUNNER_TYPE_UNAVAILABLE`,
   `runner_type_unavailable` or `timed_out` may meet Jobs' own
-  `runner_type_retired`, or `cancelled`.
+  `runner_type_retired`, `cancelled`, a runner's declared code, or
+  `interrupted`.
 - `DriveHost` gains a required associated type, `DriveOwner`: write
   `type DriveOwner = br_drive::NoDriveOwner;` to keep 0.1's behaviour, and
   replace `create_drive(cx, id, created_by)` with

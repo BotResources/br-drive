@@ -6,9 +6,7 @@
 //! Every import gesture asks the host (`DriveRequest::Import`, or
 //! `DriveRequest::ImportCommit` for the commit), so each host decides who may
 //! call them, and they write through the same paths a
-//! commit and a runner report do, so the views learn of every change. A
-//! migrated source is committed without processing (`ImportCommit`), so a host
-//! that declared its upload rules first still gets a READY file to import into.
+//! commit and a runner report do, so the views learn of every change.
 
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
