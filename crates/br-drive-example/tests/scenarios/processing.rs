@@ -710,7 +710,10 @@ async fn every_jobs_fact_replayed_changes_nothing() {
     let run_a = Uuid::now_v7();
     let mut files = drive_subscription(&world, &owner, drive).await;
 
-    let started_at = chrono::Utc::now();
+    // Jobs' instants may carry nanoseconds (they do on Linux); the store
+    // keeps microseconds: the replay must still read as the known step.
+    let started_at = chrono::Timelike::with_nanosecond(&chrono::Utc::now(), 123_456_789)
+        .expect("a valid instant");
     for _ in 0..2 {
         jobs.queue(job_a, RENDER).await;
         jobs.start(job_a, run_a).await;

@@ -17,7 +17,7 @@
 
 use std::marker::PhantomData;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use service_engine::error::EngineError;
@@ -328,6 +328,26 @@ pub(crate) enum Received {
 }
 
 impl Received {
+    /// The fact with its instants at the store's precision (microseconds):
+    /// Jobs may send nanoseconds, `drive.file_processing` keeps microseconds,
+    /// so a redelivered step compares equal to the one stored before it.
+    fn at_store_precision(self) -> Self {
+        match self {
+            Self::StepStarted {
+                run_id,
+                index,
+                label,
+                started_at,
+            } => Self::StepStarted {
+                run_id,
+                index,
+                label,
+                started_at: started_at.trunc_subsecs(6),
+            },
+            other => other,
+        }
+    }
+
     /// The fact as its own event.
     fn event(&self, job_id: Uuid) -> ProcessingEvent {
         match self.clone() {
@@ -675,6 +695,7 @@ impl<H> FileProcessing<H> {
     /// what it did. Nothing received is dropped: a fact that changes nothing
     /// any more is recorded as `JobFactIgnored`.
     pub(crate) fn receive(&mut self, job_id: Uuid, fact: Received, meta: &FactMeta) -> Applied {
+        let fact = fact.at_store_precision();
         let event = fact.event(job_id);
         if job_id != self.job_id {
             return self.ignore(job_id, &event, why::NOT_THE_CURRENT_JOB, meta);
@@ -1154,6 +1175,54 @@ mod tests {
                 assert!(!kind.ends_with(word), "{kind} is not a fact");
             }
         }
+    }
+
+    /// Jobs' instants carry nanoseconds on Linux; Postgres keeps
+    /// microseconds. A step replayed after the state was stored and loaded
+    /// again must still read as the step already known.
+    #[test]
+    fn a_step_replayed_after_a_store_round_trip_is_already_known_whatever_its_nanoseconds() {
+        use chrono::Timelike;
+        let at = Utc::now().with_nanosecond(123_456_789).unwrap();
+        let run_id = Uuid::now_v7();
+        let step = || Received::StepStarted {
+            run_id,
+            index: 0,
+            label: "render".into(),
+            started_at: at,
+        };
+        let plan = || Received::PlanDeclared {
+            run_id,
+            labels: vec!["render".into()],
+        };
+        let mut processing = running();
+        let job = processing.job_id;
+        assert_eq!(
+            processing.receive(job, step(), &meta()),
+            Applied::Progressed
+        );
+        assert_eq!(
+            processing.plan_at,
+            Some(at.trunc_subsecs(6)),
+            "the step is kept at the store's precision"
+        );
+        // What a reload from `drive.file_processing` gives back.
+        processing.plan_at = processing.plan_at.map(|at| at.trunc_subsecs(6));
+        // Any order of the plan and the replays: two moves, then nothing.
+        assert_eq!(
+            processing.receive(job, plan(), &meta()),
+            Applied::Progressed
+        );
+        assert_eq!(processing.receive(job, step(), &meta()), Applied::Ignored);
+        assert_eq!(processing.receive(job, plan(), &meta()), Applied::Ignored);
+        assert_eq!(processing.receive(job, step(), &meta()), Applied::Ignored);
+        let mut reordered = running();
+        let job = reordered.job_id;
+        assert_eq!(reordered.receive(job, plan(), &meta()), Applied::Progressed);
+        assert_eq!(reordered.receive(job, plan(), &meta()), Applied::Ignored);
+        assert_eq!(reordered.receive(job, step(), &meta()), Applied::Progressed);
+        reordered.plan_at = reordered.plan_at.map(|at| at.trunc_subsecs(6));
+        assert_eq!(reordered.receive(job, step(), &meta()), Applied::Ignored);
     }
 
     #[test]
