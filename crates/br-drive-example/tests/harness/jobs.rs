@@ -226,7 +226,19 @@ async fn publish_fact<T: Serialize>(
     event_type: &str,
     payload: T,
 ) -> Uuid {
-    let message_id = Uuid::now_v7();
+    publish_fact_as(js, actor, Uuid::now_v7(), coords, event_type, payload).await
+}
+
+/// Publishes a Jobs fact under a given message id: publishing it twice is the
+/// broker redelivering one message.
+async fn publish_fact_as<T: Serialize>(
+    js: &async_nats::jetstream::Context,
+    actor: Uuid,
+    message_id: Uuid,
+    coords: EventCoords,
+    event_type: &str,
+    payload: T,
+) -> Uuid {
     let event = IntegrationEvent::new(
         message_id,
         event_type,
@@ -695,6 +707,30 @@ impl JobsStandIn {
             },
         )
         .await
+    }
+
+    /// Jobs' `failed`, delivered twice under one message id — the broker's
+    /// redelivery of one message.
+    pub async fn fail_delivered_twice(&self, job_id: Uuid, failure_cause: &str) -> Uuid {
+        self.settle(job_id);
+        let message_id = Uuid::now_v7();
+        for _ in 0..2 {
+            publish_fact_as(
+                &self.js,
+                self.actor,
+                message_id,
+                evt_job_failed_v1_coords().unwrap(),
+                EVENT_TYPE_FAILED,
+                JobFailed {
+                    job_id,
+                    failure_cause: failure_cause.to_string(),
+                    failure_report: None,
+                    note: None,
+                },
+            )
+            .await;
+        }
+        message_id
     }
 
     pub async fn cancel(&self, job_id: Uuid) -> Uuid {
