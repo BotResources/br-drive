@@ -72,16 +72,13 @@ async fn anonymising_a_person_rewrites_every_id_they_left_and_keeps_their_files(
             serde_json::json!({ "f": file_id }),
         )
         .await);
-    let requester = || async {
-        sqlx::query_scalar::<_, Option<Uuid>>(
-            "SELECT requested_by FROM drive.file_job_cancel WHERE job_id = $1",
-        )
-        .bind(job_id)
-        .fetch_one(&world.db.app)
-        .await
-        .unwrap()
-    };
-    assert_eq!(requester().await, Some(person_id));
+    let requests = world.job_facts(job_id).await;
+    assert!(
+        requests
+            .iter()
+            .any(|fact| fact.event_type == "CancelRequested" && fact.actor_id == person_id),
+        "the cancel is the person's fact: {requests:?}"
+    );
 
     let outcome = world.erase(person_id).await;
     assert!(outcome.fresh);
@@ -112,20 +109,8 @@ async fn anonymising_a_person_rewrites_every_id_they_left_and_keeps_their_files(
         page_by != REDACTED.to_string() && page_by != person_id.to_string(),
         "the runner wrote the page, not the person: {page_by}"
     );
-    // The audit trail keeps every change the person made — the commit, the
-    // processing, the cancel — and no longer names them.
-    let (theirs, redacted): (i64, i64) = sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE actor_id = $1), count(*) FILTER (WHERE actor_id = $2) \
-         FROM drive.fact WHERE aggregate_id = $3",
-    )
-    .bind(person_id)
-    .bind(REDACTED)
-    .bind(file_id)
-    .fetch_one(&world.db.app)
-    .await
-    .unwrap();
-    assert_eq!(theirs, 0, "no fact names the erased person");
-    assert!(redacted >= 3, "their facts stay, anonymised: {redacted}");
+    // The facts live in the host's fact table: their erasure is the host's,
+    // not the library's.
     let link_by: Uuid =
         sqlx::query_scalar("SELECT created_by FROM drive.file_label WHERE file_id = $1")
             .bind(file_id)
@@ -134,7 +119,7 @@ async fn anonymising_a_person_rewrites_every_id_they_left_and_keeps_their_files(
             .unwrap();
     assert_eq!(link_by, REDACTED);
     let (initiator, initiator_name): (Option<Uuid>, Option<String>) = sqlx::query_as(
-        "SELECT triggered_by_id, triggered_by_name FROM drive.file_job WHERE job_id = $1",
+        "SELECT triggered_by_id, triggered_by_name FROM drive.file_processing WHERE job_id = $1",
     )
     .bind(job_id)
     .fetch_one(&world.db.app)
@@ -142,11 +127,6 @@ async fn anonymising_a_person_rewrites_every_id_they_left_and_keeps_their_files(
     .unwrap();
     assert_eq!(initiator, Some(REDACTED));
     assert!(initiator_name.is_none(), "the display name is gone");
-    assert_eq!(
-        requester().await,
-        Some(REDACTED),
-        "the cancel request no longer names the person"
-    );
     let file = world.file(&person, file_id).await;
     assert_eq!(
         file["processingState"], "PROCESSING",

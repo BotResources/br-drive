@@ -1,7 +1,9 @@
-//! The audit trail: every change of a file, a page, a label or a rule is an
-//! append-only fact naming who acted — a person (and the admin behind an
-//! impersonated session), a runner, a service account — and the last change
-//! the views show (`updatedAt`, a page's `updatedBy`) is read from those facts.
+//! The facts: every change of a file, its processing, a page, a label or a
+//! rule reaches the host's fact table through `DriveHost::record_facts`, in the
+//! gesture's transaction — numbered 1, 2, 3… per object, naming who acted (a
+//! person and the admin behind an impersonated session, a runner, a service
+//! account) and the gesture they belong to. The last change the views show
+//! (`updatedAt`, a page's `updatedBy`) is state, written with them.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -11,28 +13,11 @@ use crate::harness::runner::{
 };
 use crate::harness::upload::{UploadRequest, process, upload_processed};
 use crate::harness::{
-    JobsStandIn, World, impersonated_passport, manager_passport, ok, service_passport_as,
+    Fact, JobsStandIn, World, error_code, impersonated_passport, manager_passport, ok,
+    service_passport_as,
 };
 
 const BYTES: &[u8] = b"a document whose every change is on record";
-const REDACTED: Uuid = Uuid::nil();
-
-/// A recorded fact: its type, actor, actor kind, impersonator, instant.
-type FactRow = (String, Option<Uuid>, String, Option<Uuid>, DateTime<Utc>);
-
-async fn facts(world: &World, aggregate_type: &str, id: Uuid, page: Option<i32>) -> Vec<FactRow> {
-    sqlx::query_as(
-        "SELECT fact_type, actor_id, actor_kind, impersonator_id, occurred_at FROM drive.fact \
-         WHERE aggregate_type = $1 AND aggregate_id = $2 AND page_number IS NOT DISTINCT FROM $3 \
-         ORDER BY occurred_at, id",
-    )
-    .bind(aggregate_type)
-    .bind(id)
-    .bind(page)
-    .fetch_all(&world.db.app)
-    .await
-    .expect("read the facts")
-}
 
 fn instant(value: &serde_json::Value) -> DateTime<Utc> {
     serde_json::from_value(value.clone()).expect("an instant")
@@ -50,12 +35,41 @@ async fn catalogue(world: &World, passport: &str) -> serde_json::Value {
     ok(&read).clone()
 }
 
-fn last(rows: &[FactRow]) -> &FactRow {
-    rows.last().expect("at least one fact")
+fn kinds(facts: &[Fact]) -> Vec<&str> {
+    facts.iter().map(|fact| fact.event_type.as_str()).collect()
+}
+
+/// Jobs' information about a job (queued, started, completed) rides its own
+/// durables: its place among the other facts is the broker's.
+fn moving(facts: &[Fact]) -> Vec<&Fact> {
+    facts
+        .iter()
+        .filter(|fact| {
+            !matches!(
+                fact.event_type.as_str(),
+                "JobQueued" | "JobStarted" | "JobCompleted"
+            )
+        })
+        .collect()
+}
+
+/// Every object's facts are numbered from 1, without a gap.
+fn assert_gap_free(facts: &[Fact]) {
+    let seqs: Vec<i64> = facts.iter().map(|fact| fact.seq).collect();
+    let expected: Vec<i64> = (1..=facts.len() as i64).collect();
+    assert_eq!(seqs, expected, "{facts:?}");
+}
+
+fn last(facts: &[Fact]) -> &Fact {
+    facts.last().expect("at least one fact")
+}
+
+fn page_key(file_id: Uuid, number: i32) -> serde_json::Value {
+    serde_json::json!({ "file_id": file_id, "number": number })
 }
 
 #[tokio::test]
-async fn every_change_is_a_fact_naming_its_hand_and_the_last_change_is_read_from_them() {
+async fn every_change_is_a_fact_in_the_host_table_naming_its_hand_and_its_gesture() {
     // Given: an owner, an admin who may borrow the owner's session, a runner,
     // a manager, and a render rule
     let world = World::start("pod-audit").await;
@@ -92,36 +106,70 @@ async fn every_change_is_a_fact_naming_its_hand_and_the_last_change_is_read_from
     .await);
     world.await_state(&owner, file_id, "READY").await;
 
-    // Then: the owner's gestures are the owner's facts, the runner's report
-    // the runner's — and the file's last change is its latest fact
-    let file_facts = facts(&world, "file", file_id, None).await;
-    let hands: Vec<(&str, Option<Uuid>, &str)> = file_facts
+    // Then: the file's facts are the owner's gestures and the runner's report,
+    // in order, gap-free; the processing's too
+    let file_facts = world.facts("drive_file", serde_json::json!(file_id)).await;
+    assert_gap_free(&file_facts);
+    let hands: Vec<(&str, Uuid, &str, bool)> = file_facts
         .iter()
-        .map(|row| (row.0.as_str(), row.1, row.2.as_str()))
+        .map(|fact| {
+            (
+                fact.event_type.as_str(),
+                fact.actor_id,
+                fact.actor_kind.as_str(),
+                fact.is_runner,
+            )
+        })
         .collect();
     assert_eq!(
         hands,
         vec![
-            ("UploadCommitted", Some(owner_id), "human"),
-            ("ProcessingStarted", Some(owner_id), "human"),
-            ("ReportStored", Some(runner_id), "runner"),
-            ("ProcessingFinished", Some(runner_id), "runner"),
+            ("UploadRequested", owner_id, "human", false),
+            ("UploadCommitted", owner_id, "human", false),
+            ("ReportStored", runner_id, "service", true),
         ]
     );
+    assert!(
+        file_facts
+            .iter()
+            .all(|fact| fact.impersonator_id.is_none() && fact.causation_id.is_none())
+    );
+    assert_eq!(
+        file_facts[0].payload["name"], "audited.txt",
+        "a fact carries its data"
+    );
+    let all = world.processing_facts(file_id).await;
+    assert_gap_free(&all);
+    let processing = moving(&all);
+    assert_eq!(
+        processing
+            .iter()
+            .map(|fact| fact.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ChainStarted", "JobCreated", "JobReportedDone"]
+    );
+    assert_eq!(processing[1].payload["job_id"], job.to_string());
+    // And: one gesture, one correlation — the process gesture's two facts,
+    // the report's file, page and processing facts
+    assert_eq!(processing[0].correlation_id, processing[1].correlation_id);
+    assert_eq!(processing[0].actor_id, owner_id);
+    let reported = processing[2].correlation_id;
+    assert_ne!(reported, processing[0].correlation_id);
+    assert_eq!(last(&file_facts).correlation_id, reported);
+    let page_one = world.facts("drive_page", page_key(file_id, 1)).await;
+    assert_eq!(kinds(&page_one), vec!["Reported"]);
+    assert_eq!(page_one[0].correlation_id, reported);
+    assert_eq!(page_one[0].actor_id, runner_id);
+    assert_eq!(page_one[0].payload["job_id"], job.to_string());
+    // And: the views show the last change, as state
     let shown = world.file(&owner, file_id).await;
-    assert_eq!(instant(&shown["updatedAt"]), last(&file_facts).4);
+    assert_eq!(instant(&shown["updatedAt"]), last(&file_facts).occurred_at);
     let pages = world.file_pages(&owner, file_id).await;
     assert!(
         pages
             .iter()
             .all(|page| page["updatedBy"] == runner_id.to_string()),
         "the runner wrote every page: {pages:?}"
-    );
-    let page_one = facts(&world, "page", file_id, Some(1)).await;
-    assert_eq!(page_one.len(), 1);
-    assert_eq!(
-        (page_one[0].0.as_str(), page_one[0].2.as_str()),
-        ("Reported", "runner")
     );
 
     // When: the admin, in the owner's borrowed session, retitles the file and
@@ -143,24 +191,33 @@ async fn every_change_is_a_fact_naming_its_hand_and_the_last_change_is_read_from
 
     // Then: both changes are the owner's — the effective identity — and name
     // the admin behind the session; the views show them as the last changes
-    let file_facts = facts(&world, "file", file_id, None).await;
+    let file_facts = world.facts("drive_file", serde_json::json!(file_id)).await;
+    assert_gap_free(&file_facts);
     let retitled = last(&file_facts);
     assert_eq!(
         (
-            retitled.0.as_str(),
-            retitled.1,
-            retitled.2.as_str(),
-            retitled.3
+            retitled.event_type.as_str(),
+            retitled.actor_id,
+            retitled.impersonator_id
         ),
-        ("Retitled", Some(owner_id), "human", Some(admin_id))
+        ("Retitled", owner_id, Some(admin_id))
+    );
+    assert_eq!(
+        retitled.payload,
+        serde_json::json!({ "kind": "Retitled", "from": "audited", "to": "Audited" })
     );
     let shown = world.file(&owner, file_id).await;
-    assert_eq!(instant(&shown["updatedAt"]), retitled.4);
-    let edited = facts(&world, "page", file_id, Some(1)).await;
-    let edited = last(&edited);
+    assert_eq!(instant(&shown["updatedAt"]), retitled.occurred_at);
+    let page_one = world.facts("drive_page", page_key(file_id, 1)).await;
+    assert_gap_free(&page_one);
+    let edited = last(&page_one);
     assert_eq!(
-        (edited.0.as_str(), edited.1, edited.3),
-        ("Edited", Some(owner_id), Some(admin_id))
+        (
+            edited.event_type.as_str(),
+            edited.actor_id,
+            edited.impersonator_id
+        ),
+        ("Edited", owner_id, Some(admin_id))
     );
     let pages = world.file_pages(&owner, file_id).await;
     assert_eq!(pages[0]["updatedBy"], owner_id.to_string());
@@ -175,22 +232,30 @@ async fn every_change_is_a_fact_naming_its_hand_and_the_last_change_is_read_from
     // When: the owner reprocesses it and Jobs fails the run
     ok(&process(&world, &owner, file_id).await);
     let rerun = jobs.await_create(file_id).await.job_id;
-    jobs.fail(rerun, "RUNNER_LOST", None).await;
+    let failure = jobs.fail(rerun, "RUNNER_LOST", None).await;
     world.await_state(&owner, file_id, "FAILED").await;
 
-    // Then: the failure is a fact of Jobs' service account
-    let file_facts = facts(&world, "file", file_id, None).await;
-    let failed = last(&file_facts);
+    // Then: the failure is a fact of Jobs' service account, caused by Jobs'
+    // message, and the file's last change moves with it
+    let all = world.processing_facts(file_id).await;
+    assert_gap_free(&all);
+    let failed = *moving(&all).last().expect("the failure");
     assert_eq!(
-        (failed.0.as_str(), failed.2.as_str(), failed.3),
-        ("ProcessingFailed", "service", None)
+        (
+            failed.event_type.as_str(),
+            failed.actor_kind.as_str(),
+            failed.impersonator_id,
+            failed.causation_id
+        ),
+        ("JobFailed", "service", None, Some(failure))
     );
-    assert_ne!(failed.1, Some(owner_id));
+    assert_ne!(failed.actor_id, owner_id);
     let shown = world.file(&owner, file_id).await;
     assert!(instant(&shown["updatedAt"]) > file_before_jobs);
-    assert_eq!(instant(&shown["updatedAt"]), failed.4);
+    assert_eq!(instant(&shown["updatedAt"]), failed.occurred_at);
 
-    // When: the owner, as manager, edits a label and a rule
+    // When: the owner, as manager, creates a label and a rule, then the admin
+    // edits the label and the owner the rule
     let label = Uuid::now_v7();
     ok(&world
         .gql(
@@ -233,24 +298,20 @@ async fn every_change_is_a_fact_naming_its_hand_and_the_last_change_is_read_from
         )
         .await);
 
-    // Then: each is a fact of its own kind, and the catalogue's last change
-    // is read from it
-    let label_facts = facts(&world, "label", label, None).await;
-    assert_eq!(label_facts.len(), 1);
+    // Then: each is a fact of its own noun, and the catalogue's last change is
+    // the latest one
+    let label_facts = world.facts("drive_label", serde_json::json!(label)).await;
+    assert_gap_free(&label_facts);
+    assert_eq!(kinds(&label_facts), vec!["Created", "Updated"]);
     assert_eq!(
-        (
-            label_facts[0].0.as_str(),
-            label_facts[0].1,
-            label_facts[0].3
-        ),
-        ("Updated", Some(owner_id), Some(admin_id))
+        (label_facts[1].actor_id, label_facts[1].impersonator_id),
+        (owner_id, Some(admin_id))
     );
-    let rule_facts = facts(&world, "ruleset", rule, None).await;
-    assert_eq!(rule_facts.len(), 1);
-    assert_eq!(
-        (rule_facts[0].0.as_str(), rule_facts[0].1),
-        ("Saved", Some(owner_id))
-    );
+    assert_eq!(label_facts[1].payload["color"], "#445566");
+    let rule_facts = world.facts("drive_ruleset", serde_json::json!(rule)).await;
+    assert_gap_free(&rule_facts);
+    assert_eq!(kinds(&rule_facts), vec!["Created", "Saved"]);
+    assert_eq!(rule_facts[1].actor_id, owner_id);
     let after = catalogue(&world, &owner).await;
     let label_view = after["workspaceLabels"]
         .as_array()
@@ -259,7 +320,10 @@ async fn every_change_is_a_fact_naming_its_hand_and_the_last_change_is_read_from
         .find(|row| row["id"] == label.to_string())
         .unwrap()
         .clone();
-    assert_eq!(instant(&label_view["updatedAt"]), label_facts[0].4);
+    assert_eq!(
+        instant(&label_view["updatedAt"]),
+        label_facts[1].occurred_at
+    );
     let rule_view = after["workspaceRulesets"]
         .as_array()
         .unwrap()
@@ -267,27 +331,69 @@ async fn every_change_is_a_fact_naming_its_hand_and_the_last_change_is_read_from
         .find(|row| row["id"] == rule.to_string())
         .unwrap()
         .clone();
-    assert_eq!(instant(&rule_view["updatedAt"]), rule_facts[0].4);
+    assert_eq!(instant(&rule_view["updatedAt"]), rule_facts[1].occurred_at);
 
-    // When: the admin is erased
-    world.erase(admin_id).await;
+    world.cleanup().await;
+}
 
-    // Then: every fact keeps its change and its effective hand, and no longer
-    // names the admin behind the session
-    let named: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM drive.fact WHERE actor_id = $1 OR impersonator_id = $1",
+#[tokio::test]
+async fn a_fact_the_host_cannot_record_rolls_the_whole_gesture_back() {
+    // Given: a stored file, and a host whose fact table refuses one title
+    let world = World::start("pod-audit-refused").await;
+    let owner_id = Uuid::now_v7();
+    let owner = manager_passport(owner_id, "Owner");
+    let drive = world.create_workspace(&owner, "library").await;
+    let file_id = crate::harness::upload::upload(
+        &world,
+        &owner,
+        &UploadRequest::text(drive, "", "kept.txt", BYTES),
     )
-    .bind(admin_id)
-    .fetch_one(&world.db.app)
-    .await
-    .unwrap();
-    assert_eq!(named, 0);
-    let file_facts = facts(&world, "file", file_id, None).await;
-    let retitled = file_facts
-        .iter()
-        .find(|row| row.0 == "Retitled")
-        .expect("the retitle stays on record");
-    assert_eq!((retitled.1, retitled.3), (Some(owner_id), Some(REDACTED)));
+    .await;
+    let before = world.file(&owner, file_id).await;
+    let facts_before = world.facts("drive_file", serde_json::json!(file_id)).await;
+
+    // When: the owner retitles it to the title the host's table refuses
+    let refused = world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$t:String!){workspaceRetitleFile(fileId:$f,title:$t){success}}",
+            serde_json::json!({
+                "f": file_id,
+                "t": br_drive_example::kernel::drive::UNRECORDABLE_TITLE,
+            }),
+        )
+        .await;
+
+    // Then: the gesture fails with the host's code, and neither the state nor
+    // any fact moved
+    assert_eq!(error_code(&refused), "FACT_REFUSED");
+    let after = world.file(&owner, file_id).await;
+    assert_eq!(after["title"], before["title"]);
+    assert_eq!(after["updatedAt"], before["updatedAt"]);
+    let facts_after = world.facts("drive_file", serde_json::json!(file_id)).await;
+    assert_eq!(facts_after.len(), facts_before.len());
+    let version: i64 = sqlx::query_scalar("SELECT version FROM drive.file WHERE id = $1")
+        .bind(file_id)
+        .fetch_one(&world.db.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        version,
+        facts_before.len() as i64,
+        "the version did not move"
+    );
+
+    // And: the next gesture numbers its fact right after the last one kept
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$t:String!){workspaceRetitleFile(fileId:$f,title:$t){success}}",
+            serde_json::json!({ "f": file_id, "t": "Kept" }),
+        )
+        .await);
+    let facts = world.facts("drive_file", serde_json::json!(file_id)).await;
+    assert_gap_free(&facts);
+    assert_eq!(last(&facts).event_type, "Retitled");
 
     world.cleanup().await;
 }

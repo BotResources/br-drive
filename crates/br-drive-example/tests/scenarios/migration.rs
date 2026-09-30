@@ -119,7 +119,7 @@ async fn seed(
 async fn drive_indexes(pool: &sqlx::PgPool) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT indexname::text FROM pg_indexes WHERE schemaname = 'drive' \
-         AND tablename IN ('file', 'file_job', 'file_processed', 'file_page', 'file_image') \
+         AND tablename IN ('file', 'file_processing', 'file_processed', 'file_page', 'file_image') \
          ORDER BY indexname",
     )
     .fetch_all(pool)
@@ -237,7 +237,7 @@ async fn upgrade_and_drive(db: TestDb) {
     db.migrate(br_drive_example::db::libraries()).await;
 
     // Then: the indexes changed as the migrations say — 0.1's per-file job
-    // index went with its column, the job log and the results have theirs
+    // index went with its column, the processing and the results have theirs
     let after = drive_indexes(&owner_pool).await;
     assert!(
         !after.contains(&"file_job_idx".to_string()),
@@ -245,8 +245,8 @@ async fn upgrade_and_drive(db: TestDb) {
     );
     for kept in [
         "file_drive_idx",
-        "file_job_job_id_key",
-        "file_job_pkey",
+        "file_processing_job_id_key",
+        "file_processing_pkey",
         "file_processed_pkey",
         "file_page_pkey",
         "file_image_pkey",
@@ -311,8 +311,8 @@ async fn upgrade_and_drive(db: TestDb) {
     let pages = world.file_pages(&owner, id("ready.txt")).await;
     assert_eq!(pages.len(), 1);
     assert_eq!(pages[0]["markdown"], "old page ![i](p001-img01.png)");
-    // And: the last changes carried over became facts: the page's writer, and
-    // the file's last change, read as before
+    // And: the last changes carried over: the page's writer, and the file's
+    // last change, read as before
     assert_eq!(pages[0]["updatedBy"], owner_id.to_string());
     let carried: chrono::DateTime<chrono::Utc> =
         serde_json::from_value(ready["updatedAt"].clone()).unwrap();
@@ -321,7 +321,7 @@ async fn upgrade_and_drive(db: TestDb) {
         last_change.timestamp_micros(),
         "the file's last change survives the upgrade"
     );
-    // And: the host object counts its drive's files through the status view
+    // And: the host object counts its drive's files through their processing
     let counted = world
         .gql(
             &owner,

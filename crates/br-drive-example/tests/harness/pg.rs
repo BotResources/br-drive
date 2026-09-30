@@ -53,6 +53,20 @@ impl TestDb {
         db
     }
 
+    /// Applies the drive migrations up to `version` (the engine's and the
+    /// host's in full): the upgrade a host of that release ran.
+    pub async fn migrate_drive_until(&self, version: i64) {
+        let mut drive = br_drive::migrations();
+        let kept: Vec<_> = drive
+            .migrator
+            .iter()
+            .filter(|migration| migration.version <= version)
+            .cloned()
+            .collect();
+        drive.migrator.migrations = kept.into();
+        self.migrate(vec![drive]).await;
+    }
+
     /// A database and its two roles, with no migration applied.
     async fn empty() -> Self {
         let admin_url = admin_url();

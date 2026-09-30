@@ -654,10 +654,13 @@ async fn deleting_a_file_that_failed_asks_jobs_nothing() {
 
     // Then: no job runs on it, so nothing is asked of Jobs
     jobs.expect_no_command(Duration::from_secs(1)).await;
-    assert!(
-        world.job_log(file_id).await.is_empty(),
-        "the log goes with the file"
-    );
+    let processing: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM drive.file_processing WHERE file_id = $1")
+            .bind(file_id)
+            .fetch_one(&world.db.app)
+            .await
+            .unwrap();
+    assert_eq!(processing, 0, "the processing goes with the file");
 
     world.cleanup().await;
 }
@@ -712,7 +715,8 @@ async fn a_late_fact_of_an_old_job_changes_nothing() {
 
     // Then: once each is consumed — each fact type rides its own durable, so
     // their arrival order is the broker's — the old job's end is still the
-    // first one, nothing of its progress is kept, and the file does not move
+    // first one, each late fact is kept as ignored and none as progress, and
+    // the file does not move
     for message in late {
         world.await_consumed(message).await;
     }
@@ -720,16 +724,29 @@ async fn a_late_fact_of_an_old_job_changes_nothing() {
         world.job_end(old).await,
         Some(("cancelled".to_string(), None))
     );
-    let old_progress: i64 = sqlx::query_scalar(
-        "SELECT (SELECT count(*) FROM drive.file_job_plan WHERE job_id = $1) \
-              + (SELECT count(*) FROM drive.file_job_step WHERE job_id = $1)",
-    )
-    .bind(old)
-    .fetch_one(&world.db.app)
-    .await
-    .unwrap();
-    assert_eq!(
-        old_progress, 0,
+    let old_facts = world.job_facts(old).await;
+    let ignored: Vec<&str> = old_facts
+        .iter()
+        .filter(|fact| fact.event_type == "JobFactIgnored")
+        .map(|fact| {
+            fact.payload["received"]["kind"]
+                .as_str()
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(ignored.len(), 5, "every late fact is kept: {old_facts:?}");
+    for kind in [
+        "JobStarted",
+        "JobPlanDeclared",
+        "JobStepStarted",
+        "JobCompleted",
+        "JobFailed",
+    ] {
+        assert!(ignored.contains(&kind), "{kind} is kept as ignored");
+    }
+    assert!(
+        old_facts.iter().all(|fact| fact.event_type != "JobPlanDeclared"
+            && fact.event_type != "JobStepStarted"),
         "a job that no longer runs keeps no progress"
     );
     refute_delta(
