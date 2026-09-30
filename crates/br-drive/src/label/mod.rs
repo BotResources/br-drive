@@ -16,7 +16,7 @@ pub use gestures::{
     CreateLabel, DeleteLabel, SetFileLabels, UpdateLabel, create_label, delete_label,
     set_file_labels, update_label,
 };
-pub use store::label_ids_of_files;
+pub use store::{LabelRecord, LabelStore, label_ids_of_files};
 pub use view::{DriveLabel, DriveLabels, LabelWindow};
 
 pub const MAX_LABEL_NAME_CHARS: usize = 100;
@@ -27,6 +27,42 @@ pub struct Label;
 impl Noun for Label {
     type Key = Uuid;
     const NAME: NounName = NounName::from_static("drive_label");
+}
+
+/// The payload schema version of [`LabelEvent`].
+pub const LABEL_EVENT_VERSION: i32 = 1;
+
+/// What happened to a label, as the host's fact table records it (the
+/// `drive_label` noun).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+#[non_exhaustive]
+pub enum LabelEvent {
+    Created {
+        name: String,
+        color: String,
+        description: String,
+    },
+    /// The label now reads as given.
+    Updated {
+        name: String,
+        color: String,
+        description: String,
+    },
+    Deleted,
+}
+
+impl crate::facts::DriveEvent for LabelEvent {
+    const NOUN: &'static str = "drive_label";
+    const VERSION: i32 = LABEL_EVENT_VERSION;
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Created { .. } => "Created",
+            Self::Updated { .. } => "Updated",
+            Self::Deleted => "Deleted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

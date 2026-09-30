@@ -10,6 +10,9 @@ pub struct OwnedWorkspaces(pub Vec<Uuid>);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostSettings {
     pub upload_window: Duration,
+    /// Whether a commit starts the file's default upload rule
+    /// (`DriveHost::process_on_commit`).
+    pub process_on_commit: bool,
 }
 
 impl HostSettings {
@@ -20,6 +23,7 @@ impl Default for HostSettings {
     fn default() -> Self {
         Self {
             upload_window: Self::DEFAULT_UPLOAD_WINDOW,
+            process_on_commit: true,
         }
     }
 }

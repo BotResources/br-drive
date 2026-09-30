@@ -4,13 +4,13 @@ use service_engine::pipeline::{Mutation, MutationInput, OneShot};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::store::serialize_rulesets;
+use super::store::{RulesetRecord, hand_deleted, serialize_rulesets};
 use super::{
     ANY_MEDIA_TYPE, MAX_RULESET_NAME_BYTES, MAX_RULESET_STEPS, MAX_RUNNER_TYPE_BYTES, Ruleset,
     RulesetCause, RulesetRow, RulesetStep, Trigger,
 };
 use crate::catalogue;
-use crate::fact::{Author, Subject};
+use crate::facts::{self, FactMeta};
 use crate::fault::{DriveFault, codes};
 use crate::host::{DriveHost, DriveRequest};
 use crate::media::MediaType;
@@ -148,19 +148,23 @@ pub fn create_ruleset<'m, H: DriveHost>(
         if input.is_default {
             require_default_free(cx.connection(), input.trigger, &media_types, None).await?;
         }
-        let now = cx.now().as_datetime();
-        let ruleset = RulesetRow {
-            id: input.id,
-            name,
-            trigger: input.trigger,
-            media_types,
-            steps: input.steps,
-            is_default: input.is_default,
-            created_by: cx.principal().id().as_uuid(),
-            created_at: now,
-            updated_at: now,
-        };
-        cx.create(&ruleset).await?;
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        let mut record = RulesetRecord::<H>::create(
+            RulesetRow {
+                id: input.id,
+                name,
+                trigger: input.trigger,
+                media_types,
+                steps: input.steps,
+                is_default: input.is_default,
+                created_by: cx.principal().id().as_uuid(),
+                created_at: meta.occurred_at,
+                updated_at: meta.occurred_at,
+            },
+            &meta,
+        );
+        facts::create(cx, &mut record).await?;
+        let ruleset = &record.row;
         let unknown_runner_types =
             catalogue::not_known_active(cx.connection(), &ruleset.runner_types()).await?;
         cx.impact_caused::<Ruleset, _>(
@@ -198,10 +202,11 @@ pub fn update_ruleset<'m, H: DriveHost>(
     Box::pin(async move {
         manage_gate(cx.principal())?;
         serialize_rulesets(cx.connection()).await?;
-        let mut ruleset = cx
-            .load::<RulesetRow>(&input.id)
+        let mut record = cx
+            .load::<RulesetRecord<H>>(&input.id)
             .await?
             .ok_or(DriveFault::Refused(codes::RULESET_NOT_FOUND))?;
+        let ruleset = &record.row;
         let name = match input.name.as_deref() {
             Some(name) => validate_name(name)?,
             None => ruleset.name.clone(),
@@ -230,26 +235,12 @@ pub fn update_ruleset<'m, H: DriveHost>(
             )
             .await?;
         }
-        ruleset.name = name;
-        ruleset.media_types = media_types;
-        ruleset.steps = steps;
-        ruleset.is_default = is_default;
-        cx.save(&ruleset).await?;
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        record.save(name, media_types, steps, is_default, &meta);
+        facts::save(cx, &mut record).await?;
+        let ruleset = &record.row;
         let unknown_runner_types =
             catalogue::not_known_active(cx.connection(), &ruleset.runner_types()).await?;
-        let now = cx.now().as_datetime();
-        let author = Author::of(cx.principal());
-        crate::fact::record(
-            cx.connection(),
-            &author,
-            Subject::Ruleset(ruleset.id),
-            RulesetCause::Saved {
-                unknown_runner_types: unknown_runner_types.clone(),
-            },
-            now,
-        )
-        .await?;
-        ruleset.updated_at = now;
         cx.impact_caused::<Ruleset, _>(
             &ruleset.id,
             RulesetCause::Saved {
@@ -281,11 +272,13 @@ pub fn delete_ruleset<'m, H: DriveHost>(
     Box::pin(async move {
         manage_gate(cx.principal())?;
         let ruleset = cx
-            .load::<RulesetRow>(&input.id)
+            .load::<RulesetRecord<H>>(&input.id)
             .await?
             .ok_or(DriveFault::Refused(codes::RULESET_NOT_FOUND))?;
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        hand_deleted::<H>(cx.connection(), &meta, &ruleset).await?;
         cx.delete(&ruleset).await?;
-        cx.impact_caused::<Ruleset, _>(&ruleset.id, RulesetCause::Deleted)?;
+        cx.impact_caused::<Ruleset, _>(&ruleset.row.id, RulesetCause::Deleted)?;
         Ok(())
     })
 }

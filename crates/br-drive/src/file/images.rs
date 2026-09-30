@@ -12,8 +12,9 @@ use service_engine::pipeline::{OutboundCommand, Reaction};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
-use super::aggregate::{File, FileCause};
+use super::aggregate::{File, FileCause, FileEvent, FileRow};
 use super::store::{config_error, sha256};
+use crate::facts::{self, FactMeta};
 use crate::fault::DriveReactionFault;
 use crate::host::DriveHost;
 use crate::image::ImageName;
@@ -446,6 +447,11 @@ pub fn image_landed<'r, H: DriveHost>(
             file_id: message.file_id,
             name: message.name,
         };
+        // The file first, as every writer of its images locks it: a runner's
+        // image request on the same name waits, or is waited for.
+        let Some(mut file) = cx.load::<FileRow<H>>(&key.file_id).await? else {
+            return Ok(());
+        };
         let Some(mut image) = cx.load::<ImageRecord<H>>(&key).await? else {
             return Ok(());
         };
@@ -457,11 +463,15 @@ pub fn image_landed<'r, H: DriveHost>(
             Landing::First => {}
         }
         cx.save(&image).await?;
-        if crate::owner::refreshes::<H>()
-            && let Some(drive) = super::store::drive_of(cx.connection(), image.file_id).await?
-        {
-            crate::owner::touch::<H>(cx, drive)?;
-        }
+        let meta = FactMeta::of_reaction(cx);
+        file.record(
+            FileEvent::ImageAvailable {
+                name: image.name.as_str().to_string(),
+            },
+            &meta,
+        );
+        facts::save(cx, &mut file).await?;
+        crate::owner::touch::<H>(cx, file.drive_id)?;
         cx.impact_caused::<File, _>(
             &image.file_id,
             FileCause::ImageAvailable {

@@ -37,6 +37,10 @@ pub struct WorldOptions {
     pub reaper_interval: Duration,
     pub upload_window: Duration,
     pub watch_catalogue: bool,
+    /// The host's `process_on_commit`. Off by default in the suite: its
+    /// scenarios are written for the two-gesture flow (commit, then
+    /// `ProcessFile`); the commit-starts-the-chain scenarios turn it on.
+    pub process_on_commit: bool,
 }
 
 impl Default for WorldOptions {
@@ -45,6 +49,7 @@ impl Default for WorldOptions {
             reaper_interval: Duration::from_millis(150),
             upload_window: HostSettings::DEFAULT_UPLOAD_WINDOW,
             watch_catalogue: true,
+            process_on_commit: false,
         }
     }
 }
@@ -84,6 +89,7 @@ impl World {
                 await_ready: true,
                 settings: HostSettings {
                     upload_window: options.upload_window,
+                    process_on_commit: options.process_on_commit,
                 },
                 watch_catalogue: options.watch_catalogue,
             },
@@ -222,14 +228,13 @@ impl World {
 
     pub async fn job_of(&self, file_id: Uuid) -> Option<Uuid> {
         sqlx::query_scalar(
-            "SELECT last_job_id FROM drive.file_status \
-             WHERE file_id = $1 AND processing_state = 'processing'",
+            "SELECT job_id FROM drive.file_processing \
+             WHERE file_id = $1 AND state = 'processing'",
         )
         .bind(file_id)
         .fetch_optional(&self.db.app)
         .await
-        .expect("read the file's status")
-        .flatten()
+        .expect("read the file's processing")
     }
 
     pub async fn await_job(&self, file_id: Uuid) -> Uuid {
@@ -404,36 +409,79 @@ impl World {
             .expect("read the blob row")
     }
 
-    /// The jobs of a file, in their order: each job's id, chain step and end
-    /// kind (`None` while it runs) — what the library recorded.
-    pub async fn job_log(&self, file_id: Uuid) -> Vec<(Uuid, i32, Option<String>)> {
+    /// The facts the host's fact table holds about one aggregate (`noun`,
+    /// `key`), in `seq` order.
+    pub async fn facts(&self, noun: &str, key: serde_json::Value) -> Vec<Fact> {
         sqlx::query_as(
-            "SELECT j.job_id, j.step_index, e.kind FROM drive.file_job j \
-             LEFT JOIN drive.file_job_end e ON e.job_id = j.job_id \
-             WHERE j.file_id = $1 ORDER BY j.number",
+            "SELECT seq, event_type, payload, actor_id, actor_kind, is_runner, impersonator_id, \
+               correlation_id, causation_id, occurred_at \
+             FROM workspace_fact WHERE noun = $1 AND key = $2 ORDER BY seq",
         )
-        .bind(file_id)
+        .bind(noun)
+        .bind(key)
         .fetch_all(&self.db.app)
         .await
-        .expect("read the file's jobs")
+        .expect("read the host's facts")
     }
 
-    /// How a job ended, as recorded: its kind and reason; `None` while it runs.
-    pub async fn job_end(&self, job_id: Uuid) -> Option<(String, Option<String>)> {
-        sqlx::query_as("SELECT kind, reason_code FROM drive.file_job_end WHERE job_id = $1")
-            .bind(job_id)
-            .fetch_optional(&self.db.app)
+    /// The facts of a file's processing, in `seq` order.
+    pub async fn processing_facts(&self, file_id: Uuid) -> Vec<Fact> {
+        self.facts("drive_file_processing", serde_json::json!(file_id))
             .await
-            .expect("read the job's end")
+    }
+
+    /// The facts of a file's processing about one of its jobs, in `seq` order.
+    pub async fn job_facts(&self, job_id: Uuid) -> Vec<Fact> {
+        sqlx::query_as(
+            "SELECT seq, event_type, payload, actor_id, actor_kind, is_runner, impersonator_id, \
+               correlation_id, causation_id, occurred_at \
+             FROM workspace_fact \
+             WHERE noun = 'drive_file_processing' AND payload ->> 'job_id' = $1 ORDER BY seq",
+        )
+        .bind(job_id.to_string())
+        .fetch_all(&self.db.app)
+        .await
+        .expect("read the job's facts")
+    }
+
+    /// The jobs of a file, in their order, as its processing facts tell them:
+    /// each job's id, chain step and end kind (`None` while it runs).
+    pub async fn job_log(&self, file_id: Uuid) -> Vec<(Uuid, i32, Option<String>)> {
+        let mut log: Vec<(Uuid, i32, Option<String>)> = Vec::new();
+        for fact in self.processing_facts(file_id).await {
+            let Some(job) = fact.job_id() else { continue };
+            if fact.event_type == "JobCreated" {
+                let step = fact.payload["step_index"].as_i64().unwrap_or_default() as i32;
+                log.push((job, step, None));
+                continue;
+            }
+            let Some(kind) = end_kind(&fact.event_type) else {
+                continue;
+            };
+            if let Some(entry) = log.iter_mut().find(|(id, _, _)| *id == job) {
+                entry.2.get_or_insert_with(|| kind.to_string());
+            }
+        }
+        log
+    }
+
+    /// How a job ended, as its facts tell it: the kind and reason of its first
+    /// end; `None` while it runs.
+    pub async fn job_end(&self, job_id: Uuid) -> Option<(String, Option<String>)> {
+        self.job_facts(job_id).await.into_iter().find_map(|fact| {
+            let kind = end_kind(&fact.event_type)?;
+            let reason = fact.payload["reason_code"].as_str().map(str::to_string);
+            Some((kind.to_string(), reason))
+        })
     }
 
     /// How many cancel requests a job recorded.
     pub async fn job_cancels(&self, job_id: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT count(*) FROM drive.file_job_cancel WHERE job_id = $1")
-            .bind(job_id)
-            .fetch_one(&self.db.app)
+        self.job_facts(job_id)
             .await
-            .expect("read the job's cancel requests")
+            .iter()
+            .filter(|fact| fact.event_type == "JobCancelSent")
+            .count() as i64
     }
 
     /// Waits until the host consumed the message `message_id` (the engine
@@ -774,6 +822,42 @@ pub async fn refute_delta(
             !forbidden(&delta[root]),
             "a forbidden delta arrived: {delta}"
         );
+    }
+}
+
+/// A fact of the host's fact table.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Fact {
+    pub seq: i64,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub actor_id: Uuid,
+    pub actor_kind: String,
+    pub is_runner: bool,
+    pub impersonator_id: Option<Uuid>,
+    pub correlation_id: Uuid,
+    pub causation_id: Option<Uuid>,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Fact {
+    /// The job a processing fact is about.
+    pub fn job_id(&self) -> Option<Uuid> {
+        self.payload["job_id"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+    }
+}
+
+/// The end a processing fact records, named as 0.4.0's job log named it.
+fn end_kind(event_type: &str) -> Option<&'static str> {
+    match event_type {
+        "JobReportedDone" => Some("reported_done"),
+        "JobReportedFailed" => Some("reported_failed"),
+        "JobFailed" => Some("failed"),
+        "JobCancelled" => Some("cancelled"),
+        "JobCreationRejected" => Some("creation_rejected"),
+        _ => None,
     }
 }
 

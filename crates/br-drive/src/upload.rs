@@ -13,13 +13,15 @@ use uuid::Uuid;
 
 use crate::blob::DriveSource;
 use crate::drive::DriveRow;
-use crate::fact::Author;
+use crate::facts::{self, FactMeta};
 use crate::fault::{DriveFault, DriveReactionFault, codes};
 use crate::file::store;
-use crate::file::{FileCause, FileRow, FileStatus};
+use crate::file::{FileCause, FileEvent, FileRow, FileStatus};
 use crate::host::{DriveHost, DriveRequest};
 use crate::media::MediaType;
 use crate::path::{DrivePath, FileName};
+use crate::processing;
+use crate::ruleset::{Trigger, select_ruleset};
 use crate::title::FileTitle;
 
 pub const UPLOAD_DEADLINE_AGGREGATE: &str = "drive_file";
@@ -110,15 +112,16 @@ pub fn request_upload<'m, H: DriveHost>(
             UploadExpectation::new(input.size, digest),
         )?;
         let now = cx.now().as_datetime();
-        let file = FileRow::<H> {
+        let size_bytes =
+            i64::try_from(input.size).map_err(|_| DriveFault::Refused(codes::FILE_TOO_LARGE))?;
+        let mut file = FileRow::<H> {
             id: input.file_id,
             drive_id: input.drive_id,
             path,
             name,
             title,
             media_type,
-            size_bytes: i64::try_from(input.size)
-                .map_err(|_| DriveFault::Refused(codes::FILE_TOO_LARGE))?,
+            size_bytes,
             sha256: *digest.as_bytes(),
             blob_ref: blob.reference().as_uuid(),
             committed_at: None,
@@ -131,10 +134,25 @@ pub fn request_upload<'m, H: DriveHost>(
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,
+            file_updated_at: now,
+            version: 0,
+            pending: Default::default(),
             status: FileStatus::pending(),
             host: PhantomData,
         };
-        cx.create(&file).await?;
+        let meta = FactMeta::of(cx.principal(), now);
+        file.record(
+            FileEvent::UploadTicketIssued {
+                drive_id: file.drive_id,
+                path: file.path.as_str().to_string(),
+                name: file.name.as_str().to_string(),
+                title: file.title.as_str().to_string(),
+                media_type: file.media_type.as_str().to_string(),
+                size_bytes,
+            },
+            &meta,
+        );
+        facts::create(cx, &mut file).await?;
         crate::file::file_changed::<H>(cx, &file, FileCause::UploadRequested)?;
         let window = TimeDelta::from_std(cx.principal().upload_window()).map_err(|_| {
             DriveFault::Engine(service_engine::error::EngineError::Config(
@@ -159,8 +177,13 @@ impl MutationInput for CommitUpload {
 }
 
 /// Confirms a pending upload: the object is present and is the pinned bytes
-/// (a live storage HEAD), and the file is READY — stored, not processed.
-/// Processing is a gesture of its own (`ProcessFile`), right after or never.
+/// (a live storage HEAD). On a host that processes on commit
+/// (`DriveHost::process_on_commit`, the default), the default `upload` rule
+/// matching the file's media type starts its chain in this very transaction —
+/// the file goes PROCESSING, never READY first — when the host's `Process`
+/// gate allows it; without such a rule, or with the gate refusing, the file is
+/// READY, stored only, and the commit is not refused. Otherwise the file is
+/// READY and processing is a gesture of its own (`ProcessFile`).
 pub fn commit_upload<'m, H: DriveHost>(
     cx: &'m mut Mutation<'m, H>,
     input: CommitUpload,
@@ -175,9 +198,27 @@ pub fn commit_upload<'m, H: DriveHost>(
         require_landed(&reader, &file).await?;
         let now = cx.now().as_datetime();
         file.committed_at = Some(now);
-        cx.save(&file).await?;
-        let author = Author::of(cx.principal());
-        crate::file::file_recorded::<H>(cx, &author, &mut file, FileCause::UploadCommitted).await?;
+        file.status = FileStatus::stored();
+        let meta = FactMeta::of(cx.principal(), now);
+        file.record(FileEvent::UploadCommitted, &meta);
+        facts::save(cx, &mut file).await?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::UploadCommitted)?;
+        if cx.principal().process_on_commit() && file.process_gate(cx.principal()).is_allowed() {
+            let rule =
+                select_ruleset(cx.connection(), Trigger::Upload, &file.media_type, None).await?;
+            if let Some(rule) = rule {
+                let initiator = processing::Initiator::of(cx.principal());
+                processing::start_chain(
+                    cx,
+                    &meta,
+                    &mut file,
+                    processing::ChainPlan::from_ruleset(&rule, None),
+                    Trigger::Upload,
+                    initiator,
+                )
+                .await?;
+            }
+        }
         Ok(())
     })
 }
@@ -244,6 +285,14 @@ pub fn upload_deadline<'r, H: DriveHost>(
         if file.committed_at.is_some() {
             return Ok(());
         }
+        let meta = FactMeta::of_reaction(cx);
+        crate::file::store::hand_gone::<H>(
+            cx.connection(),
+            &meta,
+            &file,
+            FileEvent::UploadAbandoned,
+        )
+        .await?;
         cx.delete(&file).await?;
         crate::file::file_changed::<H>(cx, &file, FileCause::UploadAbandoned)?;
         Ok(())

@@ -7,19 +7,14 @@ use service_engine::persistence::{Aggregate, Persistence, PersistenceStyle};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
-use super::LabelRow;
+use std::marker::PhantomData;
 
-/// The columns a label is inserted with.
-const COLUMNS: &str = "id, name, color, description, created_by, created_at";
+use super::{LabelEvent, LabelRow};
+use crate::facts::{self, FactMeta, Pending, SoftEda, Stamped};
+use crate::host::DriveHost;
 
-/// A label as read: its columns, and its last change — its latest fact, or its
-/// creation.
-const SELECT: &str = "SELECT l.id, l.name, l.color, l.description, l.created_by, l.created_at, \
-       COALESCE(u.occurred_at, l.created_at) AS updated_at \
-     FROM drive.label l \
-     LEFT JOIN LATERAL (SELECT x.occurred_at FROM drive.fact x \
-       WHERE x.aggregate_type = 'label' AND x.aggregate_id = l.id AND x.page_number IS NULL \
-       ORDER BY x.occurred_at DESC, x.id DESC LIMIT 1) u ON true";
+/// The columns of a label.
+const COLUMNS: &str = "id, name, color, description, created_by, created_at, version, updated_at";
 
 fn row_to_label(row: &sqlx::postgres::PgRow) -> LabelRow {
     LabelRow {
@@ -33,25 +28,116 @@ fn row_to_label(row: &sqlx::postgres::PgRow) -> LabelRow {
     }
 }
 
-pub struct LabelStore;
+/// A label as its store keeps it: its row, its version, its pending events.
+pub struct LabelRecord<H> {
+    pub row: LabelRow,
+    pub(crate) version: i64,
+    pending: Pending<LabelEvent>,
+    host: PhantomData<fn() -> H>,
+}
 
-impl Persistence for LabelStore {
-    type Aggregate = LabelRow;
+impl<H> Clone for LabelRecord<H> {
+    fn clone(&self) -> Self {
+        Self {
+            row: self.row.clone(),
+            version: self.version,
+            pending: self.pending.clone(),
+            host: PhantomData,
+        }
+    }
+}
+
+impl<H> LabelRecord<H> {
+    /// A new label, created now by `meta`'s hand.
+    pub(crate) fn create(
+        id: Uuid,
+        name: String,
+        color: String,
+        description: String,
+        meta: &FactMeta,
+    ) -> Self {
+        let mut label = Self {
+            row: LabelRow {
+                id,
+                name: name.clone(),
+                color: color.clone(),
+                description: description.clone(),
+                created_by: meta.actor_id,
+                created_at: meta.occurred_at,
+                updated_at: meta.occurred_at,
+            },
+            version: 0,
+            pending: Pending::default(),
+            host: PhantomData,
+        };
+        label.pending.push(
+            &mut label.version,
+            LabelEvent::Created {
+                name,
+                color,
+                description,
+            },
+            meta,
+        );
+        label
+    }
+
+    /// The label now reads as given.
+    pub(crate) fn update(
+        &mut self,
+        name: String,
+        color: String,
+        description: String,
+        meta: &FactMeta,
+    ) {
+        self.row.name = name.clone();
+        self.row.color = color.clone();
+        self.row.description = description.clone();
+        self.row.updated_at = meta.occurred_at;
+        self.pending.push(
+            &mut self.version,
+            LabelEvent::Updated {
+                name,
+                color,
+                description,
+            },
+            meta,
+        );
+    }
+
+    fn base_version(&self) -> i64 {
+        self.version - self.pending.len()
+    }
+}
+
+fn record<H>(row: &sqlx::postgres::PgRow) -> LabelRecord<H> {
+    LabelRecord {
+        row: row_to_label(row),
+        version: row.get("version"),
+        pending: Pending::default(),
+        host: PhantomData,
+    }
+}
+
+pub struct LabelStore<H>(PhantomData<fn() -> H>);
+
+impl<H: DriveHost> Persistence for LabelStore<H> {
+    type Aggregate = LabelRecord<H>;
     type Key = Uuid;
-    type Event = ();
+    type Event = Stamped<LabelEvent>;
 
-    const STYLE: PersistenceStyle = PersistenceStyle::Crud;
+    const STYLE: PersistenceStyle = PersistenceStyle::SoftEda;
 
     fn load<'a>(
         conn: &'a mut PgConnection,
         key: &'a Uuid,
-    ) -> BoxFuture<'a, Result<Option<LabelRow>, EngineError>> {
+    ) -> BoxFuture<'a, Result<Option<LabelRecord<H>>, EngineError>> {
         Box::pin(async move {
-            let row = sqlx::query(&format!("{SELECT} WHERE l.id = $1"))
+            let row = sqlx::query(&format!("SELECT {COLUMNS} FROM drive.label WHERE id = $1"))
                 .bind(key)
                 .fetch_optional(conn)
                 .await?;
-            Ok(row.as_ref().map(row_to_label))
+            Ok(row.as_ref().map(record))
         })
     }
 
@@ -65,17 +151,19 @@ impl Persistence for LabelStore {
     fn read_many<'a>(
         conn: &'a mut PgConnection,
         keys: &'a [Uuid],
-    ) -> BoxFuture<'a, Result<Vec<(Uuid, LabelRow)>, EngineError>> {
+    ) -> BoxFuture<'a, Result<Vec<(Uuid, LabelRecord<H>)>, EngineError>> {
         Box::pin(async move {
-            let rows = sqlx::query(&format!("{SELECT} WHERE l.id = ANY($1)"))
-                .bind(keys)
-                .fetch_all(conn)
-                .await?;
+            let rows = sqlx::query(&format!(
+                "SELECT {COLUMNS} FROM drive.label WHERE id = ANY($1)"
+            ))
+            .bind(keys)
+            .fetch_all(conn)
+            .await?;
             Ok(rows
                 .iter()
                 .map(|row| {
-                    let label = row_to_label(row);
-                    (label.id, label)
+                    let label = record(row);
+                    (label.row.id, label)
                 })
                 .collect())
         })
@@ -83,41 +171,23 @@ impl Persistence for LabelStore {
 
     fn save<'a>(
         conn: &'a mut PgConnection,
-        label: &'a LabelRow,
-        _events: &'a [()],
+        label: &'a LabelRecord<H>,
+        events: &'a [Stamped<LabelEvent>],
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
-            sqlx::query(
-                "UPDATE drive.label SET name = $2, color = $3, description = $4 WHERE id = $1",
-            )
-            .bind(label.id)
-            .bind(&label.name)
-            .bind(&label.color)
-            .bind(&label.description)
-            .execute(conn)
-            .await?;
-            Ok(())
+            upsert(conn, label).await?;
+            hand_label_facts::<H>(conn, label, events).await
         })
     }
 
     fn create<'a>(
         conn: &'a mut PgConnection,
-        label: &'a LabelRow,
-        _events: &'a [()],
+        label: &'a LabelRecord<H>,
+        events: &'a [Stamped<LabelEvent>],
     ) -> BoxFuture<'a, Result<(), EngineError>> {
         Box::pin(async move {
-            sqlx::query(&format!(
-                "INSERT INTO drive.label ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6)"
-            ))
-            .bind(label.id)
-            .bind(&label.name)
-            .bind(&label.color)
-            .bind(&label.description)
-            .bind(label.created_by)
-            .bind(label.created_at)
-            .execute(conn)
-            .await?;
-            Ok(())
+            upsert(conn, label).await?;
+            hand_label_facts::<H>(conn, label, events).await
         })
     }
 
@@ -135,11 +205,66 @@ impl Persistence for LabelStore {
     }
 }
 
-impl Aggregate for LabelRow {
-    type Store = LabelStore;
+async fn upsert<H>(conn: &mut PgConnection, label: &LabelRecord<H>) -> Result<(), EngineError> {
+    let row = &label.row;
+    sqlx::query(&format!(
+        "INSERT INTO drive.label ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, color = EXCLUDED.color, \
+           description = EXCLUDED.description, version = EXCLUDED.version, \
+           updated_at = EXCLUDED.updated_at"
+    ))
+    .bind(row.id)
+    .bind(&row.name)
+    .bind(&row.color)
+    .bind(&row.description)
+    .bind(row.created_by)
+    .bind(row.created_at)
+    .bind(label.version)
+    .bind(row.updated_at)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+async fn hand_label_facts<H: DriveHost>(
+    conn: &mut PgConnection,
+    label: &LabelRecord<H>,
+    events: &[Stamped<LabelEvent>],
+) -> Result<(), EngineError> {
+    let facts = facts::facts_of(&facts::uuid_key(label.row.id), label.base_version(), events)?;
+    facts::hand::<H>(conn, &facts).await
+}
+
+/// Hands the last fact of `label`, about to be deleted by the caller.
+pub(crate) async fn hand_deleted<H: DriveHost>(
+    conn: &mut PgConnection,
+    meta: &FactMeta,
+    label: &LabelRecord<H>,
+) -> Result<(), EngineError> {
+    let fact = facts::fact_at(
+        facts::uuid_key(label.row.id),
+        label.version + 1,
+        &LabelEvent::Deleted,
+        meta,
+    )?;
+    facts::hand::<H>(conn, &[fact]).await
+}
+
+impl<H: DriveHost> Aggregate for LabelRecord<H> {
+    type Store = LabelStore<H>;
 
     fn key(&self) -> Uuid {
-        self.id
+        self.row.id
+    }
+
+    fn pending_events(&self) -> &[Stamped<LabelEvent>] {
+        self.pending.as_slice()
+    }
+}
+
+impl<H: DriveHost> SoftEda for LabelRecord<H> {
+    fn clear_pending(&mut self) {
+        self.pending.clear();
     }
 }
 
@@ -151,7 +276,10 @@ pub async fn all_ids(conn: &mut PgConnection) -> Result<Vec<Uuid>, EngineError> 
 }
 
 /// Serializes the name checks of two concurrent saves, so a collision is
-/// answered `LABEL_NAME_TAKEN` and never the unique index's error.
+/// answered `LABEL_NAME_TAKEN` and never the unique index's error. Not a row
+/// lock: the name a create or a rename claims has no aggregate to load yet,
+/// and the engine offers no pipeline lock for it. It is always taken before
+/// any aggregate of the gesture, so it adds no lock-order cycle.
 pub async fn serialize_labels(conn: &mut PgConnection) -> Result<(), EngineError> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('drive.label'))")
         .execute(conn)
@@ -172,14 +300,6 @@ pub async fn name_taken(
     .fetch_one(conn)
     .await?;
     Ok(taken)
-}
-
-pub async fn existing_ids(conn: &mut PgConnection, ids: &[Uuid]) -> Result<Vec<Uuid>, EngineError> {
-    let rows = sqlx::query("SELECT id FROM drive.label WHERE id = ANY($1)")
-        .bind(ids)
-        .fetch_all(conn)
-        .await?;
-    Ok(rows.iter().map(|row| row.get::<Uuid, _>("id")).collect())
 }
 
 /// The label ids of every file asked for, set-based.

@@ -1,9 +1,9 @@
 use service_engine::pipeline::Ops;
 use uuid::Uuid;
 
-use super::aggregate::{FileCause, FileRow};
+use super::aggregate::{FileCause, FileEvent, FileRow};
 use super::store;
-use crate::fact::Author;
+use crate::facts::{self, FactMeta};
 use crate::fault::{DriveFault, codes};
 use crate::host::DriveHost;
 
@@ -27,9 +27,10 @@ pub async fn set_metadata<H: DriveHost>(
     if file.metadata == metadata {
         return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
     }
-    file.metadata = metadata;
-    ops.save(&file).await?;
-    let author = Author::of(principal);
-    crate::file::file_recorded::<H>(ops, &author, &mut file, FileCause::MetadataChanged).await?;
+    file.metadata = metadata.clone();
+    let meta = FactMeta::of(principal, ops.now().as_datetime());
+    file.record(FileEvent::MetadataChanged { metadata }, &meta);
+    facts::save(ops, &mut file).await?;
+    crate::file::file_changed::<H>(ops, &file, FileCause::MetadataChanged)?;
     Ok(())
 }

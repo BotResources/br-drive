@@ -6,11 +6,11 @@ use service_engine::gate::Reason;
 use service_engine::pipeline::{Mutation, MutationInput};
 use uuid::Uuid;
 
-use super::aggregate::{FileCause, FileRow, PageOrigin, ProcessingState};
-use super::pages::{Page, PageCause, PageKey};
-use super::store::{self, PageWrite};
+use super::aggregate::{FileCause, FileEvent, FilePlace, FileRow, ProcessingState};
+use super::pages::{Page, PageCause, PageKey, PageRecord};
+use super::store;
 use crate::drive::DriveRow;
-use crate::fact::Author;
+use crate::facts::{self, FactMeta};
 use crate::fault::{DriveFault, codes};
 use crate::host::DriveHost;
 use crate::path::{DrivePath, FileName};
@@ -41,24 +41,17 @@ pub fn edit_page<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.edit_page_gate(cx.principal()).require()?;
-        if !store::page_exists(cx.connection(), file.id, input.number).await? {
-            return Err(DriveFault::Refused(codes::PAGE_NOT_FOUND));
-        }
-        let author = Author::of(cx.principal());
-        let now = cx.now().as_datetime();
-        store::upsert_pages(
-            cx.connection(),
-            &author,
-            file.id,
-            &[PageWrite {
-                number: input.number,
-                markdown: &input.markdown,
-                origin: PageOrigin::Edited,
-            }],
-            &PageCause::Edited,
-            now,
-        )
-        .await?;
+        let key = PageKey {
+            file_id: file.id,
+            number: input.number,
+        };
+        let mut page = cx
+            .load::<PageRecord<H>>(&key)
+            .await?
+            .ok_or(DriveFault::Refused(codes::PAGE_NOT_FOUND))?;
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        page.edit(input.markdown, &meta);
+        facts::save(cx, &mut page).await?;
         cx.impact_caused::<Page, _>(
             &PageKey {
                 file_id: file.id,
@@ -138,15 +131,28 @@ pub fn update_file<'m, H: DriveHost>(
         } else {
             FileCause::Renamed
         };
+        let from = FilePlace::of(&file);
         file.drive_id = target_drive;
         file.path = target_path;
         file.name = target_name;
-        cx.save(&file).await?;
+        let to = FilePlace::of(&file);
+        let event = if target_drive != from_drive {
+            FileEvent::Moved {
+                from_drive,
+                to_drive: target_drive,
+                from,
+                to,
+            }
+        } else {
+            FileEvent::Renamed { from, to }
+        };
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        file.record(event, &meta);
+        facts::save(cx, &mut file).await?;
         if from_drive != target_drive {
             crate::owner::touch::<H>(cx, from_drive)?;
         }
-        let author = Author::of(cx.principal());
-        crate::file::file_recorded::<H>(cx, &author, &mut file, cause).await?;
+        crate::file::file_changed::<H>(cx, &file, cause)?;
         Ok(())
     })
 }
@@ -180,10 +186,17 @@ pub fn retitle_file<'m, H: DriveHost>(
         if file.title == title {
             return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
         }
-        file.title = title;
-        cx.save(&file).await?;
-        let author = Author::of(cx.principal());
-        crate::file::file_recorded::<H>(cx, &author, &mut file, FileCause::Retitled).await?;
+        let from = std::mem::replace(&mut file.title, title);
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        file.record(
+            FileEvent::Retitled {
+                from: from.as_str().to_string(),
+                to: file.title.as_str().to_string(),
+            },
+            &meta,
+        );
+        facts::save(cx, &mut file).await?;
+        crate::file::file_changed::<H>(cx, &file, FileCause::Retitled)?;
         Ok(())
     })
 }
@@ -211,6 +224,8 @@ pub fn delete_file<'m, H: DriveHost>(
         file.delete_gate(cx.principal()).require()?;
         processing::cancel_active_job(cx, &file)?;
         let images = store::image_refs_of_files(cx.connection(), &[file.id]).await?;
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        store::hand_gone::<H>(cx.connection(), &meta, &file, FileEvent::Deleted).await?;
         cx.delete(&file).await?;
         for reference in images {
             cx.release_blob(BlobRef(reference))?;
@@ -264,8 +279,8 @@ pub fn process_file<'m, H: DriveHost>(
             (None, _) => return Err(DriveFault::Refused(codes::NO_RULESET_MATCHES)),
         };
         let initiator = processing::Initiator::of(cx.principal());
-        let author = Author::of(cx.principal());
-        processing::start_chain(cx, &author, &mut file, plan, trigger, initiator).await?;
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        processing::start_chain(cx, &meta, &mut file, plan, trigger, initiator).await?;
         Ok(())
     })
 }
@@ -317,10 +332,10 @@ pub fn regenerate_page<'m, H: DriveHost>(
             &ruleset,
             Some(&serde_json::Value::Object(options)),
         );
-        let author = Author::of(cx.principal());
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
         processing::start_chain(
             cx,
-            &author,
+            &meta,
             &mut file,
             plan,
             Trigger::RegeneratePage,
@@ -343,7 +358,7 @@ impl MutationInput for CancelProcessing {
 }
 
 /// Asks Jobs to cancel the job running on a PROCESSING file. The request is
-/// recorded on the job (`drive.file_job_cancel`) and the file stays PROCESSING until
+/// recorded on the file's processing and the file stays PROCESSING until
 /// Jobs confirms with `cancelled`, which lands it FAILED `cancelled`, open to
 /// a reprocess. Asking again sends the cancel again — Jobs may not have
 /// consumed the job's creation yet when the first one reaches it.
@@ -360,21 +375,16 @@ pub fn cancel_processing<'m, H: DriveHost>(
         let Some(job_id) = file.active_job().map(|job| job.job_id) else {
             return Err(DriveFault::Refused(codes::FILE_NOT_PROCESSING));
         };
-        let requested_by = cx.principal().id().as_uuid();
-        let now = cx.now().as_datetime();
-        processing::request_cancel(cx.connection(), job_id, requested_by, now).await?;
+        let mut processing = processing::load_processing(cx, &file).await?;
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        processing.request_cancel(&meta);
         cx.command(processing::JobCancel {
             payload: CancelJob { job_id },
         })?;
-        processing::refresh_status(cx, &mut file).await?;
-        let author = Author::of(cx.principal());
-        crate::file::file_recorded::<H>(
-            cx,
-            &author,
-            &mut file,
-            FileCause::CancelRequested { job_id },
-        )
-        .await?;
+        facts::save(cx, &mut processing).await?;
+        file.status = processing.status();
+        file.updated_at = file.updated_at.max(processing.updated_at);
+        crate::file::file_changed::<H>(cx, &file, FileCause::CancelRequested { job_id })?;
         Ok(())
     })
 }

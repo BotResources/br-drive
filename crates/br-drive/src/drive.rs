@@ -7,7 +7,7 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use crate::fault::{DriveFault, codes};
-use crate::file::{FileCause, FileRow, store};
+use crate::file::{FileCause, FileEvent, FileRow, store};
 use crate::folders::{delete_rows, impact_rows};
 use crate::host::DriveHost;
 use crate::owner::{DriveOwnerObject, NoDriveOwner, OwnerObject};
@@ -175,7 +175,7 @@ pub async fn delete_drive<H: DriveHost>(
         .ok_or(DriveFault::Refused(codes::DRIVE_NOT_FOUND))?;
     let ids = store::ids_in_drive(cx.connection(), id).await?;
     let files = cx.load_many::<FileRow<H>>(&ids).await?;
-    delete_rows(cx, &files).await?;
+    delete_rows(cx, &files, FileEvent::DriveDeleted).await?;
     cx.delete(&drive).await?;
     let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
     impact_rows(cx, id, &ids, FileCause::DriveDeleted)?;

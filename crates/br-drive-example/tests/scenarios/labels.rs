@@ -351,3 +351,67 @@ async fn a_files_labels_are_a_target_set_that_survives_a_move_and_loses_a_delete
 
     world.cleanup().await;
 }
+
+#[tokio::test]
+async fn deleting_a_label_while_it_is_assigned_serialises_through_the_pipeline() {
+    // Given: a manager's file carrying a label, and a second label
+    let world = World::start("pod-labels-race").await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    let drive = world.create_workspace(&manager, "library").await;
+    let file_id = upload(
+        &world,
+        &manager,
+        &UploadRequest::text(drive, "", "raced.txt", BYTES),
+    )
+    .await;
+    for round in 0..5 {
+        let (doomed, kept) = (Uuid::now_v7(), Uuid::now_v7());
+        for (id, name) in [
+            (doomed, format!("doomed {round}")),
+            (kept, format!("kept {round}")),
+        ] {
+            ok(&world
+                .gql(
+                    &manager,
+                    "mutation($id:UUID!,$n:String!){workspaceCreateLabel(id:$id,name:$n,color:\"#112233\"){success}}",
+                    serde_json::json!({ "id": id, "n": name }),
+                )
+                .await);
+        }
+        ok(&set_labels(&world, &manager, file_id, &[doomed]).await);
+
+        // When: the label is deleted while the file's labels change to include it
+        let both = [doomed, kept];
+        let (deleted, assigned) = tokio::join!(
+            world.gql(
+                &manager,
+                "mutation($id:UUID!){workspaceDeleteLabel(id:$id){success}}",
+                serde_json::json!({ "id": doomed }),
+            ),
+            set_labels(&world, &manager, file_id, &both),
+        );
+
+        // Then: neither deadlocks — the deletion goes through, the assignment
+        // either lands first or finds the label gone — and the file ends
+        // without the deleted label, its removal on record
+        ok(&deleted);
+        if assigned.get("errors").is_some() {
+            assert_eq!(error_code(&assigned), "LABEL_NOT_FOUND", "{assigned}");
+        }
+        let file = world.file(&manager, file_id).await;
+        let labels: Vec<Uuid> = serde_json::from_value(file["labelIds"].clone()).unwrap();
+        assert!(!labels.contains(&doomed), "{file}");
+        let facts = world.facts("drive_file", serde_json::json!(file_id)).await;
+        let last_removal = facts.iter().rev().find(|fact| {
+            fact.event_type == "LabelsChanged"
+                && fact.payload["removed"]
+                    .as_array()
+                    .is_some_and(|removed| removed.contains(&serde_json::json!(doomed)))
+        });
+        assert!(last_removal.is_some(), "the detach is a fact: {facts:?}");
+        let seqs: Vec<i64> = facts.iter().map(|fact| fact.seq).collect();
+        assert_eq!(seqs, (1..=facts.len() as i64).collect::<Vec<_>>());
+    }
+
+    world.cleanup().await;
+}

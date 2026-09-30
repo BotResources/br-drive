@@ -43,6 +43,27 @@ async fn counts_reach(sub: &mut Subscription, workspace: Uuid, files: i64, ready
     .await;
 }
 
+/// Waits for the counts, then lets the session settle: a gesture of several
+/// steps (a request, a commit, a process) publishes each of its states, so a
+/// state seen early may come round again — the counts are the last one sent
+/// once the session falls silent.
+async fn counts_settle(sub: &mut Subscription, workspace: Uuid, files: i64, ready: i64) {
+    counts_reach(sub, workspace, files, ready).await;
+    let mut last = (files, ready);
+    while let Some(delta) = sub.try_next_payload(Duration::from_millis(700)).await {
+        let node = &delta["workspaceDeltas"];
+        if node["__typename"] == "WorkspaceUpsert" && node["view"]["id"] == workspace.to_string() {
+            last = (
+                node["view"]["fileCount"].as_i64().unwrap_or_default(),
+                node["view"]["readyFileCount"].as_i64().unwrap_or_default(),
+            );
+        }
+    }
+    if last != (files, ready) {
+        counts_reach(sub, workspace, files, ready).await;
+    }
+}
+
 #[tokio::test]
 async fn the_hosts_own_object_republishes_as_the_files_of_its_drive_land_fail_move_and_go() {
     // Given: two workspaces, whose view shows their drive's file counts, watched live
@@ -112,7 +133,9 @@ async fn the_hosts_own_object_republishes_as_the_files_of_its_drive_land_fail_mo
         &UploadRequest::text(library, "", "finished.txt", BYTES),
     )
     .await;
-    counts_reach(&mut workspaces, library, 1, 0).await;
+    // (the request, the commit and the process each publish: PENDING, READY,
+    // then PROCESSING)
+    counts_settle(&mut workspaces, library, 1, 0).await;
     let runner = service_passport(&[RUNNER_SCOPE]);
     let job = jobs.await_create(finished).await.job_id;
     ok(&report(
@@ -130,7 +153,7 @@ async fn the_hosts_own_object_republishes_as_the_files_of_its_drive_land_fail_mo
     .await);
     finish_job(&world, &jobs, job).await;
     // Then: the READY count rises when the chain lands
-    counts_reach(&mut workspaces, library, 1, 1).await;
+    counts_settle(&mut workspaces, library, 1, 1).await;
 
     // When: a change that moves no count happens (a retitle)
     ok(&world

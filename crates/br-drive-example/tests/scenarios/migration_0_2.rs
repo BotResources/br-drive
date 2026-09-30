@@ -16,6 +16,9 @@ type EndRow = (Uuid, String, Option<String>, Option<String>, DateTime<Utc>);
 
 /// The last drive migration released in v0.2.0.
 const RELEASED_0_2: i64 = 9_121_000_008;
+/// The last drive migration released in v0.4.0: the job fact tables this
+/// scenario reads before the upgrade to the state tables drops them.
+const RELEASED_0_4: i64 = 9_121_000_010;
 
 fn at(instant: DateTime<Utc>) -> serde_json::Value {
     serde_json::json!(instant)
@@ -80,7 +83,8 @@ impl Seeded {
 }
 
 #[tokio::test]
-async fn a_0_2_database_upgrades_to_the_fact_tables_and_its_running_job_ends_through_the_host() {
+async fn a_0_2_database_upgrades_through_the_fact_tables_and_its_running_job_ends_through_the_host()
+{
     // Given: a database exactly as 0.2.0 left it — the drive migrations that
     // release shipped, 01 to 08 — cleaned up whatever happens
     let db = TestDb::at_drive_version(RELEASED_0_2).await;
@@ -257,8 +261,8 @@ async fn upgrade_and_drive(db: TestDb) {
         .await;
     let pool = seeded.owner_pool;
 
-    // When: the host's upgrade applies this version's migrations
-    db.migrate(br_drive_example::db::libraries()).await;
+    // When: a 0.4.0 host's upgrade applies that release's migrations
+    db.migrate_drive_until(RELEASED_0_4).await;
 
     // Then: each job is numbered in its file's order, ended by its FIRST
     // terminal entry, with its reason; the later ones are not kept
@@ -389,6 +393,9 @@ async fn upgrade_and_drive(db: TestDb) {
     assert_eq!(initiators, vec![(Some(owner_id), s("Ada"))]);
     pool.close().await;
 
+    // When: the upgrade goes on to this version's state tables
+    db.migrate(br_drive_example::db::libraries()).await;
+
     // When: the host boots on the upgraded database
     let world = World::start_on(db, "pod-upgraded-0-2", WorldOptions::default()).await;
     let jobs = JobsStandIn::attach(&world).await;
@@ -465,15 +472,30 @@ async fn upgrade_and_drive(db: TestDb) {
     // When: the owner reprocesses a failed file
     ok(&crate::harness::upload::process(&world, &owner, jobs_failed).await);
 
-    // Then: its next job takes the next number after the migrated one
+    // Then: its next job is its running one, the migrated job an earlier one
     let create = jobs.await_create(jobs_failed).await;
     let log = world.job_log(jobs_failed).await;
+    assert_eq!(log, vec![(create.job_id, 0, None)]);
+    let earlier: Vec<Uuid> =
+        sqlx::query_scalar("SELECT past_job_ids FROM drive.file_processing WHERE file_id = $1")
+            .bind(jobs_failed)
+            .fetch_one(&world.db.app)
+            .await
+            .unwrap();
+    assert_eq!(earlier, vec![jobs_failed_job]);
+
+    // When: a late fact of the migrated job arrives
+    let late = jobs.cancel(jobs_failed_job).await;
+    world.await_consumed(late).await;
+
+    // Then: it is kept, as ignored, and the new job still runs
+    let kept = world.job_facts(jobs_failed_job).await;
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].event_type, "JobFactIgnored");
+    assert_eq!(kept[0].payload["why"], "not_the_current_job");
     assert_eq!(
-        log,
-        vec![
-            (jobs_failed_job, 0, Some("failed".to_string())),
-            (create.job_id, 0, None),
-        ]
+        world.file(&owner, jobs_failed).await["processingState"],
+        "PROCESSING"
     );
 
     world.service.shutdown().await;

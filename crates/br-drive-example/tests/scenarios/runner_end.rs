@@ -1,7 +1,8 @@
 //! The runner declares the end of its job, through the host: its final report
-//! (`done`) or its declared failure. The library records it on the job's log,
-//! moves the file at once and tells Jobs (`job.finish` / `job.fail`); what
-//! Jobs says afterwards about that job is logged and changes nothing.
+//! (`done`) or its declared failure. The library records it on the file's
+//! processing, moves the file at once and tells Jobs (`job.finish` /
+//! `job.fail`); what Jobs says afterwards about that job is recorded as
+//! ignored and changes nothing.
 
 use std::time::Duration;
 

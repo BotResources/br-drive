@@ -81,7 +81,7 @@ pub fn register<H: DriveHost>(
     )?;
     engine.register_reaction::<QueuedFact, _, _>(
         &durable(processing::DURABLE_QUEUED),
-        processing::on_queued,
+        processing::on_queued::<H>,
     )?;
     engine.register_reaction::<CreationRejectedFact, _, _>(
         &durable(processing::DURABLE_CREATION_REJECTED),
@@ -89,7 +89,7 @@ pub fn register<H: DriveHost>(
     )?;
     engine.register_reaction::<StartedFact, _, _>(
         &durable(processing::DURABLE_STARTED),
-        processing::on_started,
+        processing::on_started::<H>,
     )?;
     engine.register_reaction::<PlanDeclaredFact, _, _>(
         &durable(processing::DURABLE_PLAN_DECLARED),
@@ -101,7 +101,7 @@ pub fn register<H: DriveHost>(
     )?;
     engine.register_reaction::<CompletedFact, _, _>(
         &durable(processing::DURABLE_COMPLETED),
-        processing::on_completed,
+        processing::on_completed::<H>,
     )?;
     engine.register_reaction::<FailedFact, _, _>(
         &durable(processing::DURABLE_FAILED),

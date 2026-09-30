@@ -9,10 +9,10 @@ use service_engine::pipeline::{Bulk, MutationInput};
 use uuid::Uuid;
 
 use crate::drive::DriveRow;
-use crate::fact::Author;
+use crate::facts::FactMeta;
 use crate::fault::{DriveFault, codes};
 use crate::file::store;
-use crate::file::{DriveFiles, DrivePages, File, FileCause, FileRow};
+use crate::file::{DriveFiles, DrivePages, File, FileCause, FileEvent, FileRow};
 use crate::host::{DriveHost, DriveRequest};
 use crate::path::DrivePath;
 
@@ -69,13 +69,16 @@ pub(crate) fn folder_verdict(
     }
 }
 
+/// Deletes `files`, each one's last fact `gone` handed to the host.
 pub(crate) async fn delete_rows<H: DriveHost>(
     cx: &mut Bulk<'_, H>,
     files: &[FileRow<H>],
+    gone: FileEvent,
 ) -> Result<(), DriveFault> {
     let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
     let images = store::image_refs_of_files(cx.connection(), &ids).await?;
-    store::delete_many(cx.connection(), &ids).await?;
+    let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+    store::delete_many::<H>(cx.connection(), &ids, Some((&meta, gone))).await?;
     for file in files {
         crate::processing::cancel_active_job(cx, file)?;
         for reference in file.blob_refs() {
@@ -167,17 +170,8 @@ pub fn move_folder<'m, H: DriveHost>(
             }
         }
         let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
-        let now = cx.now().as_datetime();
-        let author = Author::of(cx.principal());
-        store::rebase_paths(
-            cx.connection(),
-            &author,
-            &ids,
-            &old_prefix,
-            &new_prefix,
-            now,
-        )
-        .await?;
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        store::rebase_paths::<H>(cx.connection(), &meta, &ids, &old_prefix, &new_prefix).await?;
         H::folder_moved(cx, input.drive_id, &old_prefix, &new_prefix).await?;
         impact_rows(cx, input.drive_id, &ids, FileCause::FolderMoved)
     })
@@ -217,7 +211,14 @@ pub fn delete_folder<'m, H: DriveHost>(
             file.delete_gate(principal)
         })
         .await?;
-        delete_rows(cx, &files).await?;
+        delete_rows(
+            cx,
+            &files,
+            FileEvent::FolderDeleted {
+                prefix: prefix.as_str().to_string(),
+            },
+        )
+        .await?;
         H::folder_deleted(cx, input.drive_id, &prefix).await?;
         let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
         impact_rows(cx, input.drive_id, &ids, FileCause::FolderDeleted)

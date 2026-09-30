@@ -24,7 +24,7 @@ The workspace's MSRV is Rust 1.94 — the floor of the pinned `contract-jobs`
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.4.0", version = "0.4.0" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.5.0", version = "0.5.0" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -88,13 +88,14 @@ rolls them together. The host never writes to the `drive` schema directly.
 
 1. **Compose**: `slice drive ["drive"] from br_drive::drive_slice { query = drive::DriveQuery, mutation = drive::DriveMutation, subscription = drive::DriveSubscription }` under the host's `prefix`; every root below appears at that prefix.
 2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and both of the library's self-commands (`upload-deadline`, `image-landed`) arrive as a service actor, and a resolver that rejects services parks all ten reactions.
-3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `visible_drives` (never a service principal), `display_name`, `upload_window`, `erase_mode`, the two folder hooks.
-4. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
-5. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
-6. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
-7. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
-8. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_metadata`, `drive_of` for curation.
-9. **Catalogue watch (optional, information only)**: a host booting through the engine's `run_service` / `BootPlan` starts it at the end of its `register` closure, on the engine's own NATS and PostgreSQL handles, and lets it run until the process exits: `register: move |engine| { register(engine)?; br_drive::watch_runner_types_of(engine).detach(); Ok(()) }` (see `src/bin/service.rs` of the example). A host assembling the engine by hand calls `br_drive::watch_runner_types(nats, pool)` once its boot can no longer fail and `CatalogueWatch::stop` at shutdown. The watch fills the local copy of Jobs' runner-type catalogue that the save's `unknownRunnerTypes` warning and `<p>RunnerTypes` read. Only a host that starts it needs the `PUBLISHED_LANGUAGE` KV bucket on its broker. Nothing waits for it and no launch consults it: a host without it launches every step all the same, reports every step's type as unknown at save and lists no type.
+3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `record_facts` (required), `visible_drives` (never a service principal), `display_name`, `upload_window`, `process_on_commit`, `erase_mode`, the two folder hooks.
+4. **Fact table**: the host's own fact table (the reference table under [Facts](#facts-handed-to-the-host)), created by a host migration; `record_facts` inserts into it on the connection it is given.
+5. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
+6. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
+7. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
+8. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
+9. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_metadata`, `drive_of` for curation.
+10. **Catalogue watch (optional, information only)**: a host booting through the engine's `run_service` / `BootPlan` starts it at the end of its `register` closure, on the engine's own NATS and PostgreSQL handles, and lets it run until the process exits: `register: move |engine| { register(engine)?; br_drive::watch_runner_types_of(engine).detach(); Ok(()) }` (see `src/bin/service.rs` of the example). A host assembling the engine by hand calls `br_drive::watch_runner_types(nats, pool)` once its boot can no longer fail and `CatalogueWatch::stop` at shutdown. The watch fills the local copy of Jobs' runner-type catalogue that the save's `unknownRunnerTypes` warning and `<p>RunnerTypes` read. Only a host that starts it needs the `PUBLISHED_LANGUAGE` KV bucket on its broker. Nothing waits for it and no launch consults it: a host without it launches every step all the same, reports every step's type as unknown at save and lists no type.
 
 ### The `DriveHost` seam
 
@@ -106,10 +107,12 @@ impl DriveHost for AppPrincipal {
     type DriveOwner = Workspace;                        // or br_drive::NoDriveOwner
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate { … }
+    fn record_facts(conn, facts: &[DriveFact]) -> BoxFuture<…> { … } // required: insert into the host's fact table
     fn visible_drives(&self) -> Vec<Uuid> { … }
     fn display_name(&self) -> Option<String> { … }      // default None; feeds job.create's triggered_by
     fn erase_mode() -> EraseMode { … }                  // default Anonymise; Delete removes the person's files
     fn upload_window(&self) -> Duration { … }           // default 15 min
+    fn process_on_commit(&self) -> bool { … }           // default true: the commit starts the upload rule
     fn folder_moved(ops, drive, old_prefix, new_prefix) -> BoxFuture<…> { … }   // default no-op
     fn folder_deleted(ops, drive, prefix) -> BoxFuture<…> { … }                  // default no-op
 }
@@ -165,6 +168,19 @@ every `RequestUpload`.
   principal act on some files (an uploader rule, say) lets a folder gesture
   tell which case applied. The per-file decisions are in memory over the rows
   the gesture already loads: they add no statement.
+- `process_on_commit` (default `true`): `CommitUpload` starts the chain of
+  the default `upload` rule matching the file's media type, in its own
+  transaction, when the host's `Process { file }` gate allows it — a file
+  that will be processed is never `READY` before it is; a file no rule
+  matches is stored, `READY`, with no refusal. `false` keeps the two-gesture
+  flow (commit, then `ProcessFile`). A host may decide per principal (the
+  example host reads its settings).
+- `record_facts(conn, facts)` is **required**: a host that does not
+  implement it does not compile. Every change of a library state row reaches
+  it, in the transaction of the gesture that made the change — `conn` is that
+  transaction: the host inserts, never commits — and an `Err` rolls the whole
+  gesture back (an `EngineError::PolicyRefused { code }` surfaces as that
+  code). See [Facts handed to the host](#facts-handed-to-the-host).
 - `type DriveOwner` — the host's own noun whose objects are keyed by the
   drive's id, marked `impl br_drive::DriveOwnerNoun for Its { type Object =
   ItsRow; }` (`ItsRow` the host aggregate, keyed by a UUID, that
@@ -219,9 +235,9 @@ renders it, is committed at
 | Root | Shape |
 |---|---|
 | `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256, title?): UploadTicket!` | `title` trimmed, 1–255 characters, one line, no control or bidirectional-override character (`INVALID_TITLE`); absent, it is the requested `name` without its extension (`report.pdf` → `report`; a name with no stem is kept whole; a collision renames the file, never its title); gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). |
-| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then the file is `READY` — stored, not processed: a commit never runs a rule. A second commit is `FILE_NOT_PENDING`. |
-| `<p>ProcessFile(fileId, rulesetId?): MutationAck!` | the only way to start processing, right after the commit, later, or never: gate `Process { file }`, then a `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload, `FILE_PROCESSING` while a chain runs). A file that never had a job runs its `upload` rule, any other its `reprocess` rule (see "Processing rules": `RULESET_NOT_FOUND`, `RULESET_MISMATCH`, `NO_RULESET_MATCHES`). Nothing is wiped: the previous results stay readable while the new run reports over them. Affordance `process`. |
-| `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; logs `cancel_requested` on the running job and stages `job.cancel.v2` for it (`CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). Affordance `cancelProcessing`. |
+| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then, on a host that processes on commit (`DriveHost::process_on_commit`, default `true`) and whose `Process { file }` gate allows it, the default `upload` rule matching the file's media type starts its chain **in the commit's transaction**: the file goes `PENDING` → `PROCESSING`, never `READY` first, and the facts `UploadCommitted`, `ChainStarted`, `JobCreated` share the commit's correlation (a failure rolls all of it back). No matching rule, or the gate refusing: the file is `READY` — stored only — and the commit is not refused. With the switch off, the file is `READY` and `ProcessFile` starts its chain. A second commit is `FILE_NOT_PENDING`. |
+| `<p>ProcessFile(fileId, rulesetId?): MutationAck!` | starts processing on a host that does not process on commit — right after the commit, later, or never — and reprocesses on any host: gate `Process { file }`, then a `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload, `FILE_PROCESSING` while a chain runs). A file that never had a job runs its `upload` rule, any other its `reprocess` rule (see "Processing rules": `RULESET_NOT_FOUND`, `RULESET_MISMATCH`, `NO_RULESET_MATCHES`). Nothing is wiped: the previous results stay readable while the new run reports over them. Affordance `process`. |
+| `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; records `JobCancelSent` on the file's processing and stages `job.cancel.v2` for the running job (the live cause stays `CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). Affordance `cancelProcessing`. |
 | `<p>RegeneratePage(fileId, number, comment?, rulesetId?): MutationAck!` | run the `regenerate_page` rule on one page of a `READY` file: `page` and `comment` are merged into the first step's options; `PAGE_NOT_FOUND`, `NO_RULESET_MATCHES`. Affordance `regeneratePage` on the page. |
 | `<p>UpdateFile(fileId, name?, path?, driveId?): MutationAck!` | rename, move, or move to another drive of the same host; both drives are locked before the sibling check, so a concurrent collision answers `NAME_TAKEN`, never a database error; `NOTHING_TO_CHANGE` when nothing differs. |
 | `<p>RetitleFile(fileId, title): MutationAck!` | gate `RetitleFile { file }` (affordance `retitle`); changes the title and nothing else — never the name, the path, the drive or the state, and `UpdateFile` never touches the title; `INVALID_TITLE`, `NOTHING_TO_CHANGE` for the same title; the host's rule sees the row (a host may allow a retitle where it refuses a rename). |
@@ -371,8 +387,7 @@ the same on a 3-page file and on a 3000-page one.
 
 Rulesets are per host service, declared at runtime by its managers, never
 known to the front or the library by name. The table is empty at boot: until a
-manager declares a rule, `<p>ProcessFile` has nothing to run (an upload only
-ever stores the file: processing is its own gesture). A rule
+manager declares a rule, `<p>ProcessFile` has nothing to run and a commit only stores the file. A rule
 says "when *trigger* happens on a file whose media type matches *mediaTypes*,
 run *steps* in order" — a list, never a graph.
 
@@ -387,7 +402,9 @@ run *steps* in order" — a list, never a graph.
 Matching: the given `rulesetId` must exist (`RULESET_NOT_FOUND`) and carry
 the gesture's trigger and a pattern matching the file's media type
 (`RULESET_MISMATCH`); without an id the default of that trigger wins by
-precedence exact > `type/*` > `*`. A commit never runs a rule. `ProcessFile`
+precedence exact > `type/*` > `*`. A commit runs the default `upload`
+rule matching the file (no given rule, no refusal when none matches) unless
+the host turned `process_on_commit` off. `ProcessFile`
 runs the `upload` trigger on a file that never had a job, the `reprocess`
 trigger on any other, and resolves in this order: the given rule (carrying
 that trigger), else the default of that trigger, else — for a reprocess — the
@@ -404,10 +421,11 @@ snapshot taken when the rule fired.
 
 The chain, one step at a time, in the library's own transactions:
 
-1. a step is a **job**: the library mints a UUIDv7 `job_id`, records that
-   the job was created (`drive.file_job`: the file's next job number, the
-   job, its chain step, the gesture that started its chain, its initiator)
-   and stages
+1. a step is a **job**: the library mints a UUIDv7 `job_id`, makes it the
+   file's running job in the file's processing (`drive.file_processing`: the
+   job, its chain step, the gesture that started its chain, its initiator —
+   `ChainStarted` then `JobCreated` for the first step, `JobCreated` for the
+   next ones) and stages
    `integration.cmd.jobs.job.create.v1` through the engine outbox in the same
    transaction: `producer`, `source_bc` and `config.host` are the host
    service, `source_entity_id` is the file (so Jobs enforces one live job per
@@ -427,69 +445,73 @@ The chain, one step at a time, in the library's own transactions:
    `reported_failed` with its reason, lands the file `FAILED` with that code (`ProcessingFailed {
    reason }`) and stages `job.fail.v2`. A refusal of that `job.finish` by Jobs
    (a job it had already cancelled or failed) changes nothing: the file stays
-   as the runner reported it, and Jobs' own terminal fact is not recorded:
-   the job had already ended;
+   as the runner reported it, and Jobs' own terminal fact is recorded as
+   `JobFactIgnored` (`job_already_ended`): the job had already ended;
 3. the eight `integration.evt.jobs.job.*.v1` facts are consumed on eight
    durables named `{service}-drive-job-…` (every durable the library binds,
    the `upload-deadline` and `image-landed` ones included, is namespaced by
    `DriveHost::SERVICE`, so N hosts on one cluster never share a consumer).
-   Each fact is handled after its job's file row is locked; a fact about a
-   job no file holds is acknowledged and ignored, so every fact can be
-   redelivered. Only the file's **running** job — its last one, not ended —
-   moves the file: `plan_declared` records a plan (`drive.file_job_plan`;
-   the latest declaration is `progress.plan`, a redelivered one adds
-   nothing) and `step_started` a step of a run (`drive.file_job_step`, one
-   row per run and plan index; the latest start is `progress.currentIndex /
-   currentLabel / at`, whatever the arrival order); `ProgressChanged` only
-   when the progress moved, and never on the host object: progress changes
-   no count. `creation_rejected` / `failed` record the job's end with the
-   reason code and land it `FAILED` (`ProcessingFailed { reason }`),
-   `cancelled` lands it `FAILED` `cancelled` — the safety net for a runner
-   that crashed, a user's cancel, a job Jobs refused. A job ends once
-   (`drive.file_job_end`, one row per job): an end arriving after the first
-   (Jobs' facts ride separate durables, and the runner's end is written
-   before Jobs hears of it) is not recorded and changes nothing; progress of
-   a job that no longer runs is not recorded either. Jobs' `queued`,
-   `started` and `completed` are read by nothing — `completed` only confirms
-   the library's own `job.finish` — and are acknowledged without a trace;
+   Each fact is handled after its job's file row is locked, then the file's
+   processing row; a fact about a job no file holds (a deleted file, a job
+   the library never created) is acknowledged and not recorded — there is no
+   processing to record it on. **Every other fact received is recorded**, as
+   a fact of the file's processing. Only the file's **running** job — its
+   last one, not ended — moves the file: `plan_declared` sets the plan
+   (`JobPlanDeclared`; `progress.plan`) and `step_started` the latest step
+   (`JobStepStarted`; the latest start by instant, then index, is
+   `progress.currentIndex / currentLabel / at`, whatever the arrival order);
+   `ProgressChanged` only when the progress moved, and never on the host
+   object: progress changes no count. `creation_rejected` / `failed` end the
+   job with the reason code and land it `FAILED` (`ProcessingFailed {
+   reason }`), `cancelled` lands it `FAILED` `cancelled` — the safety net for
+   a runner that crashed, a user's cancel, a job Jobs refused. A job ends
+   once: an end arriving after the first (Jobs' facts ride separate
+   durables, and the runner's end is written before Jobs hears of it), a
+   progress fact of a job that no longer runs or one already known (a
+   redelivery), and any fact about an **earlier** job of the file are
+   recorded as `JobFactIgnored { job_id, received, why }` (`why`:
+   `job_already_ended`, `already_known`, `not_the_current_job`) and change
+   nothing. Jobs' `queued`, `started` and `completed` of the file's last job
+   are recorded as themselves (`JobQueued`, `JobStarted`, `JobCompleted`) and
+   move nothing a reader sees — `completed` only confirms the library's own
+   `job.finish`;
 4. a user's cancel that crossed a step's final report (the cancel was still
    on its way to Jobs when the report landed) stops the chain there: the next
-   step is recorded as a job row of its own, never sent to Jobs, ended at
-   once by the library's `cancelled`, and the file lands `FAILED`
-   `cancelled`. A cancel that crossed the **last** step's final report has
+   step is skipped — never launched, no job created for it — and recorded as
+   `StepSkipped { step_index, runner_type, after_job_id }`; the file lands
+   `FAILED` `cancelled` with the ended job as its last one. A cancel that crossed the **last** step's final report has
    nothing left to stop: the work is done and the file is `READY`; Jobs'
    `cancelled`, if it comes, changes nothing.
 
-The state is **computed, never stored**, from which fact rows exist — the
-shape Jobs gives its own ledger, one insert-only table per fact:
+The state is **stored**, one row per processed file (`drive.file_processing`,
+the `drive_file_processing` aggregate, soft-EDA like every library aggregate):
 
-| Table | The fact | Key |
-|---|---|---|
-| `drive.file_job` | the job was created: its chain `step_index`, `trigger`, initiator (`triggered_by_id`, `triggered_by_name`), `created_at` | `(file_id, number)`, `number` 1, 2, 3… per file; `job_id` unique |
-| `drive.file_job_end` | the job ended: `kind` (`reported_done`, `reported_failed`, `failed`, `cancelled`, `creation_rejected`), `reason_code` (required for a failure or a rejection), `message`, `at` | `job_id`: the first end wins |
-| `drive.file_job_cancel` | a user asked to cancel it: `requested_by`, `at` | `(job_id, number)` |
-| `drive.file_job_plan` | its runner declared a plan: `run_id`, `labels`, `declared_at` | `(job_id, number)`; the highest is current |
-| `drive.file_job_step` | its runner started a step of its plan: `label`, `started_at` | `(job_id, run_id, plan_index)` |
+| Column | What it holds |
+|---|---|
+| `file_id` | the file (primary key; the row goes with the file) |
+| `version` | one per event of the file's processing |
+| `state` | `processing`, `ready` or `failed` |
+| `job_id`, `step_index` | the file's last job — the running one while `processing` — and its chain step (unique) |
+| `trigger`, `triggered_by_id`, `triggered_by_name`, `job_created_at` | the gesture that started the chain, its initiator, when the job was created |
+| `error_code`, `error_message` | why a `failed` file failed (required then, absent otherwise) |
+| `plan`, `plan_index`, `plan_label`, `plan_at` | where the running job's runner says it is: its plan, the latest step it started |
+| `cancel_requested_at` | a user asked to cancel the running job (the first request) |
+| `past_job_ids` | the file's earlier jobs, so a late fact about one is recognised and recorded as ignored |
+| `updated_at` | the processing's last change: every status change (a chain started, a job created or ended, a cancel request), never a progress fact nor Jobs' information |
 
-The `drive.file_status` view reads each file's last job (its highest
-`number`) and that job's end: no job and no `committed_at` → `PENDING`; no job
-and `committed_at` set → `READY` (a stored, unprocessed file is ready); no end
-→ `PROCESSING`; an end `reported_done` → `READY` (the next step's job is
-created in the transaction that records the end, so a done last job means the
-chain is over); any other end → `FAILED`, `processingError` its reason (the
-runner's declared `reasonCode`; a Jobs failure's `failure_report.reason_code`,
-else its `failure_cause`; a rejection's `reason_code`; `cancelled`). Every
-gate, affordance, view and the `file_counts` helper read it. A job number is
-assigned max + 1 under the file's row lock, which every writer of a file's
-jobs takes first — a gesture locks the file row before reading its status, so
-two gestures never both see the same last job — and a new job is only ever
-created once the file's last job ended: at most one job runs per file. Should
-a writer ever skip the lock, the `(file_id, number)` primary key refuses the
-second job (`FILE_PROCESSING`). `ruleset_id` and `steps` stay on the File for replay;
-`progress` is `null` outside `PROCESSING`. `updatedAt` moves on every
-change of the file the audit trail records (below) — a status change (a
-settling Jobs fact, a cancel request, the runner's end) included, never a
-progress fact.
+No row: `PENDING` without `committed_at`, `READY` with it (a stored,
+unprocessed file is ready). A row: its `state`; `processingError` its
+`error_code` (the runner's declared `reasonCode`; a Jobs failure's
+`failure_report.reason_code`, else its `failure_cause`; a rejection's
+`reason_code`; `cancelled`). Every gate, affordance, view and the
+`file_counts` helper read it. Every writer of a file's processing locks the
+file row first, then the processing row — a gesture locks the file before
+reading its status, so two gestures never both see the same last job — and a
+new job is only ever created once the file's last job ended, or in the
+transaction that ends it: at most one job runs per file. `ruleset_id` and
+`steps` stay on the File for replay; `progress` is `null` outside
+`PROCESSING`. A file's `updatedAt` is the latest of its own row's `updated_at`
+(every event of the file) and its processing's.
 
 A file's results live apart from the file, in `drive.file_processed`: the
 indexer's triple, with the pages (`drive.file_page`) and the extracted images
@@ -570,28 +592,106 @@ The runner source presign (`<p>RunnerContext`'s `sourceUrl`) goes through the
 while that job is the file's running one — never a population of every
 in-flight file.
 
-## Audit trail
+## Facts handed to the host
 
-What happens to a file, a page, a label or a rule is recorded as an
-append-only fact (`drive.fact`), the way the identity service keeps its own:
-`aggregate_type` (`file`, `page`, `label`, `ruleset`), `aggregate_id` (for a
-page, its file; `page_number` names the page), `correlation_id` (the gesture:
-a folder move's files, a report's pages share it; a reaction's message
-correlation), `fact_type` and `payload` (the change, as the library's cause:
-`Renamed`, `Retitled`, `Moved`, `FolderMoved`,
-`MetadataChanged`, `UploadCommitted`, `ProcessingStarted`, `ReportStored`,
-`ProcessingFinished`, `ProcessingFailed`, `CancelRequested`, `Reported`,
-`Edited`, `Updated`, `Saved`), `actor_id` and `actor_kind` (`human`;
-`service` — a service account, Jobs included; `runner` — a service account
-holding the host's runner scope), `impersonator_id` (the admin behind an
-impersonated session: the trail never loses the real hand) and `occurred_at`.
-No column is overwritten to say who changed something last: `DriveFile`,
-`DriveLabel` and `DriveRuleset`'s `updatedAt` are their latest fact (their
-creation when none), a page's `updatedBy` / `updatedAt` its latest fact; the
-creation columns (`created_by`, `created_at`) are written once and stay. A
-host reads an object's history from its facts, newest first, served by an
-index. The last changes of 0.3 carried over as one fact each, of kind
-`unknown` (0.3 did not record who; a page's writer was kept).
+The library keeps **state tables only**, and ships no fact table: each host
+owns **one** fact table for everything it does, the library's objects
+included, and the library hands it its facts through
+`DriveHost::record_facts(conn, &[DriveFact])`, **in the transaction** of the
+gesture that changed the state. A failing `record_facts` rolls the whole
+gesture back. Every aggregate of the library is soft-EDA, the engine's way
+(`PersistenceStyle::SoftEda`): each state-changing method pushes one event
+and bumps the aggregate's `version`; the engine hands the pending events to
+the store's `save` / `create` (`Aggregate::pending_events`), which writes the
+state row, then the facts — `seq = base_version + offset + 1`. The writes
+that change many rows without loading an aggregate — a folder move or
+delete, a drive delete, a label deleted off its files, a runner report's
+pages, a chain's trimmed pages — bump each row's `version` in SQL
+(`RETURNING version`) and hand one fact per row. The engine's post-save
+policy cannot carry this: it runs synchronous pure domain logic and writes
+no row.
+
+```rust
+pub struct DriveFact {
+    pub noun: &'static str,           // drive_file, drive_page, drive_label, drive_ruleset, drive_file_processing
+    pub key: serde_json::Value,       // the aggregate's key: a UUID, a page {file_id, number}
+    pub seq: i64,                     // per (noun, key), gap-free from 1
+    pub version: i32,                 // the payload's schema version
+    pub event_type: &'static str,     // the event's kind
+    pub payload: serde_json::Value,   // the event, tagged by "kind"
+    pub meta: FactMeta,
+}
+
+pub struct FactMeta {                 // aligned on br-core-events' EventMetadata
+    pub actor_id: Uuid,               // the effective identity (nil when a message names none)
+    pub actor_kind: ActorKind,        // Human | Service (a runner is a service account)
+    pub is_runner: bool,              // a service account holding the host's runner scope
+    pub impersonator_id: Option<Uuid>,// the admin behind an impersonated session
+    pub correlation_id: Uuid,         // the gesture; a reaction's message correlation
+    pub causation_id: Option<Uuid>,   // the inbound message a reaction handles
+    pub occurred_at: DateTime<Utc>,   // the engine clock
+}
+```
+
+The reference fact table a host is expected to create (the example host
+creates it as `workspace_fact`, and inserts a batch in one statement):
+
+```sql
+CREATE TABLE <host>.fact (
+    id uuid PRIMARY KEY, noun text NOT NULL, key jsonb NOT NULL,
+    seq bigint NOT NULL CHECK (seq >= 1), version integer NOT NULL CHECK (version >= 1),
+    event_type text NOT NULL CHECK (event_type <> ''), payload jsonb NOT NULL,
+    actor_id uuid NOT NULL, actor_kind text NOT NULL CHECK (actor_kind IN ('human','service')),
+    is_runner boolean NOT NULL DEFAULT false, impersonator_id uuid,
+    correlation_id uuid NOT NULL, causation_id uuid, occurred_at timestamptz NOT NULL,
+    UNIQUE (noun, key, seq)
+);
+```
+
+The unique `(noun, key, seq)` makes a lost update impossible to hide: two
+writers of one aggregate would hand the same `seq`.
+
+| Noun | Events (`kind`) |
+|---|---|
+| `drive_file` (`FileEvent`) | `UploadTicketIssued { drive_id, path, name, title, media_type, size_bytes }`, `UploadCommitted`, `UploadAbandoned`, `Renamed { from, to }`, `Moved { from_drive, to_drive, from, to }`, `FolderMoved { from_path, to_path }`, `Retitled { from, to }`, `MetadataChanged { metadata }`, `LabelsChanged { added, removed }`, `ImageUploadTicketIssued { name }`, `ImageAvailable { name }`, `ImagesDropped { names }`, `ReportStored { job_id, done }`, `Deleted`, `FolderDeleted { prefix }`, `DriveDeleted` |
+| `drive_page` (`PageEvent`) | `Reported { job_id, origin }`, `Edited`, `Trimmed` |
+| `drive_label` (`LabelEvent`) | `Created { name, color, description }`, `Updated { name, color, description }`, `Deleted` |
+| `drive_ruleset` (`RulesetEvent`) | `Created { name, trigger, media_types, steps, is_default }`, `Saved { name, media_types, steps, is_default }`, `Deleted` |
+| `drive_file_processing` (`ProcessingEvent`) | `ChainStarted { trigger, ruleset_id, steps }`, `JobCreated { job_id, step_index, runner_type }`, `JobReportedDone { job_id }`, `JobReportedFailed { job_id, reason_code, message }`, `JobFailed { job_id, failure_cause, reason_code, note }`, `JobCancelled { job_id }`, `JobCreationRejected { job_id, reason_code, params }`, `JobCancelSent { job_id }`, `StepSkipped { step_index, runner_type, after_job_id }`, `JobPlanDeclared { job_id, run_id, labels }`, `JobStepStarted { job_id, run_id, index, label, started_at }`, `JobQueued { job_id, runner_type }`, `JobStarted { job_id, run_id }`, `JobCompleted { job_id }`, `JobFactIgnored { job_id, received, why }` |
+
+Every payload is at schema version 1 (`FILE_EVENT_VERSION`,
+`PAGE_EVENT_VERSION`, `LABEL_EVENT_VERSION`, `RULESET_EVENT_VERSION`,
+`PROCESSING_EVENT_VERSION`). A deletion's last fact (`Deleted`,
+`UploadAbandoned`, `FolderDeleted`, `DriveDeleted`, a page's `Trimmed`, a
+label's or a rule's `Deleted`) takes the row's next version; what cascades
+with a deleted file (its pages, its processing) hands nothing more. The live
+views keep speaking their causes (`FileCause`, `PageCause`, …): the facts are
+not deltas. Every fact names what happened in the library's past — a ticket
+issued, a cancel sent, a step skipped — never a request: the wire causes keep
+their 0.4.0 names (`UploadRequested`, `ImageRequested`, `CancelRequested`),
+the facts do not.
+
+Every write goes through the engine's pipeline locks: an aggregate is loaded
+with `cx.load` / `cx.load_many` before it is written, in the engine's order —
+store type, then encoded key — wherever two nouns meet (a label's files
+before the label, a file before its processing). Deleting a label loads the
+files it is on, then the label, then any file linked to it meanwhile;
+`SetFileLabels` loads the file, then every label it touches, so the two
+serialise and never wait on each other the other way round. A page or an
+image is written after its file's lock, as every bulk write of pages and
+images is. The only other lock is the name lock of label and rule saves
+(`pg_advisory_xact_lock` on the catalogue, since 0.2): what a create or a
+rename claims — a name, a default's patterns — has no aggregate to load, the
+engine offers no pipeline lock for it, and it is always taken before any
+aggregate lock.
+
+The last change is **state**: `drive.file.updated_at`,
+`drive.file_page.updated_at` / `updated_by`, `drive.label.updated_at`,
+`drive.ruleset.updated_at` and `drive.file_processing.updated_at` are written
+by the store with every event of their object (a file's image and label
+changes included); a file's `updatedAt` is the latest of its row's and its
+processing's. The creation columns (`created_by`, `created_at`) are written
+once.
 
 ## Erase
 
@@ -602,11 +702,11 @@ the pipeline records the erasure, purges what the manifest names and emits
 the engine's `PersonErased` fact. `DriveHost::erase_mode` picks the mode:
 
 - `Anonymise` (default): every `created_by` the person left on drives,
-  files, labels, label links and rules, the `triggered_by` of the jobs they
-  started, the `requested_by` of the cancels they asked for, and every audit
-  fact naming them — as its actor or as the admin behind an impersonated
-  session — is rewritten to `br_drive::REDACTED_PERSON` (the nil UUID); the
-  facts themselves stay, nothing is deleted.
+  files, labels, label links and rules, the initiator of the chains they
+  started (`drive.file_processing.triggered_by_*`) and the `updated_by` of the
+  pages they wrote last is rewritten to `br_drive::REDACTED_PERSON` (the nil
+  UUID); nothing is deleted. The facts naming the person live in the host's
+  fact table: their erasure is the host's.
 - `Delete`: every file the person created is deleted (its pages, images and
   label links cascade, its objects are purged through the manifest), then the
   rest is anonymised. A job still running on such a file is not cancelled —
@@ -638,9 +738,13 @@ misread them:
   pages and images hanging off that row; a page's `origin` says who wrote it
   (`runner`, `regenerated`, or `edited` for a person's correction, which a
   later reprocess keeps);
-- no row of `drive.file_job` or its fact tables unless the job exists in Jobs:
-  a migrated file with results and no job is `READY`, and a user's
+- no row of `drive.file_processing` unless its job exists in Jobs: a
+  migrated file with results and no processing is `READY`, and a user's
   `ProcessFile` runs its `upload` rule from there;
+- every state row carries `version` 1 (and `updated_at`): the host's fact
+  table then receives the rows' next facts from `seq` 2, so a host that
+  migrates rows in writes their first fact itself, or accepts facts starting
+  at 2;
 - every id is a UUIDv7 (Jobs refuses any other as a source entity), and
   `created_by` names a person the host's erase knows.
 
@@ -658,8 +762,8 @@ misread them:
 `RULESET_MISMATCH`, `NO_RULESET_MATCHES`, `FILE_NOT_PROCESSING`,
 `LABEL_NOT_FOUND`, `LABEL_NAME_TAKEN`,
 `INVALID_LABEL`, `INVALID_FAILURE_REASON` — plus the host's own codes through
-the gate and the hooks. On a `FAILED` file, `processingError` carries, from
-the end of the file's last job (`drive.file_job_end`): the `reasonCode` the runner
+the gate, the hooks and `record_facts`. On a `FAILED` file, `processingError` carries, from
+the end of the file's last job (`drive.file_processing.error_code`): the `reasonCode` the runner
 declared through `<p>RunnerReportFailure`, verbatim; the `reason_code` of the
 failure report a runner sent Jobs, else Jobs' `failure_cause`; Jobs'
 `creation_rejected` code (e.g. `duplicate_active_entity`,
@@ -678,9 +782,25 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
   fires for it) — and past `BULK_RESET_THRESHOLD` deleted files, live
   `DriveChanged` sessions catch up on their next reset instead of receiving
   one `Remove` per file.
-- The audit facts outlive their object: a deleted file, label or rule keeps
-  its history (anonymised by an erase, like every fact). A retention rule, if
-  a host needs one, is not written yet.
+- The facts live in the host's fact table and outlive their object; their
+  retention and their erasure are the host's. The library's erase rewrites
+  its state rows without handing a fact (an erasure is no gesture of the
+  library's), and deletes a person's files the same way in `Delete` mode.
+- The drive rows (`drive.drive`), the image rows (`drive.file_image`) and the
+  runner-type catalogue copy stay CRUD: a drive is created and deleted by the
+  host's own gesture (the host records its own facts), an image's change is
+  a fact of its file (`ImageUploadTicketIssued`, `ImageAvailable`, `ImagesDropped`),
+  and the catalogue copy is a cache of Jobs'. A chain's `ruleset_id` /
+  `steps` snapshot on the file is recorded by `ChainStarted` on the file's
+  processing, not by a file event.
+- A migrated row (0.4.0 or an imported corpus) starts at `version` 1 with no
+  fact in the host's table: its facts there start at `seq` 2.
+- `drive.file_processing.past_job_ids` grows by one id per job of the file,
+  for the life of the file (a GIN index serves the lookup of a late fact).
+  A file reprocessed thousands of times may want a bound later.
+- The stores are written for the engine's 0.4.0 contract (batched
+  `read_many`, `row_lock` / `FOR UPDATE` locks); the library stays on engine
+  v0.3.4 for this release.
 - `select_ruleset` reads the defaults of one trigger per gesture — fine at a
   host's scale (tens of rules), noted for the record.
 - The catalogue watch stamps `seen_at` from the database clock: it runs
@@ -695,14 +815,10 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
 - The catalogue watch receives every put of the whole `PUBLISHED_LANGUAGE`
   bucket and keeps the `jobs.runner_type.` keys client-side: the engine's KV
   facade has no prefix watch yet (an engine ask).
-- The job fact tables are kept forever, a few rows per job (insert-only,
-  never rewritten). A file reprocessed many times, or a runner reporting
-  per-page steps, may want a retention rule later (the progress rows of
-  ended jobs are never read).
 - A job Jobs holds on a file the library cannot tell about is cancelled only
   on a `duplicate_active_entity` rejection: nothing polls Jobs. A manual
   retry of a failed job in Jobs is not followed either — the file settled on
-  the job's first end (`FAILED`), a later end is not recorded, and
+  the job's first end (`FAILED`), a later end is recorded as ignored, and
   the runner of the retried run is refused `JOB_NOT_ACTIVE`; the user
   reprocesses instead.
 - A file whose running job Jobs holds as settled or does not know (a restored
@@ -710,7 +826,7 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
   never confirmed. A host-privileged gesture settling such a job locally is
   not written yet; deleting the file is the way out.
 - A runner report the library refuses (an invalid batch, say) is a refused
-  mutation: its transaction rolls back, so nothing is recorded on the job; the
+  mutation: its transaction rolls back, so nothing is recorded; the
   runner may then declare its failure (`<p>RunnerReportFailure`).
 - The Jobs double serializes the commands it reads, so the crossing of a
   `job.cancel` and a `job.create` on Jobs' separate durables is modelled by
@@ -729,7 +845,12 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
 ## The example host
 
 `crates/br-drive-example` is the reference host: a thin kernel (principal,
-facts, faults, the `DriveHost` impl), one `workspace` slice (the host object a
+facts, faults, the `DriveHost` impl — its `record_facts` inserts into the
+reference fact table, `workspace_fact`, and refuses one title and one
+runner type, the suite's proof that a refused fact rolls the gesture back;
+its `process_on_commit` comes from its settings — on for the binary,
+`DRIVE_PROCESS_ON_COMMIT=false` to turn it off — and the suite runs its
+two-gesture scenarios with it off), one `workspace` slice (the host object a
 drive hangs off, owner-only gate: `workspaceCreate` / `workspaceDelete` /
 `workspaceTransfer`; the `workspace:manage` scope on
 a human passport is its `ManageRulesets` gate, any human reads the rules), the

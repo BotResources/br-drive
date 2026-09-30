@@ -64,25 +64,6 @@ pub(crate) async fn edited_among(
     Ok(rows.iter().map(|row| row.get::<i32, _>("number")).collect())
 }
 
-/// Deletes the pages numbered above `page_count` — edited ones included — and
-/// answers their numbers.
-pub(crate) async fn trim_pages(
-    conn: &mut PgConnection,
-    file_id: Uuid,
-    page_count: i32,
-) -> Result<Vec<i32>, EngineError> {
-    let rows = sqlx::query(
-        "DELETE FROM drive.file_page WHERE file_id = $1 AND number > $2 RETURNING number",
-    )
-    .bind(file_id)
-    .bind(page_count)
-    .fetch_all(conn)
-    .await?;
-    let mut numbers: Vec<i32> = rows.iter().map(|row| row.get::<i32, _>("number")).collect();
-    numbers.sort_unstable();
-    Ok(numbers)
-}
-
 /// The file's images no page's markdown references any more (by whole name,
 /// as `references_image` matches it), in name order.
 pub(crate) async fn unreferenced_images(

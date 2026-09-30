@@ -12,8 +12,8 @@ use service_engine::view::{Populate, Projector};
 use service_engine::visibility::Unrestricted;
 use uuid::Uuid;
 
-use super::store::{RulesetStore, all_ids};
-use super::{DriveStep, Ruleset, RulesetRow, Trigger};
+use super::store::{RulesetRecord, RulesetStore, all_ids};
+use super::{DriveStep, Ruleset, Trigger};
 use crate::host::{DriveHost, DriveRequest};
 use crate::host_window::catalogue_window;
 
@@ -52,10 +52,10 @@ impl<H> DriveRulesets<H> {
 impl<H: DriveHost> Projector for DriveRulesets<H> {
     type Principal = H;
     type Noun = Ruleset;
-    type Store = RulesetStore;
+    type Store = RulesetStore<H>;
     type Query = RulesetWindow;
     type Out = DriveRuleset;
-    type Visibility = Unrestricted<RulesetRow, H, RulesetAccess>;
+    type Visibility = Unrestricted<RulesetRecord<H>, H, RulesetAccess>;
 
     const NAME: ProjectorName = Self::NAME;
 
@@ -76,7 +76,8 @@ impl<H: DriveHost> Projector for DriveRulesets<H> {
         ))
     }
 
-    fn project(row: &RulesetRow, _principal: &H) -> Result<DriveRuleset, EngineError> {
+    fn project(ruleset: &RulesetRecord<H>, _principal: &H) -> Result<DriveRuleset, EngineError> {
+        let row = &ruleset.row;
         Ok(DriveRuleset {
             id: row.id,
             name: row.name.clone(),

@@ -6,9 +6,11 @@ use service_engine::gate::Gate;
 use service_engine::impact::Deps;
 use service_engine::pipeline::Ops;
 use service_engine::principal::Principal;
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::erase::EraseMode;
+use crate::facts::DriveFact;
 use crate::file::FileRow;
 use crate::media::MediaType;
 use crate::owner::DriveOwnerNoun;
@@ -134,6 +136,16 @@ pub trait DriveHost: Principal {
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate;
 
+    /// Keeps `facts` in the host's fact table, on `conn` — the transaction of
+    /// the gesture that changed the library's state: insert, never commit.
+    /// Every change of a library state row reaches this hook, in `seq` order
+    /// per `(noun, key)`, gap-free. An error rolls the whole gesture back. The
+    /// README gives the reference table a host is expected to create.
+    fn record_facts<'a>(
+        conn: &'a mut PgConnection,
+        facts: &'a [DriveFact],
+    ) -> BoxFuture<'a, Result<(), EngineError>>;
+
     fn visible_drives(&self) -> Vec<Uuid>;
 
     fn is_runner(&self) -> bool {
@@ -155,6 +167,15 @@ pub trait DriveHost: Principal {
 
     fn upload_window(&self) -> Duration {
         Duration::from_secs(15 * 60)
+    }
+
+    /// Whether `CommitUpload` starts the chain of the file's default `upload`
+    /// rule in its own transaction (default `true`): a file with a matching
+    /// rule goes from PENDING to PROCESSING, never READY in between; one with
+    /// none stays READY (stored only). `false` keeps the two-gesture flow —
+    /// the commit stores, `ProcessFile` processes.
+    fn process_on_commit(&self) -> bool {
+        true
     }
 
     fn folder_moved<'a, 'o>(
