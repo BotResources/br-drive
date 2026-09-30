@@ -24,7 +24,7 @@ The workspace's MSRV is Rust 1.94 — the floor of the pinned `contract-jobs`
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.5.0", version = "0.5.0" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.5.1", version = "0.5.1" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -37,6 +37,7 @@ The `version` beside the `tag` is required: a tag-only git dependency carries a
 | 0.2 | `v0.3.4` |
 | 0.3 | `v0.3.4` |
 | 0.4 | `v0.3.4` |
+| 0.5 | `v0.3.4` |
 
 ## What a host writes
 
@@ -70,6 +71,12 @@ The engine's "library slice" path, exactly as `example-lib-roster` does it:
    `br_drive::NoDriveOwner` has no host object to refresh and calls
    `br_drive::create_unowned_drive::<AppPrincipal>(cx, id, created_by)` with an
    id of its choosing instead — nothing in the library relies on it then.
+   A host that deletes a drive from a **reaction** (a roster retraction
+   removing a person's collection, say) calls
+   `br_drive::delete_drive_in_reaction::<AppPrincipal>(cx, id)` instead (see
+   [Drives from a reaction](#drives-from-a-reaction)), and a host that closes
+   a collection calls `br_drive::freeze_drive::<AppPrincipal>(ops, &meta, id)`
+   in its own gesture (see [Freezing a drive](#freezing-a-drive)).
    `br_drive::set_metadata(ops, principal, file_id, metadata)` writes the
    host's free JSON on a file after asking the host's gate for that
    principal (`SetMetadata { file }`; an unchanged value is
@@ -94,7 +101,7 @@ rolls them together. The host never writes to the `drive` schema directly.
 6. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
 7. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
 8. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
-9. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`); `set_metadata`, `drive_of` for curation.
+9. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`), or deleted from a host reaction (`delete_drive_in_reaction`); frozen in the host's own gesture (`freeze_drive`); `set_metadata`, `drive_of` for curation; `file_counts` and `processing_counts` for a host view showing its drives' counts.
 10. **Catalogue watch (optional, information only)**: a host booting through the engine's `run_service` / `BootPlan` starts it at the end of its `register` closure, on the engine's own NATS and PostgreSQL handles, and lets it run until the process exits: `register: move |engine| { register(engine)?; br_drive::watch_runner_types_of(engine).detach(); Ok(()) }` (see `src/bin/service.rs` of the example). A host assembling the engine by hand calls `br_drive::watch_runner_types(nats, pool)` once its boot can no longer fail and `CatalogueWatch::stop` at shutdown. The watch fills the local copy of Jobs' runner-type catalogue that the save's `unknownRunnerTypes` warning and `<p>RunnerTypes` read. Only a host that starts it needs the `PUBLISHED_LANGUAGE` KV bucket on its broker. Nothing waits for it and no launch consults it: a host without it launches every step all the same, reports every step's type as unknown at save and lists no type.
 
 ### The `DriveHost` seam
@@ -169,7 +176,8 @@ every `RequestUpload`.
   tell which case applied. The per-file decisions are in memory over the rows
   the gesture already loads: they add no statement.
 - `process_on_commit` (default `true`): `CommitUpload` starts the chain of
-  the default `upload` rule matching the file's media type, in its own
+  the `upload` rule the uploader chose at `RequestUpload` (`rulesetId`, since
+  0.5.1), else of the default `upload` rule matching the file's media type, in its own
   transaction, when the host's `Process { file }` gate allows it — a file
   that will be processed is never `READY` before it is; a file no rule
   matches is stored, `READY`, with no refusal. `false` keeps the two-gesture
@@ -198,7 +206,12 @@ every `RequestUpload`.
   change. The library never calls the host: it stages an engine impact the
   host's projector already listens to. `br_drive::file_counts(conn,
   &drive_ids)` answers the files and READY files of several drives in one
-  statement, served by an index. Cost: each such impact re-runs the window
+  statement, served by an index; `br_drive::processing_counts(conn,
+  &drive_ids)` (since 0.5.1) answers, the same way, each drive's files per
+  processing state — `ProcessingCounts { pending, processing, ready, failed
+  }`, `files()` their sum, a drive with no file absent from the map — so a
+  host shows how many files are processing or failed without reading
+  `drive.file_processing` itself. Cost: each such impact re-runs the window
   query of every live session holding a window on the host noun.
 - `visible_drives` is the cohort membership of the reactive views (dimension
   `drive`, `Cohort::uuid("drive", drive_id)`): a principal sees the files of the
@@ -234,8 +247,8 @@ renders it, is committed at
 
 | Root | Shape |
 |---|---|
-| `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256, title?): UploadTicket!` | `title` trimmed, 1–255 characters, one line, no control or bidirectional-override character (`INVALID_TITLE`); absent, it is the requested `name` without its extension (`report.pdf` → `report`; a name with no stem is kept whole; a collision renames the file, never its title); gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). |
-| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then, on a host that processes on commit (`DriveHost::process_on_commit`, default `true`) and whose `Process { file }` gate allows it, the default `upload` rule matching the file's media type starts its chain **in the commit's transaction**: the file goes `PENDING` → `PROCESSING`, never `READY` first, and the facts `UploadCommitted`, `ChainStarted`, `JobCreated` share the commit's correlation (a failure rolls all of it back). No matching rule, or the gate refusing: the file is `READY` — stored only — and the commit is not refused. With the switch off, the file is `READY` and `ProcessFile` starts its chain. A second commit is `FILE_NOT_PENDING`. |
+| `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256, title?, rulesetId?): UploadTicket!` | `title` trimmed, 1–255 characters, one line, no control or bidirectional-override character (`INVALID_TITLE`); absent, it is the requested `name` without its extension (`report.pdf` → `report`; a name with no stem is kept whole; a collision renames the file, never its title); gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). `rulesetId` (since 0.5.1) chooses the `upload` rule the commit runs, for a front that lets its user pick a processing per upload: validated as `ProcessFile` validates a named rule — after the gate and the drive — `RULESET_NOT_FOUND`, `RULESET_MISMATCH` (another trigger, or no pattern matching the media type); pinned on the pending file (`UploadRulesetChosen`, the fact after `UploadTicketIssued`). Without it nothing is pinned and the commit runs the default, as before. |
+| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then, on a host that processes on commit (`DriveHost::process_on_commit`, default `true`) and whose `Process { file }` gate allows it, the `upload` rule the uploader chose — else the default `upload` rule matching the file's media type — starts its chain **in the commit's transaction**: the file goes `PENDING` → `PROCESSING`, never `READY` first, and the facts `UploadCommitted`, `ChainStarted`, `JobCreated` share the commit's correlation (a failure rolls all of it back). No matching rule, or the gate refusing: the file is `READY` — stored only — and the commit is not refused. A chosen rule deleted since the request, or changed so it no longer carries the `upload` trigger or matches the file, stores the file `READY` too: the default never runs in the place of the rule the uploader chose. With the switch off, the file is `READY` and `ProcessFile` starts its chain. A second commit is `FILE_NOT_PENDING`. |
 | `<p>ProcessFile(fileId, rulesetId?): MutationAck!` | starts processing on a host that does not process on commit — right after the commit, later, or never — and reprocesses on any host: gate `Process { file }`, then a `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload, `FILE_PROCESSING` while a chain runs). A file that never had a job runs its `upload` rule, any other its `reprocess` rule (see "Processing rules": `RULESET_NOT_FOUND`, `RULESET_MISMATCH`, `NO_RULESET_MATCHES`). Nothing is wiped: the previous results stay readable while the new run reports over them. Affordance `process`. |
 | `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; records `JobCancelSent` on the file's processing and stages `job.cancel.v2` for the running job (the live cause stays `CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). Affordance `cancelProcessing`. |
 | `<p>RegeneratePage(fileId, number, comment?, rulesetId?): MutationAck!` | run the `regenerate_page` rule on one page of a `READY` file: `page` and `comment` are merged into the first step's options; `PAGE_NOT_FOUND`, `NO_RULESET_MATCHES`. Affordance `regeneratePage` on the page. |
@@ -402,9 +415,11 @@ run *steps* in order" — a list, never a graph.
 Matching: the given `rulesetId` must exist (`RULESET_NOT_FOUND`) and carry
 the gesture's trigger and a pattern matching the file's media type
 (`RULESET_MISMATCH`); without an id the default of that trigger wins by
-precedence exact > `type/*` > `*`. A commit runs the default `upload`
-rule matching the file (no given rule, no refusal when none matches) unless
-the host turned `process_on_commit` off. `ProcessFile`
+precedence exact > `type/*` > `*`. A commit runs the `upload` rule the
+uploader chose at `RequestUpload`, else the default `upload` rule matching
+the file (no refusal when none matches — nor when the chosen rule is gone),
+unless the host turned `process_on_commit` off; the chosen rule is only the
+commit's: a later `ProcessFile` resolves its own. `ProcessFile`
 runs the `upload` trigger on a file that never had a job, the `reprocess`
 trigger on any other, and resolves in this order: the given rule (carrying
 that trigger), else the default of that trigger, else — for a reprocess — the
@@ -558,9 +573,68 @@ Jobs' separate consumers). When the job Jobs names (`params.activeJobId`)
 belongs to this file of this host (`sourceEntityId`, `sourceBc`), the library
 stages `job.cancel.v2` for it; the rejection lands the file `FAILED`
 `duplicate_active_entity`, and the user's reprocess gets through once Jobs
-cancelled it (a cancel is idempotent). `DeleteFile`, `DeleteFolder` and
-`delete_drive` stage `job.cancel.v2` for the running job of every file they
-remove, and the later `cancelled` fact finds no file.
+cancelled it (a cancel is idempotent). `DeleteFile`, `DeleteFolder`,
+`delete_drive` and `delete_drive_in_reaction` stage `job.cancel.v2` for the
+running job of every file they remove, and the later `cancelled` fact finds
+no file. `freeze_drive` stages it for the running job of every file of the
+drive and ends the job at once (below).
+
+### Freezing a drive
+
+`br_drive::freeze_drive::<H>(ops, &meta, drive_id) -> DriveFrozen {
+cancelled, abandoned }` (since 0.5.1) closes a drive in the host's own
+gesture and transaction — a mutation, a bulk mutation or a reaction, `meta`
+its hand (`FactMeta::of(principal, now)` or `FactMeta::of_reaction(cx)`) —
+so no work lands on it afterwards:
+
+- every running processing of the drive's files ends, as a cancel:
+  `job.cancel.v2` is staged and the job ends **there**, cancelled
+  (`JobCancelSent`, then `JobCancelledOnFreeze`); the file is `FAILED`
+  `cancelled` at once, the runner's next call about the job meets
+  `JOB_NOT_ACTIVE`, the next step of its chain is never launched, and Jobs'
+  own `cancelled` — or any later end — is recorded as `JobFactIgnored`
+  (`job_already_ended`) and changes nothing, even when Jobs drops the cancel;
+- every pending upload of the drive (`committed_at` unset, landed or not) is
+  abandoned as its upload deadline would abandon it: `UploadAbandoned`, the
+  row deleted, its blob released; a later commit meets `FILE_NOT_FOUND`.
+
+Every fact reaches `record_facts` in the gesture's transaction; stored,
+processed and failed files are untouched; a second freeze ends nothing more;
+`DRIVE_NOT_FOUND` for an unknown drive. The library stores **no** frozen
+flag: nothing but the host's gesture needs one. The host's gate keeps
+refusing new gestures on the drive (its own closed state), and the
+library's refusals cover everything already in flight — a runner's report
+(`JOB_NOT_ACTIVE`), a late commit (`FILE_NOT_FOUND`), a deadline (nothing
+left), Jobs' facts (ignored). What a flag could add is a gesture that passed
+the host's gate **before** the freeze committed and runs after it (a
+`ProcessFile` or a `RequestUpload` crossing the freeze): the gate decides on
+the principal as the request found it. Such a gesture's facts
+(`ChainStarted`, `UploadTicketIssued`) reach `record_facts` in its own
+transaction, where a host that must close that window checks its own closed
+state under its own lock and refuses (`EngineError::PolicyRefused`). An
+extracted image whose upload ticket was issued before the freeze may still
+land on its file (`ImageAvailable`). The freeze stages one impact per file it
+changes: a drive's in-flight files are few.
+
+### Drives from a reaction
+
+`delete_drive` needs the engine's bulk pipeline (`&mut Bulk`), which only a
+mutation registered with `register_bulk` gets. A host deleting a drive from a
+**reaction** calls `br_drive::delete_drive_in_reaction::<H>(cx, drive_id) ->
+DriveDeleted` (since 0.5.1) on the reaction's `Reaction`: the same effects —
+every file deleted with its pages and images in one set-based statement,
+every object released, the running job of each file cancelled, each file's
+`DriveDeleted` fact handed to `record_facts` under the reaction's message
+(`causation_id`, the sender as the actor) — and `DRIVE_NOT_FOUND` for an
+unknown drive (a host making its reaction idempotent looks its own object up
+first, as the example's does). The engine offers a reaction no bulk pipeline
+and no projector reset, and still counts its impacts against
+`impacts_per_commit`: the files are impacted one by one up to
+`BULK_RESET_THRESHOLD`, and past it not at all — live `DriveChanged`
+sessions catch up on the repopulation the host's visibility change stages
+(`impact_principal_facts`, as the example host stages for the owner of a
+retracted workspace), or on their next reset. It takes the `Reaction` rather
+than a bare `Ops` so the facts always name the message that caused them.
 
 The catalogue copy: `drive.known_runner_type` (`runner_type`, `lifecycle`,
 `version`, `seen_at`) is fed by the optional `br_drive::watch_runner_types` —
@@ -653,11 +727,11 @@ writers of one aggregate would hand the same `seq`.
 
 | Noun | Events (`kind`) |
 |---|---|
-| `drive_file` (`FileEvent`) | `UploadTicketIssued { drive_id, path, name, title, media_type, size_bytes }`, `UploadCommitted`, `UploadAbandoned`, `Renamed { from, to }`, `Moved { from_drive, to_drive, from, to }`, `FolderMoved { from_path, to_path }`, `Retitled { from, to }`, `MetadataChanged { metadata }`, `LabelsChanged { added, removed }`, `ImageUploadTicketIssued { name }`, `ImageAvailable { name }`, `ImagesDropped { names }`, `ReportStored { job_id, done }`, `Deleted`, `FolderDeleted { prefix }`, `DriveDeleted` |
+| `drive_file` (`FileEvent`) | `UploadTicketIssued { drive_id, path, name, title, media_type, size_bytes }`, `UploadRulesetChosen { ruleset_id }` (0.5.1), `UploadCommitted`, `UploadAbandoned`, `Renamed { from, to }`, `Moved { from_drive, to_drive, from, to }`, `FolderMoved { from_path, to_path }`, `Retitled { from, to }`, `MetadataChanged { metadata }`, `LabelsChanged { added, removed }`, `ImageUploadTicketIssued { name }`, `ImageAvailable { name }`, `ImagesDropped { names }`, `ReportStored { job_id, done }`, `Deleted`, `FolderDeleted { prefix }`, `DriveDeleted` |
 | `drive_page` (`PageEvent`) | `Reported { job_id, origin }`, `Edited`, `Trimmed` |
 | `drive_label` (`LabelEvent`) | `Created { name, color, description }`, `Updated { name, color, description }`, `Deleted` |
 | `drive_ruleset` (`RulesetEvent`) | `Created { name, trigger, media_types, steps, is_default }`, `Saved { name, media_types, steps, is_default }`, `Deleted` |
-| `drive_file_processing` (`ProcessingEvent`) | `ChainStarted { trigger, ruleset_id, steps }`, `JobCreated { job_id, step_index, runner_type }`, `JobReportedDone { job_id }`, `JobReportedFailed { job_id, reason_code, message }`, `JobFailed { job_id, failure_cause, reason_code, note }`, `JobCancelled { job_id }`, `JobCreationRejected { job_id, reason_code, params }`, `JobCancelSent { job_id }`, `StepSkipped { step_index, runner_type, after_job_id }`, `JobPlanDeclared { job_id, run_id, labels }`, `JobStepStarted { job_id, run_id, index, label, started_at }`, `JobQueued { job_id, runner_type }`, `JobStarted { job_id, run_id }`, `JobCompleted { job_id }`, `JobFactIgnored { job_id, received, why }` |
+| `drive_file_processing` (`ProcessingEvent`) | `ChainStarted { trigger, ruleset_id, steps }`, `JobCreated { job_id, step_index, runner_type }`, `JobReportedDone { job_id }`, `JobReportedFailed { job_id, reason_code, message }`, `JobFailed { job_id, failure_cause, reason_code, note }`, `JobCancelled { job_id }`, `JobCancelledOnFreeze { job_id }` (0.5.1), `JobCreationRejected { job_id, reason_code, params }`, `JobCancelSent { job_id }`, `StepSkipped { step_index, runner_type, after_job_id }`, `JobPlanDeclared { job_id, run_id, labels }`, `JobStepStarted { job_id, run_id, index, label, started_at }`, `JobQueued { job_id, runner_type }`, `JobStarted { job_id, run_id }`, `JobCompleted { job_id }`, `JobFactIgnored { job_id, received, why }` |
 
 Every payload is at schema version 1 (`FILE_EVENT_VERSION`,
 `PAGE_EVENT_VERSION`, `LABEL_EVENT_VERSION`, `RULESET_EVENT_VERSION`,
@@ -855,7 +929,14 @@ drive hangs off, owner-only gate: `workspaceCreate` / `workspaceDelete` /
 `workspaceTransfer`; the `workspace:manage` scope on
 a human passport is its `ManageRulesets` gate, any human reads the rules), the
 embedded `drive` slice (its `ProcessFile` and `CancelProcessing` gates allow a
-workspace's owner, like every per-file gesture), the catalogue watch — started from the `register` closure in
+workspace's owner, like every per-file gesture), `workspaceFreeze` (the
+owner freezes a workspace's drive: `freeze_drive` in a mutation — the example
+stores no closed state of its own), a `retract` command
+(`integration.cmd.workspace.workspace.retract.v1 { workspace_id }`, what a
+roster sends when a person leaves) whose reaction deletes the workspace and
+its drive with `delete_drive_in_reaction`, the workspace view's
+`pendingFileCount` / `processingFileCount` / `failedFileCount` from
+`processing_counts`, the catalogue watch — started from the `register` closure in
 `src/bin/service.rs`, and by the test boot once its fallible steps are done
 (`BootOptions::watch_catalogue`, on by default) — a
 `{"hold": true}` metadata rule refusing to move or delete a file (the per-file

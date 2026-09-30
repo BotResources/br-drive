@@ -9,6 +9,55 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.5.1 — 2026-09-30
+
+Additive only: no signature or behaviour of 0.5.0 changes, and a host on
+0.5.0 upgrades by bumping the pin (one additive migration).
+
+### Added
+
+- **Choosing the upload rule at upload time**: `RequestUpload` takes an
+  optional `rulesetId` — an `upload` rule matching the file's media type,
+  validated as `ProcessFile` validates a named rule (`RULESET_NOT_FOUND`,
+  `RULESET_MISMATCH`), pinned on the pending file
+  (`drive.file.upload_ruleset_id`, migration `9121000012`) and recorded as
+  `FileEvent::UploadRulesetChosen { ruleset_id }` right after
+  `UploadTicketIssued`. The commit's chain (`process_on_commit`) runs it in
+  place of the default; a chosen rule deleted or changed before the commit
+  stores the file `READY`, never processed by the default in its place.
+  Without `rulesetId`, the 0.5.0 gesture runs unchanged. In Rust, the named
+  variant is its own input, `RequestUploadWithRuleset { upload, ruleset_id }`
+  (mutation `drive_request_upload_with_ruleset`): `RequestUpload` keeps its
+  fields.
+- **`processing_counts(conn, &drive_ids)`** beside `file_counts`: each
+  drive's files per processing state, `ProcessingCounts { pending,
+  processing, ready, failed }` (`files()` their sum), in one statement — a
+  host stops reading `drive.file_processing` for its processing and failed
+  counts.
+- **`freeze_drive(ops, &meta, drive_id) -> DriveFrozen { cancelled,
+  abandoned }`**, in the host's own gesture and transaction: every running
+  processing of the drive ends as a cancel — `job.cancel.v2` staged,
+  `JobCancelSent` then the new `ProcessingEvent::JobCancelledOnFreeze`, the
+  file `FAILED` `cancelled` at once, so the runner's next call is
+  `JOB_NOT_ACTIVE` and Jobs' own `cancelled` is recorded as ignored — and
+  every pending upload is abandoned as its deadline would (`UploadAbandoned`,
+  blob released). No frozen flag is stored: the host's gate refuses new
+  gestures, and a gesture crossing the freeze is the host's to refuse in
+  `record_facts` (README, "Freezing a drive").
+- **`delete_drive_in_reaction(cx, drive_id)`**: `delete_drive` from a host
+  **reaction**, which the engine gives no bulk pipeline — the same effects
+  (files, objects, running jobs cancelled, `DriveDeleted` facts under the
+  reaction's message), impacts file by file up to `BULK_RESET_THRESHOLD`
+  and none past it (a reaction can stage no projector reset).
+- The example host: `workspaceFreeze`, a `retract` command whose reaction
+  deletes a workspace and its drive, and the workspace view's
+  `pendingFileCount`, `processingFileCount`, `failedFileCount`; e2e for each
+  capability.
+
+### Changed
+
+- README: the engine compatibility table gains its 0.5 row (`v0.3.4`).
+
 ## 0.5.0 — 2026-09-30
 
 State tables only, soft-EDA: the library ships **no fact table** any more.
