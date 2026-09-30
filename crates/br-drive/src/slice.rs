@@ -181,24 +181,34 @@ macro_rules! drive_slice {
                     size: $crate::ByteCount,
                     sha256: ::std::string::String,
                     title: ::core::option::Option<::std::string::String>,
+                    ruleset_id: ::core::option::Option<::uuid::Uuid>,
                 ) -> ::async_graphql::Result<$crate::UploadTicket> {
-                    ::core::result::Result::Ok(
-                        ::service_engine::execute::<$p, $crate::RequestUpload>(
-                            ctx,
-                            $crate::RequestUpload {
-                                file_id,
-                                drive_id,
-                                path,
-                                name,
-                                title,
-                                media_type,
-                                size: size.0,
-                                sha256_hex: sha256,
-                            },
-                        )
-                        .await?
-                        .into_inner(),
-                    )
+                    let upload = $crate::RequestUpload {
+                        file_id,
+                        drive_id,
+                        path,
+                        name,
+                        title,
+                        media_type,
+                        size: size.0,
+                        sha256_hex: sha256,
+                    };
+                    // No rule named: exactly the 0.5.0 gesture.
+                    ::core::result::Result::Ok(match ruleset_id {
+                        ::core::option::Option::None => {
+                            ::service_engine::execute::<$p, $crate::RequestUpload>(ctx, upload)
+                                .await?
+                                .into_inner()
+                        }
+                        ::core::option::Option::Some(ruleset_id) => {
+                            ::service_engine::execute::<$p, $crate::RequestUploadWithRuleset>(
+                                ctx,
+                                $crate::RequestUploadWithRuleset { upload, ruleset_id },
+                            )
+                            .await?
+                            .into_inner()
+                        }
+                    })
                 }
 
                 async fn [<$prefix _commit_upload>](

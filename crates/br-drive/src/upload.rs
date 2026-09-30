@@ -69,11 +69,44 @@ impl MutationInput for RequestUpload {
     const NAME: &'static str = "drive_request_upload";
 }
 
+/// `RequestUpload` naming the `upload` rule the commit runs (the GraphQL
+/// root's `rulesetId`): an `upload` rule matching the file's media type
+/// (`RULESET_NOT_FOUND`, `RULESET_MISMATCH`), pinned on the pending file.
+/// Without one, `RequestUpload` pins nothing and the commit runs the default
+/// `upload` rule matching the file, as in 0.5.0. Since 0.5.1.
+#[derive(Debug, Deserialize)]
+pub struct RequestUploadWithRuleset {
+    #[serde(flatten)]
+    pub upload: RequestUpload,
+    pub ruleset_id: Uuid,
+}
+
+impl MutationInput for RequestUploadWithRuleset {
+    type Output = OneShot<UploadTicket>;
+    type Error = DriveFault;
+    const NAME: &'static str = "drive_request_upload_with_ruleset";
+}
+
 pub fn request_upload<'m, H: DriveHost>(
     cx: &'m mut Mutation<'m, H>,
     input: RequestUpload,
 ) -> BoxFuture<'m, Result<OneShot<UploadTicket>, DriveFault>> {
-    Box::pin(async move {
+    Box::pin(request_upload_in(cx, input, None))
+}
+
+pub fn request_upload_with_ruleset<'m, H: DriveHost>(
+    cx: &'m mut Mutation<'m, H>,
+    input: RequestUploadWithRuleset,
+) -> BoxFuture<'m, Result<OneShot<UploadTicket>, DriveFault>> {
+    Box::pin(request_upload_in(cx, input.upload, Some(input.ruleset_id)))
+}
+
+async fn request_upload_in<H: DriveHost>(
+    cx: &mut Mutation<'_, H>,
+    input: RequestUpload,
+    upload_ruleset: Option<Uuid>,
+) -> Result<OneShot<UploadTicket>, DriveFault> {
+    {
         // The file id is the source entity every job of the file names, and
         // Jobs accepts only a UUIDv7 there: anything else would fail every
         // chain of the file for good.
@@ -104,6 +137,11 @@ pub fn request_upload<'m, H: DriveHost>(
         cx.load::<DriveRow>(&input.drive_id)
             .await?
             .ok_or(DriveFault::Refused(codes::DRIVE_NOT_FOUND))?;
+        if let Some(id) = upload_ruleset {
+            // Validated as `ProcessFile` validates a named rule: it exists,
+            // carries the `upload` trigger and matches the media type.
+            select_ruleset(cx.connection(), Trigger::Upload, &media_type, Some(id)).await?;
+        }
         let taken = store::sibling_names(cx.connection(), input.drive_id, &path).await?;
         let name = name.first_free(&taken);
         let blob = cx.blob_verified::<DriveSource>(
@@ -131,6 +169,7 @@ pub fn request_upload<'m, H: DriveHost>(
             estimated_tokens: None,
             ruleset_id: None,
             steps: None,
+            upload_ruleset_id: upload_ruleset,
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,
@@ -152,6 +191,9 @@ pub fn request_upload<'m, H: DriveHost>(
             },
             &meta,
         );
+        if let Some(ruleset_id) = upload_ruleset {
+            file.record(FileEvent::UploadRulesetChosen { ruleset_id }, &meta);
+        }
         facts::create(cx, &mut file).await?;
         crate::file::file_changed::<H>(cx, &file, FileCause::UploadRequested)?;
         let window = TimeDelta::from_std(cx.principal().upload_window()).map_err(|_| {
@@ -162,7 +204,7 @@ pub fn request_upload<'m, H: DriveHost>(
         let deadline = cx.now() + window;
         cx.schedule_at(deadline, UploadDeadline::<H>::new(file.id))?;
         Ok(OneShot(UploadTicket::new(file.id, blob.upload_url())))
-    })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,8 +246,7 @@ pub fn commit_upload<'m, H: DriveHost>(
         facts::save(cx, &mut file).await?;
         crate::file::file_changed::<H>(cx, &file, FileCause::UploadCommitted)?;
         if cx.principal().process_on_commit() && file.process_gate(cx.principal()).is_allowed() {
-            let rule =
-                select_ruleset(cx.connection(), Trigger::Upload, &file.media_type, None).await?;
+            let rule = commit_rule(cx.connection(), &file).await?;
             if let Some(rule) = rule {
                 let initiator = processing::Initiator::of(cx.principal());
                 processing::start_chain(
@@ -221,6 +262,28 @@ pub fn commit_upload<'m, H: DriveHost>(
         }
         Ok(())
     })
+}
+
+/// The rule the commit's chain runs: the one the uploader chose, while it
+/// still carries the `upload` trigger and matches the file — a chosen rule
+/// deleted or changed since leaves the file stored only, never processed by
+/// the default in its place — else the default `upload` rule matching the
+/// file.
+async fn commit_rule<H>(
+    conn: &mut sqlx::PgConnection,
+    file: &FileRow<H>,
+) -> Result<Option<crate::ruleset::RulesetRow>, DriveFault> {
+    let Some(chosen) = file.upload_ruleset_id else {
+        return select_ruleset(conn, Trigger::Upload, &file.media_type, None).await;
+    };
+    match select_ruleset(conn, Trigger::Upload, &file.media_type, Some(chosen)).await {
+        Err(DriveFault::Refused(reason))
+            if reason == codes::RULESET_NOT_FOUND || reason == codes::RULESET_MISMATCH =>
+        {
+            Ok(None)
+        }
+        selected => selected,
+    }
 }
 
 /// A live storage HEAD: the pending file's object is present and is the

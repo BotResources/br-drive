@@ -80,6 +80,35 @@ pub async fn request_with_hash(
         .await
 }
 
+const REQUEST_WITH_RULESET: &str = "mutation($f:UUID!,$d:UUID!,$p:String!,$n:String!,$m:String!,$s:ByteCount!,$h:String!,$r:UUID){\
+    workspaceRequestUpload(fileId:$f,driveId:$d,path:$p,name:$n,mediaType:$m,size:$s,sha256:$h,rulesetId:$r){fileId url fields}}";
+
+/// `RequestUpload` naming the `upload` rule its commit runs.
+pub async fn request_with_ruleset(
+    world: &World,
+    passport: &str,
+    file_id: Uuid,
+    request: &UploadRequest<'_>,
+    ruleset: Uuid,
+) -> serde_json::Value {
+    world
+        .gql(
+            passport,
+            REQUEST_WITH_RULESET,
+            serde_json::json!({
+                "f": file_id,
+                "d": request.drive,
+                "p": request.path,
+                "n": request.name,
+                "m": request.media_type,
+                "s": request.bytes.len(),
+                "h": sha256_hex(request.bytes),
+                "r": ruleset,
+            }),
+        )
+        .await
+}
+
 pub fn ticket(response: &serde_json::Value) -> Ticket {
     let post = &ok(response)["workspaceRequestUpload"];
     Ticket {

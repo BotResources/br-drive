@@ -148,6 +148,11 @@ pub enum ProcessingEvent {
         received: serde_json::Value,
         why: String,
     },
+    /// The host froze the file's drive while the job ran: the job ended
+    /// here, cancelled, right after its `job.cancel` was sent
+    /// (`JobCancelSent`); Jobs' own `cancelled`, when it comes, changes
+    /// nothing. Since 0.5.1.
+    JobCancelledOnFreeze { job_id: Uuid },
 }
 
 impl DriveEvent for ProcessingEvent {
@@ -162,6 +167,7 @@ impl DriveEvent for ProcessingEvent {
             Self::JobReportedFailed { .. } => "JobReportedFailed",
             Self::JobFailed { .. } => "JobFailed",
             Self::JobCancelled { .. } => "JobCancelled",
+            Self::JobCancelledOnFreeze { .. } => "JobCancelledOnFreeze",
             Self::JobCreationRejected { .. } => "JobCreationRejected",
             Self::JobCancelSent { .. } => "JobCancelSent",
             Self::StepSkipped { .. } => "StepSkipped",
@@ -686,6 +692,18 @@ impl<H> FileProcessing<H> {
         self.push(ProcessingEvent::JobCancelSent { job_id }, meta);
     }
 
+    /// The host froze the file's drive: the cancel of the running job is
+    /// sent (`JobCancelSent`, the caller stages `job.cancel`) and the job ends
+    /// here, cancelled (`JobCancelledOnFreeze`) — the file is FAILED
+    /// `cancelled` at once, so the runner's next call meets a job that no
+    /// longer runs, and Jobs' own `cancelled` is recorded as ignored.
+    pub(crate) fn cancel_on_freeze(&mut self, meta: &FactMeta) {
+        let job_id = self.job_id;
+        self.request_cancel(meta);
+        self.end(Some((CANCELLED.to_string(), None)), meta);
+        self.push(ProcessingEvent::JobCancelledOnFreeze { job_id }, meta);
+    }
+
     /// Whether a user asked to cancel the running job.
     pub(crate) fn cancel_requested(&self) -> bool {
         self.cancel_requested_at.is_some()
@@ -1079,6 +1097,30 @@ mod tests {
         };
         assert_eq!(why, why::JOB_ALREADY_ENDED);
         assert_eq!(received["kind"], "JobFailed");
+    }
+
+    #[test]
+    fn a_freeze_sends_the_cancel_and_ends_the_job_there_so_jobs_cancelled_changes_nothing() {
+        let mut processing = running();
+        let job = processing.job_id;
+        processing.cancel_on_freeze(&meta());
+        assert_eq!(
+            kinds(&processing),
+            vec![
+                "ChainStarted",
+                "JobCreated",
+                "JobCancelSent",
+                "JobCancelledOnFreeze"
+            ]
+        );
+        assert_eq!(processing.state, ProcessingState::Failed);
+        assert_eq!(processing.error_code.as_deref(), Some(CANCELLED));
+        assert_eq!(
+            processing.receive(job, Received::Cancelled, &meta()),
+            Applied::Ignored,
+            "Jobs' own cancelled confirms a job already ended"
+        );
+        assert_eq!(processing.state, ProcessingState::Failed);
     }
 
     #[test]

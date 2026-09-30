@@ -63,3 +63,13 @@ impl From<EngineError> for ReactionFault {
         }
     }
 }
+
+#[cfg(feature = "drive")]
+impl From<br_drive::DriveFault> for ReactionFault {
+    fn from(fault: br_drive::DriveFault) -> Self {
+        match fault {
+            br_drive::DriveFault::Refused(reason) => Self::Terminal(reason.code().to_string()),
+            br_drive::DriveFault::Engine(error) => Self::from(error),
+        }
+    }
+}

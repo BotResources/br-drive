@@ -19,6 +19,9 @@ pub struct WorkspaceView {
     pub created_at: DateTime<Utc>,
     pub file_count: i64,
     pub ready_file_count: i64,
+    pub pending_file_count: i64,
+    pub processing_file_count: i64,
+    pub failed_file_count: i64,
     pub affordances: Affordances,
 }
 
@@ -54,6 +57,9 @@ impl Projector for WorkspacesView {
             created_at: row.created_at,
             file_count: row.file_count,
             ready_file_count: row.ready_file_count,
+            pending_file_count: row.pending_file_count,
+            processing_file_count: row.processing_file_count,
+            failed_file_count: row.failed_file_count,
             affordances: row.affordances(principal),
         })
     }

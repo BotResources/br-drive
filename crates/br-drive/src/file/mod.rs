@@ -63,6 +63,7 @@ pub(crate) mod tests_support {
             estimated_tokens: None,
             ruleset_id: None,
             steps: None,
+            upload_ruleset_id: None,
             created_by: Uuid::now_v7(),
             created_at: now,
             updated_at: now,

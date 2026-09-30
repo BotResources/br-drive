@@ -539,6 +539,57 @@ impl World {
         .expect("the stream acks the redelivered deadline");
     }
 
+    /// A roster's `retract` command for `workspace`, published on the host's
+    /// command subject as a service would; answers its message id.
+    pub async fn send_retract(&self, workspace: Uuid) -> Uuid {
+        use br_core_integration::{Actor, EventMetadata, IntegrationCommand, ServiceAccountId};
+        let message_id = Uuid::now_v7();
+        let command = IntegrationCommand::new(
+            message_id,
+            "workspace.retract",
+            1,
+            chrono::Utc::now(),
+            EventMetadata::new(
+                Actor::Service(ServiceAccountId::from(Uuid::now_v7())),
+                Uuid::now_v7(),
+            ),
+            br_drive_example::slices::workspace::RetractWorkspace {
+                workspace_id: workspace,
+            },
+        );
+        let bytes = serde_json::to_vec(&command).expect("the command encodes");
+        let client = async_nats::connect(self.nats_server.url())
+            .await
+            .expect("dial the ephemeral broker");
+        let js = async_nats::jetstream::new(client);
+        js.publish(
+            format!(
+                "integration.cmd.{}.workspace.{}.v1",
+                br_drive_example::SERVICE,
+                br_drive_example::slices::workspace::RETRACT_VERB
+            ),
+            bytes.into(),
+        )
+        .await
+        .expect("publish the retract command")
+        .await
+        .expect("the stream acks the retract command");
+        message_id
+    }
+
+    /// The workspace's file counts, as its host view shows them.
+    pub async fn workspace_counts(&self, passport: &str, workspace: Uuid) -> serde_json::Value {
+        let response = self
+            .gql(
+                passport,
+                "query($id:UUID!){workspaceWorkspace(id:$id){fileCount readyFileCount \
+                 pendingFileCount processingFileCount failedFileCount}}",
+                serde_json::json!({ "id": workspace }),
+            )
+            .await;
+        ok(&response)["workspaceWorkspace"].clone()
+    }
+
     pub async fn cleanup(self) {
         self.service.shutdown().await;
         self.db.cleanup().await;
@@ -855,7 +906,7 @@ fn end_kind(event_type: &str) -> Option<&'static str> {
         "JobReportedDone" => Some("reported_done"),
         "JobReportedFailed" => Some("reported_failed"),
         "JobFailed" => Some("failed"),
-        "JobCancelled" => Some("cancelled"),
+        "JobCancelled" | "JobCancelledOnFreeze" => Some("cancelled"),
         "JobCreationRejected" => Some("creation_rejected"),
         _ => None,
     }

@@ -1,14 +1,16 @@
 use chrono::{DateTime, Utc};
+use contract_jobs::command::CancelJob;
 use futures_util::future::BoxFuture;
 use service_engine::error::EngineError;
 use service_engine::persistence::{Aggregate, Persistence, PersistenceStyle};
-use service_engine::pipeline::{Bulk, Ops};
+use service_engine::pipeline::{Bulk, Ops, Reaction};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
+use crate::facts::{self, FactMeta};
 use crate::fault::{DriveFault, codes};
-use crate::file::{FileCause, FileEvent, FileRow, store};
-use crate::folders::{delete_rows, impact_rows};
+use crate::file::{File, FileCause, FileEvent, FileRow, store};
+use crate::folders::{delete_rows, delete_rows_as, impact_rows};
 use crate::host::DriveHost;
 use crate::owner::{DriveOwnerObject, NoDriveOwner, OwnerObject};
 
@@ -169,15 +171,133 @@ pub async fn delete_drive<H: DriveHost>(
     cx: &mut Bulk<'_, H>,
     id: Uuid,
 ) -> Result<DriveDeleted, DriveFault> {
+    let (drive, files) = drive_and_files::<H>(cx, id).await?;
+    delete_rows(cx, &files, FileEvent::DriveDeleted).await?;
+    cx.delete(&drive).await?;
+    let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
+    impact_rows(cx, id, &ids, FileCause::DriveDeleted)?;
+    Ok(DriveDeleted { files: files.len() })
+}
+
+/// `delete_drive` from a **reaction** of the host (a roster retraction that
+/// removes a person's collection, say), in the reaction's transaction: the
+/// same effects — every file deleted with its pages and images, every object
+/// released, the running job of each file cancelled (`job.cancel`), each
+/// file's `DriveDeleted` fact handed to the host under the reaction's
+/// message (`FactMeta::of_reaction`) — and `DRIVE_NOT_FOUND` for an unknown
+/// drive. The engine offers no bulk pipeline to a reaction, and a reaction
+/// cannot stage a projector reset: live sessions are told file by file up to
+/// `BULK_RESET_THRESHOLD`, and past it catch up on their next repopulation —
+/// the one a host's visibility change stages (`impact_principal_facts`), or
+/// their next reset. Since 0.5.1.
+pub async fn delete_drive_in_reaction<H: DriveHost>(
+    cx: &mut Reaction<'_>,
+    id: Uuid,
+) -> Result<DriveDeleted, DriveFault> {
+    let meta = FactMeta::of_reaction(cx);
+    let (drive, files) = drive_and_files::<H>(cx, id).await?;
+    delete_rows_as::<H>(cx, &meta, &files, FileEvent::DriveDeleted).await?;
+    cx.delete(&drive).await?;
+    crate::owner::touch::<H>(cx, id)?;
+    if files.len() <= H::BULK_RESET_THRESHOLD {
+        for file in &files {
+            cx.impact_caused::<File, _>(&file.id, &FileCause::DriveDeleted)?;
+        }
+    }
+    Ok(DriveDeleted { files: files.len() })
+}
+
+/// The drive, locked, and every file of it, locked, in the engine's order.
+async fn drive_and_files<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    id: Uuid,
+) -> Result<(DriveRow, Vec<FileRow<H>>), DriveFault> {
     let drive = cx
         .load::<DriveRow>(&id)
         .await?
         .ok_or(DriveFault::Refused(codes::DRIVE_NOT_FOUND))?;
     let ids = store::ids_in_drive(cx.connection(), id).await?;
     let files = cx.load_many::<FileRow<H>>(&ids).await?;
-    delete_rows(cx, &files, FileEvent::DriveDeleted).await?;
-    cx.delete(&drive).await?;
-    let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
-    impact_rows(cx, id, &ids, FileCause::DriveDeleted)?;
-    Ok(DriveDeleted { files: files.len() })
+    Ok((drive, files))
+}
+
+/// What a drive freeze ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DriveFrozen {
+    /// Running processings ended, cancelled.
+    pub cancelled: usize,
+    /// Pending uploads abandoned.
+    pub abandoned: usize,
+}
+
+/// Freezes a drive, in the host's own gesture and transaction — a mutation,
+/// a bulk mutation or a reaction, `meta` its hand (`FactMeta::of` for a
+/// principal, `FactMeta::of_reaction` for a reaction): so a host can close a
+/// collection with no work landing on it afterwards.
+///
+/// - Every running processing of the drive's files ends, as a cancel:
+///   `job.cancel` is staged for the job and the job ends here, cancelled —
+///   `JobCancelSent` then `JobCancelledOnFreeze` on the file's processing,
+///   the file `FAILED` `cancelled` at once. The runner's next call about the
+///   job meets `JOB_NOT_ACTIVE`, the next step of its chain is never
+///   launched, and Jobs' own `cancelled` (or any later end) is recorded as
+///   `JobFactIgnored` and changes nothing — even when Jobs drops the cancel.
+/// - Every pending upload of the drive (`committed_at` unset) is abandoned
+///   as its upload deadline would: `UploadAbandoned`, the row deleted, its
+///   blob released; a later commit meets `FILE_NOT_FOUND`.
+///
+/// Every fact reaches the host through `record_facts`, in this transaction.
+/// Stored, processed and failed files are untouched, and the library stores
+/// no "frozen" flag: the host's gate keeps refusing new gestures on the
+/// drive. A gesture that passed that gate before the freeze committed and
+/// runs after it (a `ProcessFile`, a `RequestUpload` crossing the freeze) is
+/// the host's to refuse: its facts reach `record_facts` in its own
+/// transaction, where the host can check its own closed state under its own
+/// lock and refuse (an `EngineError::PolicyRefused`). Freezing again ends
+/// nothing more. `DRIVE_NOT_FOUND` for an unknown drive. One impact per file
+/// it changes (a drive's in-flight files are few). Since 0.5.1.
+pub async fn freeze_drive<H: DriveHost>(
+    ops: &mut Ops<'_>,
+    meta: &FactMeta,
+    id: Uuid,
+) -> Result<DriveFrozen, DriveFault> {
+    ops.load::<DriveRow>(&id)
+        .await?
+        .ok_or(DriveFault::Refused(codes::DRIVE_NOT_FOUND))?;
+    let ids = store::ids_in_flight(ops.connection(), id).await?;
+    let mut files = ops.load_many::<FileRow<H>>(&ids).await?;
+    // Each file's processing is locked after every file, in key order.
+    files.sort_by_key(|file| file.id);
+    let mut frozen = DriveFrozen::default();
+    for mut file in files {
+        if file.committed_at.is_none() {
+            store::hand_gone::<H>(ops.connection(), meta, &file, FileEvent::UploadAbandoned)
+                .await?;
+            ops.delete(&file).await?;
+            crate::file::file_changed::<H>(ops, &file, FileCause::UploadAbandoned)?;
+            frozen.abandoned += 1;
+            continue;
+        }
+        let Some(job_id) = file.active_job().map(|job| job.job_id) else {
+            // It settled between the read and the lock.
+            continue;
+        };
+        let mut processing = crate::processing::load_processing(ops, &file).await?;
+        processing.cancel_on_freeze(meta);
+        ops.command(crate::processing::JobCancel {
+            payload: CancelJob { job_id },
+        })?;
+        facts::save(ops, &mut processing).await?;
+        file.status = processing.status();
+        file.updated_at = file.updated_at.max(processing.updated_at);
+        crate::file::file_changed::<H>(
+            ops,
+            &file,
+            FileCause::ProcessingFailed {
+                reason: crate::processing::CANCELLED.to_string(),
+            },
+        )?;
+        frozen.cancelled += 1;
+    }
+    Ok(frozen)
 }

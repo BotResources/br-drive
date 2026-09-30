@@ -30,7 +30,10 @@ pub use catalogue::{
     CatalogueWatch, DriveRunnerType, DriveRunnerTypeLifecycle, known_runner_types,
     watch_runner_types, watch_runner_types_of,
 };
-pub use drive::{DriveDeleted, create_drive, create_unowned_drive, delete_drive};
+pub use drive::{
+    DriveDeleted, DriveFrozen, create_drive, create_unowned_drive, delete_drive,
+    delete_drive_in_reaction, freeze_drive,
+};
 pub use erase::{DriveErasure, EraseMode, REDACTED_PERSON};
 pub use facts::{ActorKind, DriveFact, FactMeta};
 pub use fault::{DriveFault, DriveReactionFault, codes};
@@ -54,7 +57,8 @@ pub use label::{
 };
 pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
 pub use owner::{
-    DriveOwnerNoun, DriveOwnerObject, FileCounts, NoDriveOwner, OwnerObject, Unowned, file_counts,
+    DriveOwnerNoun, DriveOwnerObject, FileCounts, NoDriveOwner, OwnerObject, ProcessingCounts,
+    Unowned, file_counts, processing_counts,
 };
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
 pub use processing::{
@@ -75,7 +79,7 @@ pub use runner::{
     RunnerSource, RunnerSources, RunnerWindow, runner_context, scoped_to_job,
 };
 pub use title::{FileTitle, InvalidTitle, MAX_TITLE_CHARS};
-pub use upload::{CommitUpload, RequestUpload, UploadTicket};
+pub use upload::{CommitUpload, RequestUpload, RequestUploadWithRuleset, UploadTicket};
 
 pub const NAME: &str = "drive";
 pub const SCHEMA: &str = "drive";

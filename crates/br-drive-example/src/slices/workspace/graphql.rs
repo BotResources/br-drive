@@ -67,6 +67,12 @@ impl WorkspaceMutation {
     }
 
     #[cfg(feature = "drive")]
+    async fn workspace_freeze(&self, ctx: &Context<'_>, id: Uuid) -> Result<MutationAck> {
+        use super::mutations::FreezeWorkspace;
+        service_engine::ack::<AppPrincipal, FreezeWorkspace>(ctx, FreezeWorkspace { id }).await
+    }
+
+    #[cfg(feature = "drive")]
     async fn workspace_annotate_file(
         &self,
         ctx: &Context<'_>,
