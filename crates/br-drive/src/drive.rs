@@ -30,24 +30,6 @@ impl Persistence for DriveStore {
 
     const STYLE: PersistenceStyle = PersistenceStyle::Crud;
 
-    fn load<'a>(
-        conn: &'a mut PgConnection,
-        key: &'a Uuid,
-    ) -> BoxFuture<'a, Result<Option<DriveRow>, EngineError>> {
-        Box::pin(async move {
-            let row =
-                sqlx::query("SELECT id, created_by, created_at FROM drive.drive WHERE id = $1")
-                    .bind(key)
-                    .fetch_optional(conn)
-                    .await?;
-            Ok(row.map(|row| DriveRow {
-                id: row.get("id"),
-                created_by: row.get("created_by"),
-                created_at: row.get("created_at"),
-            }))
-        })
-    }
-
     fn lock<'a>(
         conn: &'a mut PgConnection,
         key: &'a Uuid,

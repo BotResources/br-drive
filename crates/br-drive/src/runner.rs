@@ -3,16 +3,15 @@ use std::marker::PhantomData;
 
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use service_engine::BlobRef;
 use service_engine::blobs::{Sha256Digest, UploadExpectation};
 use service_engine::error::EngineError;
 use service_engine::name::ProjectorName;
-use service_engine::persistence::Persistence;
+use service_engine::persistence::PersistenceExt;
 use service_engine::pipeline::{Mutation, MutationInput, OneShot, Ops};
 use service_engine::population::Population;
 use service_engine::view::{Populate, Projector};
 use service_engine::visibility::Unrestricted;
-use sqlx::PgPool;
+use service_engine::{BlobRef, Query};
 use uuid::Uuid;
 
 use crate::blob::DriveImage;
@@ -95,14 +94,17 @@ impl<H: DriveHost> Projector for RunnerSources<H> {
         // The population is the one file the runner's job names, and only
         // while that job is the file's active one: the presign re-checks what
         // `runner_context` checked, it never widens it.
-        let Ok((file_id, job_id)) = RUNNER_JOB.try_with(|scope| *scope) else {
+        let Ok(RunnerScope {
+            file_id, job_id, ..
+        }) = RUNNER_JOB.try_with(|scope| *scope)
+        else {
             return Ok(Population::Keys(BTreeSet::new()));
         };
         if query.file_id.is_some_and(|wanted| wanted != file_id) {
             return Ok(Population::Keys(BTreeSet::new()));
         }
         let mut conn = cx.pool().acquire().await.map_err(EngineError::from)?;
-        let active = <FileStore<H> as Persistence>::load(&mut conn, &file_id)
+        let active = FileStore::<H>::load(&mut conn, &file_id)
             .await?
             .is_some_and(|file| file.require_active_job(job_id).is_ok());
         let keys = if active {
@@ -116,27 +118,58 @@ impl<H: DriveHost> Projector for RunnerSources<H> {
     fn project(row: &FileRow<H>, _principal: &H) -> Result<RunnerSource, EngineError> {
         Ok(RunnerSource { file_id: row.id })
     }
+
+    /// The gate of every read of a runner source, the presign
+    /// (`Query::download` gates on the row, not on the population) and the
+    /// runner context's read: a runner, reading inside a runner scope, the
+    /// job's own file — and, for the presign (`scoped_to_job`), only while
+    /// that job is the file's active one. The context read checks the job
+    /// itself, so it answers `JOB_NOT_ACTIVE` rather than hide the file. No
+    /// scope, no row: the gate fails closed.
+    fn visible(row: &FileRow<H>, principal: &H) -> bool {
+        principal.is_runner()
+            && RUNNER_JOB
+                .try_with(|scope| {
+                    row.id == scope.file_id
+                        && (!scope.require_active || row.require_active_job(scope.job_id).is_ok())
+                })
+                .unwrap_or(false)
+    }
+}
+
+/// The runner read in flight: the file its job names, the job, and whether
+/// the gate itself requires the job to be the file's active one.
+#[derive(Debug, Clone, Copy)]
+struct RunnerScope {
+    file_id: Uuid,
+    job_id: Uuid,
+    require_active: bool,
 }
 
 tokio::task_local! {
-    static RUNNER_JOB: (Uuid, Uuid);
+    static RUNNER_JOB: RunnerScope;
 }
 
-/// Runs `presign` with the runner source population scoped to `file_id` and
-/// `job_id`. The engine asks a view's population without the key it is about
-/// to serve, so the runner context resolver names the job's own file here
-/// rather than letting the population cover every in-flight file. Engine 0.3.0
-/// polls the population inside the `download` future itself (no spawned
-/// task); were it ever to move to another task, the population would read no
-/// scope and be empty — the runner would get `SOURCE_NOT_AVAILABLE`, never a
-/// wider presign. Not a host API: the `drive_slice!` expansion calls it.
+/// Runs `presign` with the runner source gate scoped to `file_id` and
+/// `job_id`: the presign's visibility check (`RunnerSources::visible`) and
+/// population admit only the job's own file while that job is its active
+/// one. Engine 0.4.0 runs the check inside the `download` future itself (no
+/// spawned task); were it ever to move to another task, the check would read
+/// no scope and admit no row — the runner would get `SOURCE_NOT_AVAILABLE`,
+/// never a wider presign. Not a host API: the `drive_slice!` expansion calls
+/// it.
 #[doc(hidden)]
 pub async fn scoped_to_job<F: std::future::Future>(
     file_id: Uuid,
     job_id: Uuid,
     presign: F,
 ) -> F::Output {
-    RUNNER_JOB.scope((file_id, job_id), presign).await
+    let scope = RunnerScope {
+        file_id,
+        job_id,
+        require_active: true,
+    };
+    RUNNER_JOB.scope(scope, presign).await
 }
 
 fn runner_only<H: DriveHost>(principal: &H) -> Result<(), DriveFault> {
@@ -147,31 +180,53 @@ fn runner_only<H: DriveHost>(principal: &H) -> Result<(), DriveFault> {
     }
 }
 
+/// What a runner reads of the file its job processes: the file, its pages
+/// and its image names, read in one snapshot behind the runner source gate
+/// (`Query::behind`). The runner scope is required, then the file, then the
+/// job as the file's active one (`JOB_NOT_ACTIVE`).
 pub async fn runner_context<H: DriveHost>(
-    pool: &PgPool,
+    query: &Query<'_, H>,
     principal: &H,
     file_id: Uuid,
     job_id: Uuid,
-) -> Result<RunnerContext, DriveFault> {
-    runner_only(principal)?;
-    let mut conn = pool.acquire().await.map_err(EngineError::from)?;
-    let file = <FileStore<H> as Persistence>::load(&mut conn, &file_id)
-        .await?
-        .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
-    file.require_active_job(job_id)?;
-    let pages = read_pages(&mut conn, file.id).await?;
-    let images = image_names_of(&mut conn, file.id).await?;
-    Ok(RunnerContext {
-        file_id: file.id,
-        media_type: file.media_type.as_str().to_string(),
-        name: file.name.as_str().to_string(),
-        page_count: file.page_count,
-        summary: file.summary.clone(),
-        pages,
-        images,
-        source_url: None,
-        source: file.blob_ref,
-    })
+) -> async_graphql::Result<RunnerContext> {
+    runner_only(principal).map_err(DriveFault::into_graphql)?;
+    let scope = RunnerScope {
+        file_id,
+        job_id,
+        require_active: false,
+    };
+    let behind = query.behind::<RunnerSources<H>>(&file_id);
+    let read = RUNNER_JOB
+        .scope(
+            scope,
+            behind.read(|file, conn| {
+                Box::pin(async move {
+                    if let Err(reason) = file.require_active_job(job_id) {
+                        return Ok(Err(DriveFault::Refused(reason)));
+                    }
+                    let pages = read_pages(&mut *conn, file.id).await?;
+                    let images = image_names_of(&mut *conn, file.id).await?;
+                    Ok(Ok(RunnerContext {
+                        file_id: file.id,
+                        media_type: file.media_type.as_str().to_string(),
+                        name: file.name.as_str().to_string(),
+                        page_count: file.page_count,
+                        summary: file.summary.clone(),
+                        pages,
+                        images,
+                        source_url: None,
+                        source: file.blob_ref,
+                    }))
+                })
+            }),
+        )
+        .await?;
+    match read {
+        Some(Ok(context)) => Ok(context),
+        Some(Err(fault)) => Err(fault.into_graphql()),
+        None => Err(DriveFault::Refused(codes::FILE_NOT_FOUND).into_graphql()),
+    }
 }
 
 #[derive(Debug, Deserialize)]

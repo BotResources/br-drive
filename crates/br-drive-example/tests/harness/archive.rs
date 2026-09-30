@@ -56,25 +56,29 @@ impl Principal for ArchivePrincipal {
 }
 
 impl PassportPrincipal for ArchivePrincipal {
-    fn from_passport(
-        pg: &PgPool,
-        passport: Passport,
-    ) -> BoxFuture<'_, Result<Self, PrincipalRejected>> {
-        Box::pin(async move {
-            let id = passport
-                .user_id()
-                .or_else(|| passport.service_account_id())
-                .ok_or_else(|| PrincipalRejected::new("the passport names no subject"))?;
-            let drives = drives_of(pg, id)
-                .await
-                .map_err(|e| PrincipalRejected::new(e.to_string()))?;
-            Ok(Self {
-                id: PrincipalId::from(id),
-                passport,
-                drives,
-            })
+    /// The passport alone: the drives the person created are a database
+    /// fact, read by the loader registered at boot.
+    fn from_passport(passport: Passport) -> Result<Self, PrincipalRejected> {
+        let id = passport
+            .user_id()
+            .or_else(|| passport.service_account_id())
+            .ok_or_else(|| PrincipalRejected::new("the passport names no subject"))?;
+        Ok(Self {
+            id: PrincipalId::from(id),
+            passport,
+            drives: Vec::new(),
         })
     }
+}
+
+fn load_drives<'a>(
+    pg: &'a PgPool,
+    principal: &'a mut ArchivePrincipal,
+) -> BoxFuture<'a, Result<(), EngineError>> {
+    Box::pin(async move {
+        principal.drives = drives_of(pg, principal.id.as_uuid()).await?;
+        Ok(())
+    })
 }
 
 struct ArchiveResolver;
@@ -82,15 +86,14 @@ struct ArchiveResolver;
 impl PrincipalResolver<ArchivePrincipal> for ArchiveResolver {
     fn resolve<'a>(
         &'a self,
-        pg: &'a PgPool,
+        _pg: &'a PgPool,
         current: &'a ArchivePrincipal,
     ) -> BoxFuture<'a, Result<Option<ArchivePrincipal>, EngineError>> {
         Box::pin(async move {
-            let drives = drives_of(pg, current.id.as_uuid()).await?;
             Ok(Some(ArchivePrincipal {
                 id: current.id,
                 passport: current.passport.clone(),
-                drives,
+                drives: Vec::new(),
             }))
         })
     }
@@ -222,6 +225,9 @@ impl ArchiveHost {
                 },
             )
             .expect("register the reaction principal");
+        engine
+            .register_principal_fact(load_drives)
+            .expect("register the drives fact loader");
         schema::register(&mut engine).expect("the drive slice registers for the archive host");
         let state = Arc::new(engine.graphql_state());
         let graphql = engine_schema(

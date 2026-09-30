@@ -27,8 +27,9 @@ use service_engine::LibraryMigrations;
 
 pub use blob::{DriveImage as DriveImageBlob, DriveSource};
 pub use catalogue::{
-    CatalogueWatch, DriveRunnerType, DriveRunnerTypeLifecycle, known_runner_types,
-    watch_runner_types, watch_runner_types_of,
+    CatalogueWatch, DriveRunnerType, DriveRunnerTypeLifecycle, DriveRunnerTypes, KnownRunnerType,
+    RunnerTypeAccess, RunnerTypeStore, known_runner_types, watch_runner_types,
+    watch_runner_types_of,
 };
 pub use drive::{
     DriveDeleted, DriveFrozen, create_drive, create_unowned_drive, delete_drive,

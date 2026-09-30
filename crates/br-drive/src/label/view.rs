@@ -68,7 +68,10 @@ impl<H: DriveHost> Projector for DriveLabels<H> {
             return Ok(catalogue_window::<Label>(BTreeSet::new()));
         }
         let mut conn = cx.pool().acquire().await.map_err(EngineError::from)?;
-        let keys: BTreeSet<Uuid> = all_ids(&mut conn).await?.into_iter().collect();
+        let keys: BTreeSet<Uuid> = all_ids(&mut conn, cx.limit_all())
+            .await?
+            .into_iter()
+            .collect();
         Ok(catalogue_window::<Label>(keys))
     }
 

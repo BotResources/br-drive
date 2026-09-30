@@ -109,20 +109,15 @@ impl Principal for AppPrincipal {
 }
 
 impl PassportPrincipal for AppPrincipal {
-    fn from_passport(
-        _pg: &PgPool,
-        passport: Passport,
-    ) -> BoxFuture<'_, Result<Self, PrincipalRejected>> {
-        Box::pin(async move {
-            let id = passport
-                .user_id()
-                .or_else(|| passport.service_account_id())
-                .ok_or_else(|| PrincipalRejected::new("the passport names no subject"))?;
-            Ok(AppPrincipal {
-                id: PrincipalId::from(id),
-                passport,
-                facts: PrincipalFacts::new(),
-            })
+    fn from_passport(passport: Passport) -> Result<Self, PrincipalRejected> {
+        let id = passport
+            .user_id()
+            .or_else(|| passport.service_account_id())
+            .ok_or_else(|| PrincipalRejected::new("the passport names no subject"))?;
+        Ok(AppPrincipal {
+            id: PrincipalId::from(id),
+            passport,
+            facts: PrincipalFacts::new(),
         })
     }
 }

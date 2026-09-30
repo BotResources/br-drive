@@ -11,7 +11,7 @@ use contract_jobs::catalog::{RUNNER_TYPE_PREFIX, RunnerType, RunnerTypeLifecycle
 use contract_jobs::runner::WIRE_VERSION;
 use service_engine::error::EngineError;
 use service_engine::nats::{KvEvent, KvPrefix, Nats, NatsError, Watched};
-use service_engine::{Engine, Principal};
+use service_engine::{Engine, Principal, validate_database_tls};
 use sqlx::{PgConnection, PgPool};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -246,11 +246,40 @@ pub fn watch_runner_types(nats: Nats, pool: PgPool) -> CatalogueWatch {
     CatalogueWatch { stop, task }
 }
 
-/// [`watch_runner_types`] on the engine's own NATS and PostgreSQL handles —
-/// the call for a host's `register(&mut Engine)` closure (`BootPlan`).
+/// The variable `run_service` reads the application pool's URL from.
+const DATABASE_URL: &str = "DATABASE_URL";
+/// The connections the watch's own pool may hold: it writes one entry at a
+/// time.
+const WATCH_POOL_CONNECTIONS: u32 = 2;
+
+/// [`watch_runner_types`] on the engine's own NATS handle — the call for a
+/// host's `register(&mut Engine)` closure (`BootPlan`). Engine 0.4.0 hands
+/// its PostgreSQL pool to no caller, so the watch opens a small pool of its
+/// own (at most two connections, connected lazily) on `DATABASE_URL`, the
+/// URL `run_service` boots the engine's pool from, checked by the engine's
+/// own TLS rule. Without a usable `DATABASE_URL` the watch does not start and
+/// says so in a `warn`: the copy is information only. A host that holds its
+/// pool calls [`watch_runner_types`] with it instead.
 pub fn watch_runner_types_of<P: Principal>(engine: &Engine<P>) -> CatalogueWatch {
-    let pool = engine.accumulator_handle().reader().pool().clone();
-    watch_runner_types(engine.nats().clone(), pool)
+    match own_pool() {
+        Ok(pool) => watch_runner_types(engine.nats().clone(), pool),
+        Err(reason) => {
+            tracing::warn!(%reason, "the runner-type catalogue watch does not start");
+            CatalogueWatch {
+                stop: Arc::new(Notify::new()),
+                task: tokio::spawn(async {}),
+            }
+        }
+    }
+}
+
+fn own_pool() -> Result<PgPool, String> {
+    let url = std::env::var(DATABASE_URL).map_err(|_| format!("{DATABASE_URL} is not set"))?;
+    validate_database_tls(&url).map_err(|error| error.to_string())?;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(WATCH_POOL_CONNECTIONS)
+        .connect_lazy(&url)
+        .map_err(|error| format!("{DATABASE_URL} does not parse: {error}"))
 }
 
 #[cfg(test)]

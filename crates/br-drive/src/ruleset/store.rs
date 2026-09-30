@@ -135,21 +135,6 @@ impl<H: DriveHost> Persistence for RulesetStore<H> {
 
     const STYLE: PersistenceStyle = PersistenceStyle::SoftEda;
 
-    fn load<'a>(
-        conn: &'a mut PgConnection,
-        key: &'a Uuid,
-    ) -> BoxFuture<'a, Result<Option<RulesetRecord<H>>, EngineError>> {
-        Box::pin(async move {
-            let row = sqlx::query(&format!(
-                "SELECT {COLUMNS} FROM drive.ruleset WHERE id = $1"
-            ))
-            .bind(key)
-            .fetch_optional(conn)
-            .await?;
-            row.as_ref().map(record).transpose()
-        })
-    }
-
     fn lock<'a>(
         conn: &'a mut PgConnection,
         key: &'a Uuid,
@@ -285,8 +270,11 @@ impl<H: DriveHost> SoftEda for RulesetRecord<H> {
     }
 }
 
-pub async fn all_ids(conn: &mut PgConnection) -> Result<Vec<Uuid>, EngineError> {
-    let rows = sqlx::query("SELECT id FROM drive.ruleset ORDER BY name")
+/// Every id of the catalogue, at most `limit` of them (the window's
+/// populate ceiling).
+pub async fn all_ids(conn: &mut PgConnection, limit: i64) -> Result<Vec<Uuid>, EngineError> {
+    let rows = sqlx::query("SELECT id FROM drive.ruleset ORDER BY name LIMIT $1")
+        .bind(limit)
         .fetch_all(conn)
         .await?;
     Ok(rows.iter().map(|row| row.get::<Uuid, _>("id")).collect())

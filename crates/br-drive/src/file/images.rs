@@ -198,22 +198,6 @@ impl<H: DriveHost> Persistence for ImageStore<H> {
 
     const STYLE: PersistenceStyle = PersistenceStyle::Crud;
 
-    fn load<'a>(
-        conn: &'a mut PgConnection,
-        key: &'a ImageKey,
-    ) -> BoxFuture<'a, Result<Option<ImageRecord<H>>, EngineError>> {
-        Box::pin(async move {
-            let row = sqlx::query(&format!(
-                "SELECT {COLUMNS} FROM drive.file_image WHERE file_id = $1 AND name = $2"
-            ))
-            .bind(key.file_id)
-            .bind(&key.name)
-            .fetch_optional(conn)
-            .await?;
-            row.as_ref().map(row_to_image).transpose()
-        })
-    }
-
     fn lock<'a>(
         conn: &'a mut PgConnection,
         key: &'a ImageKey,
@@ -227,6 +211,35 @@ impl<H: DriveHost> Persistence for ImageStore<H> {
             .execute(conn)
             .await?;
             Ok(())
+        })
+    }
+
+    fn read_many<'a>(
+        conn: &'a mut PgConnection,
+        keys: &'a [ImageKey],
+    ) -> BoxFuture<'a, Result<Vec<(ImageKey, ImageRecord<H>)>, EngineError>> {
+        Box::pin(async move {
+            let file_ids: Vec<Uuid> = keys.iter().map(|key| key.file_id).collect();
+            let names: Vec<&str> = keys.iter().map(|key| key.name.as_str()).collect();
+            let rows = sqlx::query(&format!(
+                "SELECT {COLUMNS} FROM drive.file_image \
+                 WHERE (file_id, name) IN (SELECT * FROM UNNEST($1::uuid[], $2::text[]))"
+            ))
+            .bind(&file_ids)
+            .bind(&names)
+            .fetch_all(conn)
+            .await?;
+            rows.iter()
+                .map(|row| {
+                    row_to_image(row).map(|image| {
+                        let key = ImageKey {
+                            file_id: image.file_id,
+                            name: image.name.as_str().to_string(),
+                        };
+                        (key, image)
+                    })
+                })
+                .collect()
         })
     }
 

@@ -46,8 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             move |engine: &mut service_engine::Engine<br_drive_example::kernel::AppPrincipal>| {
                 register(engine)?;
                 // The optional runner-type catalogue watch, on the engine's
-                // own handles; information only, so it runs detached until
-                // the process exits and nothing of the boot waits for it.
+                // NATS handle and a small pool of its own on DATABASE_URL;
+                // information only, so it runs detached until the process
+                // exits and nothing of the boot waits for it.
                 #[cfg(feature = "drive")]
                 br_drive::watch_runner_types_of(engine).detach();
                 Ok(())

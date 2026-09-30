@@ -1,7 +1,7 @@
 use async_graphql::{Context, Object, Result, Subscription};
 use futures_util::{Stream, StreamExt};
 use service_engine::session::WindowSpec;
-use service_engine::{MutationAck, Query};
+use service_engine::{MutationAck, OrInternal, Query};
 use uuid::Uuid;
 
 use super::mutations::{CreateWorkspace, DeleteWorkspace, TransferWorkspace};
@@ -102,7 +102,10 @@ impl WorkspaceSubscription {
     ) -> Result<impl Stream<Item = Result<WorkspaceDelta>>> {
         let stream = service_engine::attach::<AppPrincipal>(
             ctx,
-            vec![WindowSpec::view::<WorkspacesView>(&(), false)?],
+            vec![
+                WindowSpec::view::<WorkspacesView>(&(), false)
+                    .or_internal("encode the workspaces window")?,
+            ],
         )
         .await?;
         Ok(stream.map(|delta| WorkspaceDelta::from_delta(&delta)))

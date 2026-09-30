@@ -119,13 +119,6 @@ impl<H: DriveHost> Persistence for FileViewStore<H> {
 
     const STYLE: PersistenceStyle = PersistenceStyle::Crud;
 
-    fn load<'a>(
-        conn: &'a mut PgConnection,
-        key: &'a Uuid,
-    ) -> BoxFuture<'a, Result<Option<FileView<H>>, EngineError>> {
-        Box::pin(async move { Ok(load_views(conn, std::slice::from_ref(key)).await?.pop()) })
-    }
-
     fn read_many<'a>(
         conn: &'a mut PgConnection,
         keys: &'a [Uuid],
@@ -290,7 +283,7 @@ pub(crate) async fn visible_file_keys<H: DriveHost>(
         return Ok(BTreeSet::new());
     }
     let mut conn = cx.pool().acquire().await.map_err(EngineError::from)?;
-    Ok(store::ids_in_drives(&mut conn, &drives)
+    Ok(store::ids_in_drives(&mut conn, &drives, cx.limit_all())
         .await?
         .into_iter()
         .collect())
