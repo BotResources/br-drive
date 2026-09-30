@@ -83,6 +83,17 @@ it its facts in the transaction that writes the state.
   launched, and the file's processing keeps the ended job as its last one
   (visible outcome unchanged: `FAILED` `cancelled`).
 
+- **The commit starts the upload rule** (`DriveHost::process_on_commit`,
+  default `true`): `CommitUpload` starts the chain of the default `upload`
+  rule matching the file's media type in its own transaction, when the host's
+  `Process` gate allows it — `PENDING` → `PROCESSING`, never `READY` first;
+  `UploadCommitted`, `ChainStarted` and `JobCreated` share the commit's
+  correlation, and a failure rolls the commit back whole. No matching rule:
+  the file is `READY` (stored only), the commit is not refused. `ProcessFile`
+  stays for reprocessing, and for a host that turns the switch off to keep
+  the two-gesture flow. **Breaking** for a host that relied on a commit never
+  processing: it overrides `process_on_commit` to `false`.
+
 ### Upgrading from 0.4
 
 - Create the host's fact table and implement `record_facts` before booting

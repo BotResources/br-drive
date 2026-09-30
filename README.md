@@ -88,7 +88,7 @@ rolls them together. The host never writes to the `drive` schema directly.
 
 1. **Compose**: `slice drive ["drive"] from br_drive::drive_slice { query = drive::DriveQuery, mutation = drive::DriveMutation, subscription = drive::DriveSubscription }` under the host's `prefix`; every root below appears at that prefix.
 2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and both of the library's self-commands (`upload-deadline`, `image-landed`) arrive as a service actor, and a resolver that rejects services parks all ten reactions.
-3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `record_facts` (required), `visible_drives` (never a service principal), `display_name`, `upload_window`, `erase_mode`, the two folder hooks.
+3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `record_facts` (required), `visible_drives` (never a service principal), `display_name`, `upload_window`, `process_on_commit`, `erase_mode`, the two folder hooks.
 4. **Fact table**: the host's own fact table (the reference table under [Facts](#facts-handed-to-the-host)), created by a host migration; `record_facts` inserts into it on the connection it is given.
 5. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
 6. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
@@ -112,6 +112,7 @@ impl DriveHost for AppPrincipal {
     fn display_name(&self) -> Option<String> { … }      // default None; feeds job.create's triggered_by
     fn erase_mode() -> EraseMode { … }                  // default Anonymise; Delete removes the person's files
     fn upload_window(&self) -> Duration { … }           // default 15 min
+    fn process_on_commit(&self) -> bool { … }           // default true: the commit starts the upload rule
     fn folder_moved(ops, drive, old_prefix, new_prefix) -> BoxFuture<…> { … }   // default no-op
     fn folder_deleted(ops, drive, prefix) -> BoxFuture<…> { … }                  // default no-op
 }
@@ -167,6 +168,13 @@ every `RequestUpload`.
   principal act on some files (an uploader rule, say) lets a folder gesture
   tell which case applied. The per-file decisions are in memory over the rows
   the gesture already loads: they add no statement.
+- `process_on_commit` (default `true`): `CommitUpload` starts the chain of
+  the default `upload` rule matching the file's media type, in its own
+  transaction, when the host's `Process { file }` gate allows it — a file
+  that will be processed is never `READY` before it is; a file no rule
+  matches is stored, `READY`, with no refusal. `false` keeps the two-gesture
+  flow (commit, then `ProcessFile`). A host may decide per principal (the
+  example host reads its settings).
 - `record_facts(conn, facts)` is **required**: a host that does not
   implement it does not compile. Every change of a library state row reaches
   it, in the transaction of the gesture that made the change — `conn` is that
@@ -227,8 +235,8 @@ renders it, is committed at
 | Root | Shape |
 |---|---|
 | `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256, title?): UploadTicket!` | `title` trimmed, 1–255 characters, one line, no control or bidirectional-override character (`INVALID_TITLE`); absent, it is the requested `name` without its extension (`report.pdf` → `report`; a name with no stem is kept whole; a collision renames the file, never its title); gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). |
-| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then the file is `READY` — stored, not processed: a commit never runs a rule. A second commit is `FILE_NOT_PENDING`. |
-| `<p>ProcessFile(fileId, rulesetId?): MutationAck!` | the only way to start processing, right after the commit, later, or never: gate `Process { file }`, then a `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload, `FILE_PROCESSING` while a chain runs). A file that never had a job runs its `upload` rule, any other its `reprocess` rule (see "Processing rules": `RULESET_NOT_FOUND`, `RULESET_MISMATCH`, `NO_RULESET_MATCHES`). Nothing is wiped: the previous results stay readable while the new run reports over them. Affordance `process`. |
+| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then, on a host that processes on commit (`DriveHost::process_on_commit`, default `true`) and whose `Process { file }` gate allows it, the default `upload` rule matching the file's media type starts its chain **in the commit's transaction**: the file goes `PENDING` → `PROCESSING`, never `READY` first, and the facts `UploadCommitted`, `ChainStarted`, `JobCreated` share the commit's correlation (a failure rolls all of it back). No matching rule, or the gate refusing: the file is `READY` — stored only — and the commit is not refused. With the switch off, the file is `READY` and `ProcessFile` starts its chain. A second commit is `FILE_NOT_PENDING`. |
+| `<p>ProcessFile(fileId, rulesetId?): MutationAck!` | starts processing on a host that does not process on commit — right after the commit, later, or never — and reprocesses on any host: gate `Process { file }`, then a `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload, `FILE_PROCESSING` while a chain runs). A file that never had a job runs its `upload` rule, any other its `reprocess` rule (see "Processing rules": `RULESET_NOT_FOUND`, `RULESET_MISMATCH`, `NO_RULESET_MATCHES`). Nothing is wiped: the previous results stay readable while the new run reports over them. Affordance `process`. |
 | `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; records `JobCancelSent` on the file's processing and stages `job.cancel.v2` for the running job (the live cause stays `CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). Affordance `cancelProcessing`. |
 | `<p>RegeneratePage(fileId, number, comment?, rulesetId?): MutationAck!` | run the `regenerate_page` rule on one page of a `READY` file: `page` and `comment` are merged into the first step's options; `PAGE_NOT_FOUND`, `NO_RULESET_MATCHES`. Affordance `regeneratePage` on the page. |
 | `<p>UpdateFile(fileId, name?, path?, driveId?): MutationAck!` | rename, move, or move to another drive of the same host; both drives are locked before the sibling check, so a concurrent collision answers `NAME_TAKEN`, never a database error; `NOTHING_TO_CHANGE` when nothing differs. |
@@ -379,8 +387,7 @@ the same on a 3-page file and on a 3000-page one.
 
 Rulesets are per host service, declared at runtime by its managers, never
 known to the front or the library by name. The table is empty at boot: until a
-manager declares a rule, `<p>ProcessFile` has nothing to run (an upload only
-ever stores the file: processing is its own gesture). A rule
+manager declares a rule, `<p>ProcessFile` has nothing to run and a commit only stores the file. A rule
 says "when *trigger* happens on a file whose media type matches *mediaTypes*,
 run *steps* in order" — a list, never a graph.
 
@@ -395,7 +402,9 @@ run *steps* in order" — a list, never a graph.
 Matching: the given `rulesetId` must exist (`RULESET_NOT_FOUND`) and carry
 the gesture's trigger and a pattern matching the file's media type
 (`RULESET_MISMATCH`); without an id the default of that trigger wins by
-precedence exact > `type/*` > `*`. A commit never runs a rule. `ProcessFile`
+precedence exact > `type/*` > `*`. A commit runs the default `upload`
+rule matching the file (no given rule, no refusal when none matches) unless
+the host turned `process_on_commit` off. `ProcessFile`
 runs the `upload` trigger on a file that never had a job, the `reprocess`
 trigger on any other, and resolves in this order: the given rule (carrying
 that trigger), else the default of that trigger, else — for a reprocess — the
@@ -837,8 +846,11 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
 
 `crates/br-drive-example` is the reference host: a thin kernel (principal,
 facts, faults, the `DriveHost` impl — its `record_facts` inserts into the
-reference fact table, `workspace_fact`, and refuses one title, the suite's
-proof that a refused fact rolls the gesture back), one `workspace` slice (the host object a
+reference fact table, `workspace_fact`, and refuses one title and one
+runner type, the suite's proof that a refused fact rolls the gesture back;
+its `process_on_commit` comes from its settings — on for the binary,
+`DRIVE_PROCESS_ON_COMMIT=false` to turn it off — and the suite runs its
+two-gesture scenarios with it off), one `workspace` slice (the host object a
 drive hangs off, owner-only gate: `workspaceCreate` / `workspaceDelete` /
 `workspaceTransfer`; the `workspace:manage` scope on
 a human passport is its `ManageRulesets` gate, any human reads the rules), the

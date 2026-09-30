@@ -312,6 +312,15 @@ impl FileStatus {
             last_job: None,
         }
     }
+
+    /// A file just committed, never processed: stored, READY.
+    pub(crate) fn stored() -> Self {
+        Self {
+            state: ProcessingState::Ready,
+            error: None,
+            last_job: None,
+        }
+    }
 }
 
 impl<H> Clone for FileRow<H> {

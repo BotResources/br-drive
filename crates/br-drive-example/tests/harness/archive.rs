@@ -138,6 +138,11 @@ impl DriveHost for ArchivePrincipal {
         self.passport.claim::<String>("name")
     }
 
+    /// The archive's scenarios are written for the two-gesture flow.
+    fn process_on_commit(&self) -> bool {
+        false
+    }
+
     fn erase_mode() -> EraseMode {
         EraseMode::Delete
     }
