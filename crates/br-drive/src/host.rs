@@ -169,6 +169,15 @@ pub trait DriveHost: Principal {
         Duration::from_secs(15 * 60)
     }
 
+    /// Whether `CommitUpload` starts the chain of the file's default `upload`
+    /// rule in its own transaction (default `true`): a file with a matching
+    /// rule goes from PENDING to PROCESSING, never READY in between; one with
+    /// none stays READY (stored only). `false` keeps the two-gesture flow —
+    /// the commit stores, `ProcessFile` processes.
+    fn process_on_commit(&self) -> bool {
+        true
+    }
+
     fn folder_moved<'a, 'o>(
         _ops: &'a mut Ops<'o>,
         _drive: Uuid,

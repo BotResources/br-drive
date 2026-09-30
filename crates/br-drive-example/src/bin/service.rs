@@ -28,6 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(raw) = std::env::var("DRIVE_UPLOAD_WINDOW_MS") {
         settings.upload_window = Duration::from_millis(raw.parse()?);
     }
+    if let Ok(raw) = std::env::var("DRIVE_PROCESS_ON_COMMIT") {
+        settings.process_on_commit = raw.parse()?;
+    }
 
     run_service(BootPlan {
         component: "br-drive-example",

@@ -34,6 +34,9 @@ pub const DISPLAY_NAME_CLAIM: &str = "name";
 /// fails the gesture, which the suite uses to prove the state change rolls
 /// back with the facts.
 pub const UNRECORDABLE_TITLE: &str = "unrecordable";
+/// A runner type the host's fact table refuses to see a job created for: the
+/// suite's proof that a commit starting a chain rolls back whole.
+pub const UNRECORDABLE_RUNNER_TYPE: &str = "unrecordable";
 pub const FACT_REFUSED: Reason = Reason::new("FACT_REFUSED");
 
 impl DriveHost for AppPrincipal {
@@ -136,6 +139,12 @@ impl DriveHost for AppPrincipal {
         self.passport().claim::<String>(DISPLAY_NAME_CLAIM)
     }
 
+    fn process_on_commit(&self) -> bool {
+        self.facts()
+            .get::<HostSettings>()
+            .is_none_or(|settings| settings.process_on_commit)
+    }
+
     fn upload_window(&self) -> Duration {
         self.facts()
             .get::<HostSettings>()
@@ -183,10 +192,16 @@ impl DriveHost for AppPrincipal {
 /// Inserts `facts` into the host's fact table (`workspace_fact`), one
 /// statement for the batch.
 pub async fn record_facts(conn: &mut PgConnection, facts: &[DriveFact]) -> Result<(), EngineError> {
-    let refused = facts.iter().any(|fact| {
-        fact.event_type == "Retitled"
-            && fact.payload.get("to").and_then(serde_json::Value::as_str)
-                == Some(UNRECORDABLE_TITLE)
+    let text = |fact: &DriveFact, field: &str| {
+        fact.payload
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let refused = facts.iter().any(|fact| match fact.event_type {
+        "Retitled" => text(fact, "to").as_deref() == Some(UNRECORDABLE_TITLE),
+        "JobCreated" => text(fact, "runner_type").as_deref() == Some(UNRECORDABLE_RUNNER_TYPE),
+        _ => false,
     });
     if refused {
         return Err(EngineError::PolicyRefused {

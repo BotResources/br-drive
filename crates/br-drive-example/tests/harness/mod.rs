@@ -37,6 +37,10 @@ pub struct WorldOptions {
     pub reaper_interval: Duration,
     pub upload_window: Duration,
     pub watch_catalogue: bool,
+    /// The host's `process_on_commit`. Off by default in the suite: its
+    /// scenarios are written for the two-gesture flow (commit, then
+    /// `ProcessFile`); the commit-starts-the-chain scenarios turn it on.
+    pub process_on_commit: bool,
 }
 
 impl Default for WorldOptions {
@@ -45,6 +49,7 @@ impl Default for WorldOptions {
             reaper_interval: Duration::from_millis(150),
             upload_window: HostSettings::DEFAULT_UPLOAD_WINDOW,
             watch_catalogue: true,
+            process_on_commit: false,
         }
     }
 }
@@ -84,6 +89,7 @@ impl World {
                 await_ready: true,
                 settings: HostSettings {
                     upload_window: options.upload_window,
+                    process_on_commit: options.process_on_commit,
                 },
                 watch_catalogue: options.watch_catalogue,
             },
