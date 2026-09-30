@@ -231,6 +231,11 @@ pub enum FileEvent {
     },
     /// Its drive was deleted.
     DriveDeleted,
+    /// The uploader chose the `upload` rule its commit runs, with the upload
+    /// ticket (the fact after `UploadTicketIssued`). Since 0.5.1.
+    UploadRulesetChosen {
+        ruleset_id: Uuid,
+    },
 }
 
 impl crate::facts::DriveEvent for FileEvent {
@@ -255,6 +260,7 @@ impl crate::facts::DriveEvent for FileEvent {
             Self::Deleted => "Deleted",
             Self::FolderDeleted { .. } => "FolderDeleted",
             Self::DriveDeleted => "DriveDeleted",
+            Self::UploadRulesetChosen { .. } => "UploadRulesetChosen",
         }
     }
 }
@@ -277,6 +283,9 @@ pub struct FileRow<H> {
     pub estimated_tokens: Option<i64>,
     pub ruleset_id: Option<Uuid>,
     pub steps: Option<Vec<RulesetStep>>,
+    /// The `upload` rule the uploader chose at `RequestUpload`, for the
+    /// commit's chain; `None`: the default `upload` rule matching the file.
+    pub(crate) upload_ruleset_id: Option<Uuid>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     /// The file's last change: the latest of its own row's and of its
@@ -342,6 +351,7 @@ impl<H> Clone for FileRow<H> {
             estimated_tokens: self.estimated_tokens,
             ruleset_id: self.ruleset_id,
             steps: self.steps.clone(),
+            upload_ruleset_id: self.upload_ruleset_id,
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,

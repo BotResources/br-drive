@@ -54,7 +54,7 @@ type DriveLabel {
 }
 
 type DriveMutation {
-	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!, title: String): UploadTicket!
+	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!, title: String, rulesetId: UUID): UploadTicket!
 	workspaceCommitUpload(fileId: UUID!): MutationAck!
 	workspaceProcessFile(fileId: UUID!, rulesetId: UUID): MutationAck!
 	workspaceCancelProcessing(fileId: UUID!): MutationAck!

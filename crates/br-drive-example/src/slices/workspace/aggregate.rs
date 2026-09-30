@@ -49,11 +49,26 @@ pub struct WorkspaceRow {
     pub file_count: i64,
     #[serde(default)]
     pub ready_file_count: i64,
+    /// Read-side only too: the drive's files per processing state
+    /// (`br_drive::processing_counts`) that are not READY.
+    #[serde(default)]
+    pub pending_file_count: i64,
+    #[serde(default)]
+    pub processing_file_count: i64,
+    #[serde(default)]
+    pub failed_file_count: i64,
 }
 
 service_engine::gated! {
     WorkspaceRow, AppPrincipal;
     "delete" => fn delete_gate(this, principal) {
+        if principal.user() == this.owner_id {
+            Gate::allowed()
+        } else {
+            Gate::blocked(NOT_THE_OWNER)
+        }
+    }
+    "freeze" => fn freeze_gate(this, principal) {
         if principal.user() == this.owner_id {
             Gate::allowed()
         } else {

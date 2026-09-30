@@ -47,6 +47,7 @@ type WorkspaceMutation {
 	workspaceCreate(id: UUID!, name: String!): MutationAck!
 	workspaceDelete(id: UUID!): MutationAck!
 	workspaceTransfer(id: UUID!, to: UUID!): MutationAck!
+	workspaceFreeze(id: UUID!): MutationAck!
 	workspaceAnnotateFile(fileId: UUID!, metadata: JSON!): MutationAck!
 }
 
@@ -84,6 +85,9 @@ type WorkspaceView {
 	createdAt: DateTime!
 	fileCount: Int!
 	readyFileCount: Int!
+	pendingFileCount: Int!
+	processingFileCount: Int!
+	failedFileCount: Int!
 	affordances: Affordances!
 }
 

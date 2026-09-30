@@ -26,7 +26,10 @@ use crate::runner::{
     RunnerReport, RunnerReportFailure, RunnerRequestImageUpload, RunnerSources, runner_report,
     runner_report_failure, runner_request_image_upload,
 };
-use crate::upload::{self, CommitUpload, RequestUpload, UPLOAD_DEADLINE_DURABLE, UploadDeadline};
+use crate::upload::{
+    self, CommitUpload, RequestUpload, RequestUploadWithRuleset, UPLOAD_DEADLINE_DURABLE,
+    UploadDeadline,
+};
 
 pub fn register<H: DriveHost>(
     engine: &mut Engine<H>,
@@ -47,6 +50,9 @@ pub fn register<H: DriveHost>(
     engine.register_view(DriveLabels::<H>::default())?;
     engine.register_erasable(DriveErasure::<H>::default())?;
     engine.register_mutation::<RequestUpload, _>(upload::request_upload::<H>)?;
+    engine.register_mutation::<RequestUploadWithRuleset, _>(
+        upload::request_upload_with_ruleset::<H>,
+    )?;
     let reader = engine.blob_reader();
     engine.register_mutation::<CommitUpload, _>(move |cx, input| {
         upload::commit_upload::<H>(cx, input, reader.clone())

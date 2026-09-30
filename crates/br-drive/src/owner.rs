@@ -148,3 +148,67 @@ pub async fn file_counts(
         })
         .collect())
 }
+
+/// How many files of a drive are in each processing state — what
+/// `processingState` reads on each of them. Since 0.5.1.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessingCounts {
+    /// Uploads not confirmed yet.
+    pub pending: i64,
+    /// Files whose chain runs.
+    pub processing: i64,
+    /// Files stored, processed or never processed.
+    pub ready: i64,
+    /// Files whose last job failed or was cancelled.
+    pub failed: i64,
+}
+
+impl ProcessingCounts {
+    /// Every file of the drive, whatever its state.
+    pub fn files(&self) -> i64 {
+        self.pending + self.processing + self.ready + self.failed
+    }
+}
+
+/// The processing counts of several drives in one statement, served by the
+/// same index as [`file_counts`] — for a host view that shows how many files
+/// are processing or failed without reading `drive.file_processing` itself.
+/// A drive with no file is absent from the map. Since 0.5.1.
+pub async fn processing_counts(
+    conn: &mut PgConnection,
+    drives: &[Uuid],
+) -> Result<HashMap<Uuid, ProcessingCounts>, EngineError> {
+    let rows = sqlx::query(
+        "SELECT drive_id, \
+                count(*) FILTER (WHERE state = $2) AS pending, \
+                count(*) FILTER (WHERE state = $3) AS processing, \
+                count(*) FILTER (WHERE state = $4) AS ready, \
+                count(*) FILTER (WHERE state = $5) AS failed \
+         FROM (SELECT f.drive_id, COALESCE(s.state, \
+                 CASE WHEN f.committed_at IS NULL THEN $2 ELSE $4 END) AS state \
+               FROM drive.file f LEFT JOIN drive.file_processing s ON s.file_id = f.id \
+               WHERE f.drive_id = ANY($1)) files \
+         GROUP BY drive_id",
+    )
+    .bind(drives)
+    .bind(ProcessingState::Pending.as_str())
+    .bind(ProcessingState::Processing.as_str())
+    .bind(ProcessingState::Ready.as_str())
+    .bind(ProcessingState::Failed.as_str())
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            (
+                row.get("drive_id"),
+                ProcessingCounts {
+                    pending: row.get("pending"),
+                    processing: row.get("processing"),
+                    ready: row.get("ready"),
+                    failed: row.get("failed"),
+                },
+            )
+        })
+        .collect())
+}

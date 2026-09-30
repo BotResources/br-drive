@@ -17,6 +17,9 @@ fn row_to_workspace(row: &sqlx::postgres::PgRow) -> WorkspaceRow {
         created_at: row.get("created_at"),
         file_count: 0,
         ready_file_count: 0,
+        pending_file_count: 0,
+        processing_file_count: 0,
+        failed_file_count: 0,
     }
 }
 
@@ -29,10 +32,15 @@ async fn with_file_counts(
 ) -> Result<(), EngineError> {
     let ids: Vec<Uuid> = workspaces.iter().map(|workspace| workspace.id).collect();
     let counts = br_drive::file_counts(conn, &ids).await?;
+    let states = br_drive::processing_counts(conn, &ids).await?;
     for workspace in workspaces {
         let counted = counts.get(&workspace.id).copied().unwrap_or_default();
         workspace.file_count = counted.files;
         workspace.ready_file_count = counted.ready;
+        let states = states.get(&workspace.id).copied().unwrap_or_default();
+        workspace.pending_file_count = states.pending;
+        workspace.processing_file_count = states.processing;
+        workspace.failed_file_count = states.failed;
     }
     Ok(())
 }

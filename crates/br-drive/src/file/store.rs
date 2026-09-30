@@ -20,7 +20,7 @@ use crate::title::FileTitle;
 
 /// The columns of `drive.file` itself, in insert order.
 pub(crate) const FILE_COLUMNS: &str = "id, drive_id, path, name, title, media_type, size_bytes, sha256, blob_ref, \
-     committed_at, metadata, ruleset_id, steps, created_by, created_at, version, updated_at";
+     committed_at, metadata, ruleset_id, steps, created_by, created_at, version, updated_at, upload_ruleset_id";
 
 /// The columns of `drive.file_processed` a file row reads beside its own: what
 /// the workers produced (absent until the first result).
@@ -190,6 +190,7 @@ pub(crate) fn row_to_file_prefixed<H>(
         estimated_tokens: row.get(column("estimated_tokens").as_str()),
         ruleset_id: row.get(column("ruleset_id").as_str()),
         steps: decode_json("a file's steps snapshot", row.get(column("steps").as_str())),
+        upload_ruleset_id: row.get(column("upload_ruleset_id").as_str()),
         created_by: row.get(column("created_by").as_str()),
         created_at: row.get(column("created_at").as_str()),
         updated_at: row.get(column("last_change").as_str()),
@@ -292,7 +293,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
         Box::pin(async move {
             sqlx::query(&format!(
                 "INSERT INTO drive.file ({FILE_COLUMNS}) VALUES \
-                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"
+                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"
             ))
             .bind(file.id)
             .bind(file.drive_id)
@@ -311,6 +312,7 @@ impl<H: DriveHost> Persistence for FileStore<H> {
             .bind(file.created_at)
             .bind(file.version)
             .bind(file.file_updated_at)
+            .bind(file.upload_ruleset_id)
             .execute(&mut *conn)
             .await?;
             hand_file_facts::<H>(conn, file, events).await
@@ -478,6 +480,21 @@ pub async fn ids_in_drives(
 
 pub async fn ids_in_drive(conn: &mut PgConnection, drive: Uuid) -> Result<Vec<Uuid>, EngineError> {
     ids_in_drives(conn, &[drive]).await
+}
+
+/// The files of `drive` still in flight: uploads not confirmed, and files
+/// whose chain runs — what a drive freeze ends.
+pub async fn ids_in_flight(conn: &mut PgConnection, drive: Uuid) -> Result<Vec<Uuid>, EngineError> {
+    Ok(sqlx::query_scalar(
+        "SELECT f.id FROM drive.file f \
+         LEFT JOIN drive.file_processing s ON s.file_id = f.id \
+         WHERE f.drive_id = $1 AND (f.committed_at IS NULL OR s.state = $2) \
+         ORDER BY f.id",
+    )
+    .bind(drive)
+    .bind(ProcessingState::Processing.as_str())
+    .fetch_all(conn)
+    .await?)
 }
 
 pub async fn drives_of(conn: &mut PgConnection, files: &[Uuid]) -> Result<Vec<Uuid>, EngineError> {

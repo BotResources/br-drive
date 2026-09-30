@@ -11,6 +11,8 @@ use service_engine::error::EngineError;
 use crate::kernel::AppPrincipal;
 
 pub use aggregate::{Workspace, WorkspaceCause, WorkspaceRow};
+#[cfg(feature = "drive")]
+pub use mutations::{RETRACT_VERB, RetractWorkspace};
 pub use view::{WorkspaceView, WorkspacesView};
 
 pub fn register(engine: &mut Engine<AppPrincipal>) -> Result<(), EngineError> {
@@ -20,8 +22,14 @@ pub fn register(engine: &mut Engine<AppPrincipal>) -> Result<(), EngineError> {
     engine.register_bulk::<mutations::DeleteWorkspace, _>(mutations::delete_workspace)?;
     engine.register_mutation::<mutations::TransferWorkspace, _>(mutations::transfer_workspace)?;
     #[cfg(feature = "drive")]
-    #[cfg(feature = "drive")]
     engine.register_mutation::<mutations::AnnotateFile, _>(mutations::annotate_file)?;
+    #[cfg(feature = "drive")]
+    engine.register_mutation::<mutations::FreezeWorkspace, _>(mutations::freeze_workspace)?;
+    #[cfg(feature = "drive")]
+    engine.register_reaction::<mutations::RetractWorkspace, _, _>(
+        mutations::RETRACT_DURABLE,
+        mutations::retract_workspace,
+    )?;
     engine.register_schema_slice(
         service_engine::graphql::SliceFragment::derive::<
             graphql::WorkspaceQuery,

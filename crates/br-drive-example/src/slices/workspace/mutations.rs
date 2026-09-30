@@ -2,11 +2,15 @@ use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use service_engine::impact::Deps;
 use service_engine::pipeline::{Bulk, Mutation, MutationInput};
+#[cfg(feature = "drive")]
+use service_engine::pipeline::Reaction;
 use service_engine::principal::PrincipalId;
 use uuid::Uuid;
 
 use super::aggregate::{Workspace, WorkspaceCause, WorkspaceRow};
 use crate::kernel::error::WORKSPACE_NOT_FOUND;
+#[cfg(feature = "drive")]
+use crate::kernel::ReactionFault;
 use crate::kernel::{AppFault, AppPrincipal, OWNERSHIP_DEP};
 
 fn ownership_dep() -> Deps {
@@ -38,6 +42,9 @@ pub fn create_workspace<'m>(
             created_at: cx.now().as_datetime(),
             file_count: 0,
             ready_file_count: 0,
+            pending_file_count: 0,
+            processing_file_count: 0,
+            failed_file_count: 0,
         };
         cx.create(&workspace).await?;
         #[cfg(feature = "drive")]
@@ -134,6 +141,91 @@ pub fn annotate_file<'m>(
         let principal = cx.principal().clone();
         br_drive::set_metadata::<AppPrincipal>(cx, &principal, input.file_id, input.metadata)
             .await?;
+        Ok(())
+    })
+}
+
+/// Closes a workspace's drive: its running processings end, cancelled, and
+/// its pending uploads are abandoned (`br_drive::freeze_drive`), in this
+/// gesture's transaction. The example host stores no closed state of its own:
+/// the gesture shows the library's side only.
+#[cfg(feature = "drive")]
+#[derive(Debug, Deserialize)]
+pub struct FreezeWorkspace {
+    pub id: Uuid,
+}
+
+#[cfg(feature = "drive")]
+impl MutationInput for FreezeWorkspace {
+    type Output = ();
+    type Error = AppFault;
+    const NAME: &'static str = "freeze_workspace";
+}
+
+#[cfg(feature = "drive")]
+pub fn freeze_workspace<'m>(
+    cx: &'m mut Mutation<'m, AppPrincipal>,
+    input: FreezeWorkspace,
+) -> BoxFuture<'m, Result<(), AppFault>> {
+    Box::pin(async move {
+        let workspace = cx
+            .load::<WorkspaceRow>(&input.id)
+            .await?
+            .ok_or(AppFault::Refused(WORKSPACE_NOT_FOUND))?;
+        workspace.freeze_gate(cx.principal()).require()?;
+        let meta = br_drive::FactMeta::of(cx.principal(), cx.now().as_datetime());
+        br_drive::freeze_drive::<AppPrincipal>(cx, &meta, workspace.id).await?;
+        Ok(())
+    })
+}
+
+/// The verb of the host command that retracts a workspace — what a roster
+/// sends when the person a personal workspace belongs to leaves.
+#[cfg(feature = "drive")]
+pub const RETRACT_VERB: &str = "retract";
+#[cfg(feature = "drive")]
+pub const RETRACT_DURABLE: &str = "workspace-retract";
+
+/// `integration.cmd.workspace.workspace.retract.v1 { workspace_id }`: deletes
+/// the workspace and its drive from a **reaction**
+/// (`br_drive::delete_drive_in_reaction`). An unknown workspace is a no-op,
+/// so a redelivered command changes nothing.
+#[cfg(feature = "drive")]
+#[derive(Debug, serde::Serialize, Deserialize)]
+pub struct RetractWorkspace {
+    pub workspace_id: Uuid,
+}
+
+#[cfg(feature = "drive")]
+impl service_engine::inbound::ReactionMessage for RetractWorkspace {
+    fn coordinates() -> service_engine::inbound::ReactionCoordinates {
+        use br_core_integration::{Aggregate, Bc, CommandCoords, Verb};
+        service_engine::inbound::ReactionCoordinates::Command(CommandCoords {
+            receiver: Bc::new(crate::SERVICE).expect("the host service name is a valid bc"),
+            aggregate: Aggregate::new("workspace").expect("a static aggregate segment"),
+            verb: Verb::new(RETRACT_VERB).expect("a static verb segment"),
+            version: 1,
+        })
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(payload)
+    }
+}
+
+#[cfg(feature = "drive")]
+pub fn retract_workspace<'r>(
+    cx: &'r mut Reaction<'r>,
+    message: RetractWorkspace,
+) -> BoxFuture<'r, Result<(), ReactionFault>> {
+    Box::pin(async move {
+        let Some(workspace) = cx.load::<WorkspaceRow>(&message.workspace_id).await? else {
+            return Ok(());
+        };
+        br_drive::delete_drive_in_reaction::<AppPrincipal>(cx, workspace.id).await?;
+        cx.delete(&workspace).await?;
+        cx.impact_caused::<Workspace, _>(&workspace.id, WorkspaceCause::Deleted)?;
+        cx.impact_principal_facts(PrincipalId::from(workspace.owner_id), ownership_dep());
         Ok(())
     })
 }
