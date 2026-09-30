@@ -229,7 +229,7 @@ renders it, is committed at
 | `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256, title?): UploadTicket!` | `title` trimmed, 1–255 characters, one line, no control or bidirectional-override character (`INVALID_TITLE`); absent, it is the requested `name` without its extension (`report.pdf` → `report`; a name with no stem is kept whole; a collision renames the file, never its title); gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). |
 | `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then the file is `READY` — stored, not processed: a commit never runs a rule. A second commit is `FILE_NOT_PENDING`. |
 | `<p>ProcessFile(fileId, rulesetId?): MutationAck!` | the only way to start processing, right after the commit, later, or never: gate `Process { file }`, then a `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload, `FILE_PROCESSING` while a chain runs). A file that never had a job runs its `upload` rule, any other its `reprocess` rule (see "Processing rules": `RULESET_NOT_FOUND`, `RULESET_MISMATCH`, `NO_RULESET_MATCHES`). Nothing is wiped: the previous results stay readable while the new run reports over them. Affordance `process`. |
-| `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; logs `cancel_requested` on the running job and stages `job.cancel.v2` for it (`CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). Affordance `cancelProcessing`. |
+| `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; records `JobCancelSent` on the file's processing and stages `job.cancel.v2` for the running job (the live cause stays `CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). Affordance `cancelProcessing`. |
 | `<p>RegeneratePage(fileId, number, comment?, rulesetId?): MutationAck!` | run the `regenerate_page` rule on one page of a `READY` file: `page` and `comment` are merged into the first step's options; `PAGE_NOT_FOUND`, `NO_RULESET_MATCHES`. Affordance `regeneratePage` on the page. |
 | `<p>UpdateFile(fileId, name?, path?, driveId?): MutationAck!` | rename, move, or move to another drive of the same host; both drives are locked before the sibling check, so a concurrent collision answers `NAME_TAKEN`, never a database error; `NOTHING_TO_CHANGE` when nothing differs. |
 | `<p>RetitleFile(fileId, title): MutationAck!` | gate `RetitleFile { file }` (affordance `retitle`); changes the title and nothing else — never the name, the path, the drive or the state, and `UpdateFile` never touches the title; `INVALID_TITLE`, `NOTHING_TO_CHANGE` for the same title; the host's rule sees the row (a host may allow a retitle where it refuses a rename). |
@@ -468,9 +468,9 @@ The chain, one step at a time, in the library's own transactions:
    `job.finish`;
 4. a user's cancel that crossed a step's final report (the cancel was still
    on its way to Jobs when the report landed) stops the chain there: the next
-   step is recorded as a job of its own, never sent to Jobs, ended at once by
-   the library (`JobCancelled` on that job id), and the file lands `FAILED`
-   `cancelled`. A cancel that crossed the **last** step's final report has
+   step is skipped — never launched, no job created for it — and recorded as
+   `StepSkipped { step_index, runner_type, after_job_id }`; the file lands
+   `FAILED` `cancelled` with the ended job as its last one. A cancel that crossed the **last** step's final report has
    nothing left to stop: the work is done and the file is `READY`; Jobs'
    `cancelled`, if it comes, changes nothing.
 
@@ -644,11 +644,11 @@ writers of one aggregate would hand the same `seq`.
 
 | Noun | Events (`kind`) |
 |---|---|
-| `drive_file` (`FileEvent`) | `UploadRequested { drive_id, path, name, title, media_type, size_bytes }`, `UploadCommitted`, `UploadAbandoned`, `Renamed { from, to }`, `Moved { from_drive, to_drive, from, to }`, `FolderMoved { from_path, to_path }`, `Retitled { from, to }`, `MetadataChanged { metadata }`, `LabelsChanged { added, removed }`, `ImageRequested { name }`, `ImageAvailable { name }`, `ImagesDropped { names }`, `ReportStored { job_id, done }`, `Deleted`, `FolderDeleted { prefix }`, `DriveDeleted` |
+| `drive_file` (`FileEvent`) | `UploadTicketIssued { drive_id, path, name, title, media_type, size_bytes }`, `UploadCommitted`, `UploadAbandoned`, `Renamed { from, to }`, `Moved { from_drive, to_drive, from, to }`, `FolderMoved { from_path, to_path }`, `Retitled { from, to }`, `MetadataChanged { metadata }`, `LabelsChanged { added, removed }`, `ImageUploadTicketIssued { name }`, `ImageAvailable { name }`, `ImagesDropped { names }`, `ReportStored { job_id, done }`, `Deleted`, `FolderDeleted { prefix }`, `DriveDeleted` |
 | `drive_page` (`PageEvent`) | `Reported { job_id, origin }`, `Edited`, `Trimmed` |
 | `drive_label` (`LabelEvent`) | `Created { name, color, description }`, `Updated { name, color, description }`, `Deleted` |
 | `drive_ruleset` (`RulesetEvent`) | `Created { name, trigger, media_types, steps, is_default }`, `Saved { name, media_types, steps, is_default }`, `Deleted` |
-| `drive_file_processing` (`ProcessingEvent`) | `ChainStarted { trigger, ruleset_id, steps }`, `JobCreated { job_id, step_index, runner_type }`, `JobReportedDone { job_id }`, `JobReportedFailed { job_id, reason_code, message }`, `JobFailed { job_id, failure_cause, reason_code, note }`, `JobCancelled { job_id }`, `JobCreationRejected { job_id, reason_code, params }`, `CancelRequested { job_id }`, `JobPlanDeclared { job_id, run_id, labels }`, `JobStepStarted { job_id, run_id, index, label, started_at }`, `JobQueued { job_id, runner_type }`, `JobStarted { job_id, run_id }`, `JobCompleted { job_id }`, `JobFactIgnored { job_id, received, why }` |
+| `drive_file_processing` (`ProcessingEvent`) | `ChainStarted { trigger, ruleset_id, steps }`, `JobCreated { job_id, step_index, runner_type }`, `JobReportedDone { job_id }`, `JobReportedFailed { job_id, reason_code, message }`, `JobFailed { job_id, failure_cause, reason_code, note }`, `JobCancelled { job_id }`, `JobCreationRejected { job_id, reason_code, params }`, `JobCancelSent { job_id }`, `StepSkipped { step_index, runner_type, after_job_id }`, `JobPlanDeclared { job_id, run_id, labels }`, `JobStepStarted { job_id, run_id, index, label, started_at }`, `JobQueued { job_id, runner_type }`, `JobStarted { job_id, run_id }`, `JobCompleted { job_id }`, `JobFactIgnored { job_id, received, why }` |
 
 Every payload is at schema version 1 (`FILE_EVENT_VERSION`,
 `PAGE_EVENT_VERSION`, `LABEL_EVENT_VERSION`, `RULESET_EVENT_VERSION`,
@@ -657,7 +657,24 @@ Every payload is at schema version 1 (`FILE_EVENT_VERSION`,
 label's or a rule's `Deleted`) takes the row's next version; what cascades
 with a deleted file (its pages, its processing) hands nothing more. The live
 views keep speaking their causes (`FileCause`, `PageCause`, …): the facts are
-not deltas.
+not deltas. Every fact names what happened in the library's past — a ticket
+issued, a cancel sent, a step skipped — never a request: the wire causes keep
+their 0.4.0 names (`UploadRequested`, `ImageRequested`, `CancelRequested`),
+the facts do not.
+
+Every write goes through the engine's pipeline locks: an aggregate is loaded
+with `cx.load` / `cx.load_many` before it is written, in the engine's order —
+store type, then encoded key — wherever two nouns meet (a label's files
+before the label, a file before its processing). Deleting a label loads the
+files it is on, then the label, then any file linked to it meanwhile;
+`SetFileLabels` loads the file, then every label it touches, so the two
+serialise and never wait on each other the other way round. A page or an
+image is written after its file's lock, as every bulk write of pages and
+images is. The only other lock is the name lock of label and rule saves
+(`pg_advisory_xact_lock` on the catalogue, since 0.2): what a create or a
+rename claims — a name, a default's patterns — has no aggregate to load, the
+engine offers no pipeline lock for it, and it is always taken before any
+aggregate lock.
 
 The last change is **state**: `drive.file.updated_at`,
 `drive.file_page.updated_at` / `updated_by`, `drive.label.updated_at`,
@@ -763,7 +780,7 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
 - The drive rows (`drive.drive`), the image rows (`drive.file_image`) and the
   runner-type catalogue copy stay CRUD: a drive is created and deleted by the
   host's own gesture (the host records its own facts), an image's change is
-  a fact of its file (`ImageRequested`, `ImageAvailable`, `ImagesDropped`),
+  a fact of its file (`ImageUploadTicketIssued`, `ImageAvailable`, `ImagesDropped`),
   and the catalogue copy is a cache of Jobs'. A chain's `ruleset_id` /
   `steps` snapshot on the file is recorded by `ChainStarted` on the file's
   processing, not by a file event.

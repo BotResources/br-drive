@@ -68,8 +68,20 @@ it its facts in the transaction that writes the state.
 - The library's erase rewrites the chain initiator on `drive.file_processing`
   and a page's `updated_by`; the facts, in the host's table, are the host's to
   erase.
-- Deleting a label locks the files it is on before the label, as every writer
-  of a file's labels does, then records `LabelsChanged` on each.
+- Deleting a label loads the files it is on through the pipeline
+  (`cx.load_many`) before the label, in the engine's lock order, and records
+  `LabelsChanged` on each; `SetFileLabels` loads every label it touches after
+  the file, so the two serialise. The erase locks the files whose chain names
+  the person through the pipeline too. No raw row lock is left outside the
+  stores' `Persistence::lock`.
+- Facts state what happened, never a request: the file's creation is
+  `UploadTicketIssued`, an image's `ImageUploadTicketIssued`, a user's cancel
+  `JobCancelSent`. The wire causes keep their names (`UploadRequested`,
+  `ImageRequested`, `CancelRequested`).
+- A cancel crossing a step's final report records `StepSkipped { step_index,
+  runner_type, after_job_id }`: no job id is minted for a step never
+  launched, and the file's processing keeps the ended job as its last one
+  (visible outcome unchanged: `FAILED` `cancelled`).
 
 ### Upgrading from 0.4
 
