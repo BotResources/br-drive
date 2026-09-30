@@ -285,7 +285,7 @@ pub(crate) async fn stage_image<H: DriveHost>(
         }
     }
     file.record(
-        FileEvent::ImageRequested {
+        FileEvent::ImageUploadTicketIssued {
             name: name.as_str().to_string(),
         },
         meta,

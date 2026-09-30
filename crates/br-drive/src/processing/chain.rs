@@ -182,8 +182,8 @@ pub(crate) async fn start_chain<H: DriveHost>(
 /// transaction: the job settles, Jobs is told (`job.finish`), and the chain
 /// moves on — the next step's job, or the end of the chain (READY). Jobs' own
 /// `completed` then only confirms it. A user's cancel that crossed the report
-/// stops the chain there: the next step is recorded as never started,
-/// `cancelled`; on the last step there is nothing left to stop and the file
+/// stops the chain there: the next step is skipped (`StepSkipped`), never
+/// launched, and the file is FAILED `cancelled`; on the last step there is nothing left to stop and the file
 /// is READY.
 pub(crate) async fn report_done<H: DriveHost>(
     cx: &mut Ops<'_>,
@@ -201,7 +201,13 @@ pub(crate) async fn report_done<H: DriveHost>(
     let next = usize::try_from(step_index).unwrap_or(0) + 1;
     let has_next = file.steps.as_ref().is_some_and(|steps| next < steps.len());
     if cancel_requested && has_next {
-        processing.stop_before(i32::try_from(next).unwrap_or(i32::MAX), meta);
+        let runner_type = file
+            .steps
+            .as_ref()
+            .and_then(|steps| steps.get(next))
+            .map(|step| step.runner_type.clone())
+            .unwrap_or_default();
+        processing.skip_step(i32::try_from(next).unwrap_or(i32::MAX), runner_type, meta);
         save_processing(cx, file, processing).await?;
         crate::file::file_changed::<H>(
             cx,

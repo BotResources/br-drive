@@ -439,17 +439,8 @@ impl World {
     }
 
     /// The jobs of a file, in their order, as its processing facts tell them:
-    /// each job's id, chain step and end kind (`None` while it runs). A step
-    /// the chain stopped before (a job never asked of Jobs) takes its step
-    /// from the processing row.
+    /// each job's id, chain step and end kind (`None` while it runs).
     pub async fn job_log(&self, file_id: Uuid) -> Vec<(Uuid, i32, Option<String>)> {
-        let current: Option<(Uuid, i32)> = sqlx::query_as(
-            "SELECT job_id, step_index FROM drive.file_processing WHERE file_id = $1",
-        )
-        .bind(file_id)
-        .fetch_optional(&self.db.app)
-        .await
-        .expect("read the file's processing");
         let mut log: Vec<(Uuid, i32, Option<String>)> = Vec::new();
         for fact in self.processing_facts(file_id).await {
             let Some(job) = fact.job_id() else { continue };
@@ -461,17 +452,8 @@ impl World {
             let Some(kind) = end_kind(&fact.event_type) else {
                 continue;
             };
-            match log.iter_mut().find(|(id, _, _)| *id == job) {
-                Some(entry) => {
-                    entry.2.get_or_insert_with(|| kind.to_string());
-                }
-                None => {
-                    let step = current
-                        .filter(|(id, _)| *id == job)
-                        .map(|(_, step)| step)
-                        .unwrap_or_default();
-                    log.push((job, step, Some(kind.to_string())));
-                }
+            if let Some(entry) = log.iter_mut().find(|(id, _, _)| *id == job) {
+                entry.2.get_or_insert_with(|| kind.to_string());
             }
         }
         log
@@ -492,7 +474,7 @@ impl World {
         self.job_facts(job_id)
             .await
             .iter()
-            .filter(|fact| fact.event_type == "CancelRequested")
+            .filter(|fact| fact.event_type == "JobCancelSent")
             .count() as i64
     }
 

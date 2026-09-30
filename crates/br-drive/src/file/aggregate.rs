@@ -164,8 +164,9 @@ pub const FILE_EVENT_VERSION: i32 = 1;
 #[serde(tag = "kind")]
 #[non_exhaustive]
 pub enum FileEvent {
-    /// A file was created, pending its upload.
-    UploadRequested {
+    /// A file was created, pending its upload: the uploader was issued a
+    /// presigned upload ticket for these bytes.
+    UploadTicketIssued {
         drive_id: Uuid,
         path: String,
         name: String,
@@ -206,8 +207,8 @@ pub enum FileEvent {
         added: Vec<Uuid>,
         removed: Vec<Uuid>,
     },
-    /// A runner asked to upload an extracted image.
-    ImageRequested {
+    /// A runner was issued a presigned upload ticket for an extracted image.
+    ImageUploadTicketIssued {
         name: String,
     },
     /// An extracted image landed.
@@ -238,7 +239,7 @@ impl crate::facts::DriveEvent for FileEvent {
 
     fn kind(&self) -> &'static str {
         match self {
-            Self::UploadRequested { .. } => "UploadRequested",
+            Self::UploadTicketIssued { .. } => "UploadTicketIssued",
             Self::UploadCommitted => "UploadCommitted",
             Self::UploadAbandoned => "UploadAbandoned",
             Self::Renamed { .. } => "Renamed",
@@ -247,7 +248,7 @@ impl crate::facts::DriveEvent for FileEvent {
             Self::Retitled { .. } => "Retitled",
             Self::MetadataChanged { .. } => "MetadataChanged",
             Self::LabelsChanged { .. } => "LabelsChanged",
-            Self::ImageRequested { .. } => "ImageRequested",
+            Self::ImageUploadTicketIssued { .. } => "ImageUploadTicketIssued",
             Self::ImageAvailable { .. } => "ImageAvailable",
             Self::ImagesDropped { .. } => "ImagesDropped",
             Self::ReportStored { .. } => "ReportStored",

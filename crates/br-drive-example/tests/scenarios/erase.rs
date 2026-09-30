@@ -76,7 +76,7 @@ async fn anonymising_a_person_rewrites_every_id_they_left_and_keeps_their_files(
     assert!(
         requests
             .iter()
-            .any(|fact| fact.event_type == "CancelRequested" && fact.actor_id == person_id),
+            .any(|fact| fact.event_type == "JobCancelSent" && fact.actor_id == person_id),
         "the cancel is the person's fact: {requests:?}"
     );
 

@@ -99,9 +99,7 @@ pub enum ProcessingEvent {
         reason_code: String,
         note: Option<String>,
     },
-    /// Jobs cancelled the job — or the library stopped the chain before the
-    /// next step, because a user's cancel crossed the previous step's final
-    /// report: that step is a job id of its own, never asked of Jobs.
+    /// Jobs cancelled the job.
     JobCancelled { job_id: Uuid },
     /// Jobs refused to create the job.
     JobCreationRejected {
@@ -109,8 +107,17 @@ pub enum ProcessingEvent {
         reason_code: String,
         params: serde_json::Value,
     },
-    /// A user asked to cancel the running job.
-    CancelRequested { job_id: Uuid },
+    /// The library sent Jobs the cancel of the running job (`job.cancel`),
+    /// on a user's gesture; Jobs' `cancelled` settles it.
+    JobCancelSent { job_id: Uuid },
+    /// The chain stopped before step `step_index`: a user's cancel was
+    /// pending when `after_job_id`, the previous step's job, was reported
+    /// done, so the step's job was never created nor asked of Jobs.
+    StepSkipped {
+        step_index: i32,
+        runner_type: String,
+        after_job_id: Uuid,
+    },
     /// The runner declared its plan, in a run of the job.
     JobPlanDeclared {
         job_id: Uuid,
@@ -156,7 +163,8 @@ impl DriveEvent for ProcessingEvent {
             Self::JobFailed { .. } => "JobFailed",
             Self::JobCancelled { .. } => "JobCancelled",
             Self::JobCreationRejected { .. } => "JobCreationRejected",
-            Self::CancelRequested { .. } => "CancelRequested",
+            Self::JobCancelSent { .. } => "JobCancelSent",
+            Self::StepSkipped { .. } => "StepSkipped",
             Self::JobPlanDeclared { .. } => "JobPlanDeclared",
             Self::JobStepStarted { .. } => "JobStepStarted",
             Self::JobQueued { .. } => "JobQueued",
@@ -603,7 +611,7 @@ impl<H> FileProcessing<H> {
     }
 
     /// The runner's final report ended the running job. The chain moves on
-    /// from the caller: `create_job`, `stop_before`, or nothing (READY).
+    /// from the caller: `create_job`, `skip_step`, or nothing (READY).
     pub(crate) fn report_done(&mut self, meta: &FactMeta) {
         let job_id = self.job_id;
         self.end(None, meta);
@@ -632,17 +640,21 @@ impl<H> FileProcessing<H> {
         );
     }
 
-    /// A user's cancel crossed the final report of the previous step: step
-    /// `step_index` is recorded as never started, cancelled — a job id of its
-    /// own, never asked of Jobs.
-    pub(crate) fn stop_before(&mut self, step_index: i32, meta: &FactMeta) {
-        let job_id = Uuid::now_v7();
-        self.retire_current_job();
-        self.job_id = job_id;
-        self.step_index = step_index;
-        self.job_created_at = meta.occurred_at;
+    /// A user's cancel crossed the final report of the running job: the
+    /// chain stops before step `step_index`, which is never launched, and the
+    /// file is FAILED `cancelled`. The state keeps the ended job as the file's
+    /// last one — no job id is minted for a step that never ran.
+    pub(crate) fn skip_step(&mut self, step_index: i32, runner_type: String, meta: &FactMeta) {
+        let after_job_id = self.job_id;
         self.end(Some((CANCELLED.to_string(), None)), meta);
-        self.push(ProcessingEvent::JobCancelled { job_id }, meta);
+        self.push(
+            ProcessingEvent::StepSkipped {
+                step_index,
+                runner_type,
+                after_job_id,
+            },
+            meta,
+        );
     }
 
     /// A user asked to cancel the running job; the first request is the one
@@ -651,7 +663,7 @@ impl<H> FileProcessing<H> {
         let job_id = self.job_id;
         self.cancel_requested_at.get_or_insert(meta.occurred_at);
         self.updated_at = meta.occurred_at;
-        self.push(ProcessingEvent::CancelRequested { job_id }, meta);
+        self.push(ProcessingEvent::JobCancelSent { job_id }, meta);
     }
 
     /// Whether a user asked to cancel the running job.
@@ -1090,22 +1102,58 @@ mod tests {
     }
 
     #[test]
-    fn a_cancel_crossing_the_final_report_stops_the_chain_on_a_job_of_its_own() {
+    fn a_cancel_crossing_the_final_report_skips_the_next_step_on_the_ended_job() {
         let mut processing = running();
         let ran = processing.job_id;
         processing.request_cancel(&meta());
         assert!(processing.cancel_requested());
         processing.report_done(&meta());
-        processing.stop_before(1, &meta());
+        processing.skip_step(1, "index".into(), &meta());
         assert_eq!(processing.state, ProcessingState::Failed);
         assert_eq!(processing.error_code.as_deref(), Some(CANCELLED));
-        assert_ne!(processing.job_id, ran);
-        assert_eq!(processing.step_index, 1);
-        assert!(!processing.cancel_requested());
         assert_eq!(
-            processing.receive(ran, Received::Completed, &meta()),
-            Applied::Ignored
+            processing.job_id, ran,
+            "no job is minted for a step never launched"
         );
+        assert_eq!(processing.step_index, 0);
+        assert_eq!(
+            kinds(&processing)[2..],
+            ["JobCancelSent", "JobReportedDone", "StepSkipped"]
+        );
+        let Some(Stamped {
+            event:
+                ProcessingEvent::StepSkipped {
+                    step_index,
+                    runner_type,
+                    after_job_id,
+                },
+            ..
+        }) = processing.pending().last()
+        else {
+            panic!("the skipped step is a fact");
+        };
+        assert_eq!(
+            (*step_index, runner_type.as_str(), *after_job_id),
+            (1, "index", ran)
+        );
+        assert_eq!(
+            processing.receive(ran, Received::Cancelled, &meta()),
+            Applied::Ignored,
+            "Jobs' late cancel of the ended job moves nothing"
+        );
+    }
+
+    #[test]
+    fn no_fact_of_the_library_is_named_as_a_request() {
+        let mut processing = running();
+        processing.request_cancel(&meta());
+        processing.report_done(&meta());
+        processing.skip_step(1, "index".into(), &meta());
+        for kind in kinds(&processing) {
+            for word in ["Requested", "Wanted", "Needed"] {
+                assert!(!kind.ends_with(word), "{kind} is not a fact");
+            }
+        }
     }
 
     #[test]

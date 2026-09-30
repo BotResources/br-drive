@@ -124,7 +124,7 @@ async fn every_change_is_a_fact_in_the_host_table_naming_its_hand_and_its_gestur
     assert_eq!(
         hands,
         vec![
-            ("UploadRequested", owner_id, "human", false),
+            ("UploadTicketIssued", owner_id, "human", false),
             ("UploadCommitted", owner_id, "human", false),
             ("ReportStored", runner_id, "service", true),
         ]
@@ -332,6 +332,20 @@ async fn every_change_is_a_fact_in_the_host_table_naming_its_hand_and_its_gestur
         .unwrap()
         .clone();
     assert_eq!(instant(&rule_view["updatedAt"]), rule_facts[1].occurred_at);
+
+    // And: every fact the gestures handed states what happened — none is
+    // named as a request
+    let types: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT event_type FROM workspace_fact ORDER BY event_type")
+            .fetch_all(&world.db.app)
+            .await
+            .unwrap();
+    assert!(types.len() >= 10, "{types:?}");
+    for kind in &types {
+        for word in ["Requested", "Wanted", "Needed"] {
+            assert!(!kind.ends_with(word), "{kind} is not a fact: {types:?}");
+        }
+    }
 
     world.cleanup().await;
 }

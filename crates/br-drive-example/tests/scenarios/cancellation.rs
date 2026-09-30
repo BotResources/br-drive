@@ -17,7 +17,7 @@ use crate::harness::upload::{
 };
 use crate::harness::{
     JobsStandIn, World, drive_subscription, error_code, manager_passport, next_drive_delta, ok,
-    passport, refute_delta, service_passport,
+    passport, refute_delta, service_passport, service_passport_as,
 };
 
 const BYTES: &[u8] = b"a document the runners never pick up";
@@ -309,7 +309,8 @@ async fn a_cancel_that_crosses_a_steps_final_report_stops_the_chain_there() {
     let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
     let owner = passport(Uuid::now_v7());
-    let runner = service_passport(&[RUNNER_SCOPE]);
+    let runner_id = Uuid::now_v7();
+    let runner = service_passport_as(runner_id, &[RUNNER_SCOPE]);
     two_step_rule(&world, &manager).await;
     let drive = world.create_workspace(&owner, "library").await;
     let file_id = upload_processed(
@@ -352,13 +353,34 @@ async fn a_cancel_that_crosses_a_steps_final_report_stops_the_chain_there() {
     jobs.await_finish(first).await;
     jobs.expect_no_command(Duration::from_secs(1)).await;
     let log = world.job_log(file_id).await;
-    assert_eq!(log.len(), 2, "the step never started is recorded as such");
-    assert_eq!(log[0].2.as_deref(), Some("reported_done"));
-    assert_eq!(log[1].1, 1);
     assert_eq!(
-        log[1].2.as_deref(),
-        Some("cancelled"),
-        "a job row of its own, ended cancelled before it started"
+        log,
+        vec![(first, 0, Some("reported_done".to_string()))],
+        "no job exists for the step never launched"
+    );
+    let processing = world.processing_facts(file_id).await;
+    let skipped: Vec<_> = processing
+        .iter()
+        .filter(|fact| fact.event_type == "StepSkipped")
+        .collect();
+    assert_eq!(skipped.len(), 1, "{processing:?}");
+    assert_eq!(
+        skipped[0].payload,
+        serde_json::json!({
+            "kind": "StepSkipped",
+            "step_index": 1,
+            "runner_type": INDEX,
+            "after_job_id": first,
+        })
+    );
+    assert_eq!(
+        skipped[0].actor_id, runner_id,
+        "the runner's report stopped it"
+    );
+    assert_eq!(
+        processing.last().map(|fact| fact.event_type.as_str()),
+        Some("StepSkipped"),
+        "the skipped step is the chain's last fact"
     );
     assert_eq!(
         world.file_pages(&owner, file_id).await.len(),

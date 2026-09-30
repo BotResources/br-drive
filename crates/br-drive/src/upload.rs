@@ -140,7 +140,7 @@ pub fn request_upload<'m, H: DriveHost>(
         };
         let meta = FactMeta::of(cx.principal(), now);
         file.record(
-            FileEvent::UploadRequested {
+            FileEvent::UploadTicketIssued {
                 drive_id: file.drive_id,
                 path: file.path.as_str().to_string(),
                 name: file.name.as_str().to_string(),
