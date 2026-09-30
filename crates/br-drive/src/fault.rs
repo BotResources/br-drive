@@ -1,3 +1,6 @@
+use std::convert::Infallible;
+
+use service_engine::OrInternal;
 use service_engine::error::EngineError;
 use service_engine::gate::Reason;
 use service_engine::inbound::{Disposition, ReactionError, sqlx_is_terminal};
@@ -52,8 +55,8 @@ pub mod codes {
 pub enum DriveFault {
     #[error("refused: {}", .0.code())]
     Refused(Reason),
-    #[error("engine: {0}")]
-    Engine(EngineError),
+    #[error("the drive's store or engine failed")]
+    Engine(#[source] EngineError),
 }
 
 impl MutationFault for DriveFault {
@@ -71,7 +74,14 @@ impl DriveFault {
             Self::Refused(reason) => {
                 service_engine::coded_error(reason.code(), "the drive refused the request")
             }
-            Self::Engine(error) => async_graphql::Error::new(error.to_string()),
+            // A fault never reaches the client as text: logged with its
+            // whole cause chain, answered `INTERNAL`.
+            fault @ Self::Engine(_) => {
+                match Err::<Infallible, _>(fault).or_internal("the drive failed") {
+                    Ok(never) => match never {},
+                    Err(error) => error,
+                }
+            }
         }
     }
 }
@@ -104,26 +114,22 @@ impl From<sqlx::Error> for DriveFault {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DriveReactionFault {
+    /// A refusal: its reason code, dead-lettered on the first delivery.
     #[error("terminal: {0}")]
     Terminal(String),
-    #[error("store: {0}")]
-    Store(String),
+    /// A store or engine fault, kept as the source of the dead-letter and
+    /// log text: retried, or dead-lettered when the database says a retry
+    /// cannot succeed.
+    #[error("the drive's store failed")]
+    Store(#[from] EngineError),
 }
 
 impl ReactionError for DriveReactionFault {
     fn disposition(&self) -> Disposition {
         match self {
             Self::Terminal(_) => Disposition::Terminal,
+            Self::Store(EngineError::Db(db)) if sqlx_is_terminal(db) => Disposition::Terminal,
             Self::Store(_) => Disposition::Retry,
-        }
-    }
-}
-
-impl From<EngineError> for DriveReactionFault {
-    fn from(error: EngineError) -> Self {
-        match &error {
-            EngineError::Db(db) if sqlx_is_terminal(db) => Self::Terminal(error.to_string()),
-            _ => Self::Store(error.to_string()),
         }
     }
 }

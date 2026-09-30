@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use service_engine::error::EngineError;
+use service_engine::page::KeyCeiling;
 use service_engine::persistence::{Aggregate, CohortIndex, Persistence, PersistenceStyle};
 use service_engine::{BlobRef, Cohort};
 use sqlx::{PgConnection, Row};
@@ -215,22 +216,6 @@ impl<H: DriveHost> Persistence for FileStore<H> {
 
     const STYLE: PersistenceStyle = PersistenceStyle::SoftEda;
 
-    fn load<'a>(
-        conn: &'a mut PgConnection,
-        key: &'a Uuid,
-    ) -> BoxFuture<'a, Result<Option<FileRow<H>>, EngineError>> {
-        Box::pin(async move {
-            let row = sqlx::query(&format!(
-                "SELECT {} FROM {FILE_FROM} WHERE f.id = $1",
-                file_select("")
-            ))
-            .bind(key)
-            .fetch_optional(conn)
-            .await?;
-            row.as_ref().map(row_to_file).transpose()
-        })
-    }
-
     fn lock<'a>(
         conn: &'a mut PgConnection,
         key: &'a Uuid,
@@ -337,10 +322,11 @@ impl<H: DriveHost> CohortIndex for FileStore<H> {
     fn keys_in_cohorts<'a>(
         conn: &'a mut PgConnection,
         cohorts: &'a [Cohort],
+        ceiling: KeyCeiling,
     ) -> BoxFuture<'a, Result<Vec<Uuid>, EngineError>> {
         Box::pin(async move {
             let drives = Cohort::uuids(cohorts, DRIVE_DIM);
-            ids_in_drives(conn, &drives).await
+            ids_in_drives(conn, &drives, ceiling.limit()).await
         })
     }
 }
@@ -467,19 +453,24 @@ pub async fn image_refs_of_files(
         .collect())
 }
 
+/// The files of `drives`, at most `limit` of them: a window binds its
+/// populate's ceiling, a gesture over a whole drive binds `i64::MAX`.
 pub async fn ids_in_drives(
     conn: &mut PgConnection,
     drives: &[Uuid],
+    limit: i64,
 ) -> Result<Vec<Uuid>, EngineError> {
-    let rows = sqlx::query("SELECT id FROM drive.file WHERE drive_id = ANY($1) ORDER BY id")
-        .bind(drives)
-        .fetch_all(conn)
-        .await?;
+    let rows =
+        sqlx::query("SELECT id FROM drive.file WHERE drive_id = ANY($1) ORDER BY id LIMIT $2")
+            .bind(drives)
+            .bind(limit)
+            .fetch_all(conn)
+            .await?;
     Ok(rows.iter().map(|row| row.get::<Uuid, _>("id")).collect())
 }
 
 pub async fn ids_in_drive(conn: &mut PgConnection, drive: Uuid) -> Result<Vec<Uuid>, EngineError> {
-    ids_in_drives(conn, &[drive]).await
+    ids_in_drives(conn, &[drive], i64::MAX).await
 }
 
 /// The files of `drive` still in flight: uploads not confirmed, and files
@@ -716,10 +707,19 @@ pub async fn page_exists(
     Ok(exists)
 }
 
-pub async fn page_numbers(conn: &mut PgConnection, file_id: Uuid) -> Result<Vec<i32>, EngineError> {
-    let rows = sqlx::query("SELECT number FROM drive.file_page WHERE file_id = $1 ORDER BY number")
-        .bind(file_id)
-        .fetch_all(conn)
-        .await?;
+/// The page numbers of `file_id`, at most `limit` of them (the page window's
+/// populate ceiling).
+pub async fn page_numbers(
+    conn: &mut PgConnection,
+    file_id: Uuid,
+    limit: i64,
+) -> Result<Vec<i32>, EngineError> {
+    let rows = sqlx::query(
+        "SELECT number FROM drive.file_page WHERE file_id = $1 ORDER BY number LIMIT $2",
+    )
+    .bind(file_id)
+    .bind(limit)
+    .fetch_all(conn)
+    .await?;
     Ok(rows.iter().map(|row| row.get::<i32, _>("number")).collect())
 }

@@ -9,6 +9,100 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.6.0 — 2026-09-30
+
+Moves the library to `br-service-engine` **v0.4.0** (the engine's breaking
+release after 0.3.4); two engine versions cannot coexist in one host, so a
+host moves with it. br-drive's GraphQL surface is unchanged (the committed
+SDL did not move): the engine forced the window bound, the reads without a
+raw pool and the fault rendering below. `cargo semver-checks` against
+v0.5.1 reports a major change (`known_runner_types` arity, the
+`DriveReactionFault` auto traits); `runner_context`'s parameter type and the
+`DriveReactionFault::Store` payload change as well, which it does not see.
+
+### Breaking
+
+- **Engine pin `v0.4.0`.** A host pins `service-engine` at `tag = "v0.4.0"`
+  and applies the engine's own *Adopter migration* to its code (pure
+  `PassportPrincipal::from_passport(passport)` with database facts in
+  `register_principal_fact` loaders, `CohortIndex::keys_in_cohorts(…,
+  ceiling)` binding `ceiling.limit()`, a required batched `read_many` and no
+  `load` override, `.or_internal(…)?` on a `WindowSpec::view` result, fault
+  types that keep their source). The example host shows each one.
+  *Migration:* bump both pins; follow the engine CHANGELOG's migration lines.
+- **Lists are bounded by the engine's `window_capacity`** (default 10,000):
+  `<p>DriveFiles`, `<p>Pages`, `<p>Labels`, `<p>Rulesets`, `<p>RunnerTypes`
+  and a new `<p>DriveChanged` / `<p>FilePages` / `<p>LabelsChanged` /
+  `<p>RulesetsChanged` session over the capacity are refused
+  `WINDOW_TOO_LARGE`; a live session is never ended for its size, and
+  `<p>File` / `<p>FileAccess` still read one row. Through 0.5.1 a list read
+  the whole drive. *Migration:* a host whose drives can exceed the default
+  raises `EngineConfig::with_window_capacity(n)`.
+- **`known_runner_types(&Query<'_, H>) -> async_graphql::Result<Vec<DriveRunnerType>>`**
+  (was `(pool, principal) -> Result<_, DriveFault>`): the engine hands a
+  resolver no raw pool, so the catalogue copy is read through the new
+  `DriveRunnerTypes` view. *Migration:*
+  `br_drive::known_runner_types::<P>(&service_engine::Query::<P>::new(ctx)?).await`.
+- **`runner_context(&Query<'_, H>, principal, file_id, job_id) -> async_graphql::Result<RunnerContext>`**
+  (was `(pool, principal, file_id, job_id) -> Result<_, DriveFault>`): read
+  behind the runner source gate (`Query::behind`), in one read-only
+  snapshot. *Migration:* pass `&Query::<P>::new(ctx)?` for the pool and drop
+  the `.map_err(DriveFault::into_graphql)`.
+- **`DriveReactionFault::Store(EngineError)`** (was `Store(String)`), built
+  by `From<EngineError>` (`#[from]`) and kept as the source of the
+  dead-letter and log text; a database fault a retry cannot fix is now
+  `Store(..)` with the `Terminal` disposition (was `Terminal(text)`), and the
+  type is no longer `UnwindSafe` / `RefUnwindSafe` (as the engine's own
+  reference faults). *Migration:* match `Store(error)` on the `EngineError`,
+  build it with `.into()` / `?`; `Terminal(code)` keeps a refusal's code.
+- **A store or engine fault never reaches a client as text.**
+  `DriveFault::into_graphql` answers the engine's coded `INTERNAL` for
+  `DriveFault::Engine` (logged with its cause chain through `OrInternal`);
+  through 0.5.1 it sent the error's `Display`, database text included.
+  `DriveFault::Engine` keeps the `EngineError` as its `source()` and writes
+  only its own context in `Display`. *Migration:* none, unless a client read
+  that text: read the log instead.
+- **The stores' one-key read is the engine's.** `FileProcessingStore`,
+  `LabelStore`, `RulesetStore` and the stores behind `FileRow`,
+  `ImageRecord` and the page and file views no longer carry a
+  `Persistence::load` (the engine 0.4.0 trait has none). *Migration:*
+  `use service_engine::PersistenceExt;` and call `RulesetStore::<P>::load(conn, &id)`
+  (the same call as before, now from the extension trait).
+
+### Added
+
+- **`DriveRunnerTypes<H>`**, the closed view behind `<p>RunnerTypes`, over
+  the read-only `RunnerTypeStore` (`save` and `create` refuse: the watch is
+  the only writer) and the noun `KnownRunnerType`, open-access
+  (`RunnerTypeAccess`) and gated on the host's `ReadRulesets`; `register`
+  registers it (projector `drive_runner_types`). `DriveRunnerType` and
+  `DriveRunnerTypeLifecycle` derive `Serialize` / `Deserialize`.
+- `ImageStore` implements the batched `read_many` (one statement over
+  `(file_id, name)` pairs).
+
+### Changed
+
+- `watch_runner_types_of(engine)` keeps its signature but runs on a small
+  pool of its own (at most two connections, connected lazily) on
+  `DATABASE_URL` — the URL `run_service` boots the engine's pool from — since
+  the engine hands its pool to no caller; without a usable `DATABASE_URL` it
+  logs a `warn` and does not start. A host holding its pool keeps calling
+  `watch_runner_types(nats, pool)`.
+- Every view's `populate` binds the engine's ceiling as the `LIMIT` of its
+  key read (`cx.limit_all()`), so a refused attach or list reads at most one
+  key past the capacity.
+- The runner source presign is gated in `RunnerSources::visible` — a
+  runner, inside a runner scope, the job's own file, with that job active for
+  the presign (`scoped_to_job`); no scope admits no row — since
+  `Query::download` now gates on the row's visibility rather than the view's
+  window.
+- The example host: a pure `from_passport`, its faults keep their source,
+  its second test host loads its drives through a fact loader, and a
+  scenario proves the window capacity on a drive (the list and a new session
+  refused, a live session kept, one file read and downloaded).
+- README: the engine compatibility table gains its 0.6 row (`v0.4.0`); the
+  window capacity and the catalogue watch's own pool are documented.
+
 ## 0.5.1 — 2026-09-30
 
 Additive only: no signature or behaviour of 0.5.0 changes, and a host on

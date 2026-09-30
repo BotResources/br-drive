@@ -56,12 +56,8 @@ macro_rules! drive_slice {
                     &self,
                     ctx: &::async_graphql::Context<'_>,
                 ) -> ::async_graphql::Result<::std::vec::Vec<$crate::DriveRunnerType>> {
-                    let principal = ctx.data::<$p>()?;
-                    let state = ctx
-                        .data::<::std::sync::Arc<::service_engine::GraphqlState<$p>>>()?;
-                    $crate::known_runner_types::<$p>(state.pg(), principal)
+                    $crate::known_runner_types::<$p>(&::service_engine::Query::<$p>::new(ctx)?)
                         .await
-                        .map_err($crate::DriveFault::into_graphql)
                 }
 
                 async fn [<$prefix _labels>](
@@ -132,17 +128,9 @@ macro_rules! drive_slice {
                     job_id: ::uuid::Uuid,
                 ) -> ::async_graphql::Result<$crate::RunnerContext> {
                     let principal = ctx.data::<$p>()?;
-                    let state = ctx
-                        .data::<::std::sync::Arc<::service_engine::GraphqlState<$p>>>()?;
-                    let mut context = $crate::runner_context::<$p>(
-                        state.pg(),
-                        principal,
-                        file_id,
-                        job_id,
-                    )
-                    .await
-                    .map_err($crate::DriveFault::into_graphql)?;
                     let query = ::service_engine::Query::<$p>::new(ctx)?;
+                    let mut context =
+                        $crate::runner_context::<$p>(&query, principal, file_id, job_id).await?;
                     let url = $crate::scoped_to_job(
                         file_id,
                         job_id,
@@ -589,9 +577,12 @@ macro_rules! drive_slice {
                     use ::futures_util::StreamExt;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
-                        ::std::vec![::service_engine::session::WindowSpec::view::<
-                            $crate::DriveFiles<$p>,
-                        >(&$crate::DriveWindow::of(drive_id), false)?],
+                        ::std::vec![::service_engine::OrInternal::or_internal(
+                            ::service_engine::session::WindowSpec::view::<
+                                $crate::DriveFiles<$p>,
+                            >(&$crate::DriveWindow::of(drive_id), false),
+                            "encode the drive files window",
+                        )?],
                     )
                     .await?;
                     ::core::result::Result::Ok(
@@ -611,9 +602,12 @@ macro_rules! drive_slice {
                     use ::futures_util::StreamExt;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
-                        ::std::vec![::service_engine::session::WindowSpec::view::<
-                            $crate::DrivePages<$p>,
-                        >(&$crate::PageWindow::of(file_id), false)?],
+                        ::std::vec![::service_engine::OrInternal::or_internal(
+                            ::service_engine::session::WindowSpec::view::<
+                                $crate::DrivePages<$p>,
+                            >(&$crate::PageWindow::of(file_id), false),
+                            "encode the file pages window",
+                        )?],
                     )
                     .await?;
                     ::core::result::Result::Ok(
@@ -632,9 +626,12 @@ macro_rules! drive_slice {
                     use ::futures_util::StreamExt;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
-                        ::std::vec![::service_engine::session::WindowSpec::view::<
-                            $crate::DriveLabels<$p>,
-                        >(&::core::default::Default::default(), false)?],
+                        ::std::vec![::service_engine::OrInternal::or_internal(
+                            ::service_engine::session::WindowSpec::view::<
+                                $crate::DriveLabels<$p>,
+                            >(&::core::default::Default::default(), false),
+                            "encode the labels window",
+                        )?],
                     )
                     .await?;
                     ::core::result::Result::Ok(
@@ -653,9 +650,12 @@ macro_rules! drive_slice {
                     use ::futures_util::StreamExt;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
-                        ::std::vec![::service_engine::session::WindowSpec::view::<
-                            $crate::DriveRulesets<$p>,
-                        >(&::core::default::Default::default(), false)?],
+                        ::std::vec![::service_engine::OrInternal::or_internal(
+                            ::service_engine::session::WindowSpec::view::<
+                                $crate::DriveRulesets<$p>,
+                            >(&::core::default::Default::default(), false),
+                            "encode the rulesets window",
+                        )?],
                     )
                     .await?;
                     ::core::result::Result::Ok(

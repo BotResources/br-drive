@@ -1,5 +1,5 @@
 use futures_util::future::BoxFuture;
-use service_engine::Cohort;
+use service_engine::{Cohort, KeyCeiling};
 use service_engine::error::EngineError;
 use service_engine::persistence::{Aggregate, CohortIndex, Persistence, PersistenceStyle};
 use sqlx::{PgConnection, PgPool, Row};
@@ -61,21 +61,6 @@ impl Persistence for WorkspaceStore {
     type Event = ();
 
     const STYLE: PersistenceStyle = PersistenceStyle::Crud;
-
-    fn load<'a>(
-        conn: &'a mut PgConnection,
-        key: &'a Uuid,
-    ) -> BoxFuture<'a, Result<Option<WorkspaceRow>, EngineError>> {
-        Box::pin(async move {
-            let row = sqlx::query(&format!("SELECT {COLUMNS} FROM workspace WHERE id = $1"))
-                .bind(key)
-                .fetch_optional(&mut *conn)
-                .await?;
-            let mut found: Vec<WorkspaceRow> = row.as_ref().map(row_to_workspace).into_iter().collect();
-            with_file_counts(conn, &mut found).await?;
-            Ok(found.pop())
-        })
-    }
 
     fn lock<'a>(
         conn: &'a mut PgConnection,
@@ -159,11 +144,13 @@ impl CohortIndex for WorkspaceStore {
     fn keys_in_cohorts<'a>(
         conn: &'a mut PgConnection,
         cohorts: &'a [Cohort],
+        ceiling: KeyCeiling,
     ) -> BoxFuture<'a, Result<Vec<Uuid>, EngineError>> {
         Box::pin(async move {
             let owners = Cohort::uuids(cohorts, OWNER_DIM);
-            let rows = sqlx::query("SELECT id FROM workspace WHERE owner_id = ANY($1)")
+            let rows = sqlx::query("SELECT id FROM workspace WHERE owner_id = ANY($1) LIMIT $2")
                 .bind(&owners)
+                .bind(ceiling.limit())
                 .fetch_all(conn)
                 .await?;
             Ok(rows.iter().map(|row| row.get::<Uuid, _>("id")).collect())

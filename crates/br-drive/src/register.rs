@@ -1,6 +1,7 @@
 use service_engine::Engine;
 use service_engine::error::EngineError;
 
+use crate::catalogue::DriveRunnerTypes;
 use crate::erase::DriveErasure;
 use crate::file::images::{IMAGE_LANDED_DURABLE, ImageLanded, image_landed};
 use crate::file::{
@@ -48,6 +49,7 @@ pub fn register<H: DriveHost>(
     engine.register_view(RunnerSources::<H>::default())?;
     engine.register_view(DriveRulesets::<H>::default())?;
     engine.register_view(DriveLabels::<H>::default())?;
+    engine.register_view(DriveRunnerTypes::<H>::default())?;
     engine.register_erasable(DriveErasure::<H>::default())?;
     engine.register_mutation::<RequestUpload, _>(upload::request_upload::<H>)?;
     engine.register_mutation::<RequestUploadWithRuleset, _>(

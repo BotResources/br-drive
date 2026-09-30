@@ -72,7 +72,10 @@ impl<H: DriveHost> Projector for DriveRulesets<H> {
         }
         let mut conn = cx.pool().acquire().await.map_err(EngineError::from)?;
         Ok(catalogue_window::<Ruleset>(
-            all_ids(&mut conn).await?.into_iter().collect(),
+            all_ids(&mut conn, cx.limit_all())
+                .await?
+                .into_iter()
+                .collect(),
         ))
     }
 

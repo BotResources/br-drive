@@ -128,19 +128,6 @@ impl<H: DriveHost> Persistence for LabelStore<H> {
 
     const STYLE: PersistenceStyle = PersistenceStyle::SoftEda;
 
-    fn load<'a>(
-        conn: &'a mut PgConnection,
-        key: &'a Uuid,
-    ) -> BoxFuture<'a, Result<Option<LabelRecord<H>>, EngineError>> {
-        Box::pin(async move {
-            let row = sqlx::query(&format!("SELECT {COLUMNS} FROM drive.label WHERE id = $1"))
-                .bind(key)
-                .fetch_optional(conn)
-                .await?;
-            Ok(row.as_ref().map(record))
-        })
-    }
-
     fn lock<'a>(
         conn: &'a mut PgConnection,
         key: &'a Uuid,
@@ -268,8 +255,11 @@ impl<H: DriveHost> SoftEda for LabelRecord<H> {
     }
 }
 
-pub async fn all_ids(conn: &mut PgConnection) -> Result<Vec<Uuid>, EngineError> {
-    let rows = sqlx::query("SELECT id FROM drive.label")
+/// Every id of the catalogue, at most `limit` of them (the window's
+/// populate ceiling).
+pub async fn all_ids(conn: &mut PgConnection, limit: i64) -> Result<Vec<Uuid>, EngineError> {
+    let rows = sqlx::query("SELECT id FROM drive.label LIMIT $1")
+        .bind(limit)
         .fetch_all(conn)
         .await?;
     Ok(rows.iter().map(|row| row.get::<Uuid, _>("id")).collect())

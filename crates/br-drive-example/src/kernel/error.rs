@@ -9,7 +9,7 @@ pub const WORKSPACE_NOT_FOUND: Reason = Reason::new("WORKSPACE_NOT_FOUND");
 pub enum AppFault {
     #[error("refused: {}", .0.code())]
     Refused(Reason),
-    #[error("engine: {0}")]
+    #[error("the store or engine failed")]
     Engine(#[from] EngineError),
 }
 
@@ -42,24 +42,16 @@ impl From<br_drive::DriveFault> for AppFault {
 pub enum ReactionFault {
     #[error("terminal: {0}")]
     Terminal(String),
-    #[error("store: {0}")]
-    Store(String),
+    #[error("the store failed")]
+    Store(#[from] EngineError),
 }
 
 impl ReactionError for ReactionFault {
     fn disposition(&self) -> Disposition {
         match self {
             Self::Terminal(_) => Disposition::Terminal,
+            Self::Store(EngineError::Db(db)) if sqlx_is_terminal(db) => Disposition::Terminal,
             Self::Store(_) => Disposition::Retry,
-        }
-    }
-}
-
-impl From<EngineError> for ReactionFault {
-    fn from(error: EngineError) -> Self {
-        match &error {
-            EngineError::Db(db) if sqlx_is_terminal(db) => Self::Terminal(error.to_string()),
-            _ => Self::Store(error.to_string()),
         }
     }
 }

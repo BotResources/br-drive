@@ -1,6 +1,7 @@
 mod audit;
 mod bulk;
 mod cancellation;
+mod capacity;
 mod cascade;
 mod commit_processing;
 mod concurrency;

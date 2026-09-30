@@ -41,6 +41,8 @@ pub struct WorldOptions {
     /// scenarios are written for the two-gesture flow (commit, then
     /// `ProcessFile`); the commit-starts-the-chain scenarios turn it on.
     pub process_on_commit: bool,
+    /// The engine's `window_capacity`; `None` keeps the engine default.
+    pub window_capacity: Option<usize>,
 }
 
 impl Default for WorldOptions {
@@ -50,6 +52,7 @@ impl Default for WorldOptions {
             upload_window: HostSettings::DEFAULT_UPLOAD_WINDOW,
             watch_catalogue: true,
             process_on_commit: false,
+            window_capacity: None,
         }
     }
 }
@@ -77,9 +80,12 @@ impl World {
         let blob_config = minio.config(&blob_bucket);
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let config = base_config(pod, addr)
+        let mut config = base_config(pod, addr)
             .with_blob_storage(blob_config)
             .with_blob_reaper_interval(options.reaper_interval);
+        if let Some(capacity) = options.window_capacity {
+            config = config.with_window_capacity(capacity);
+        }
 
         let service = boot(
             config,

@@ -100,6 +100,25 @@ impl Subscription {
         }
     }
 
+    /// The error frame the subscription is refused with; fails on a delta.
+    pub async fn next_error(&mut self, within: Duration) -> serde_json::Value {
+        loop {
+            let frame = read_json(&mut self.socket, within).await;
+            match frame["type"].as_str() {
+                Some("error") => return frame["payload"].clone(),
+                Some("next") => {
+                    let errors = &frame["payload"]["errors"];
+                    if errors.is_array() {
+                        return errors.clone();
+                    }
+                    panic!("the subscription answered a delta, not a refusal: {frame}");
+                }
+                Some("complete") => panic!("the subscription completed without a refusal"),
+                _ => continue,
+            }
+        }
+    }
+
     pub async fn next_payload(&mut self, within: Duration) -> serde_json::Value {
         loop {
             let frame = read_json(&mut self.socket, within).await;

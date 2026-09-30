@@ -24,7 +24,7 @@ The workspace's MSRV is Rust 1.94 — the floor of the pinned `contract-jobs`
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.5.1", version = "0.5.1" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.6.0", version = "0.6.0" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -38,6 +38,7 @@ The `version` beside the `tag` is required: a tag-only git dependency carries a
 | 0.3 | `v0.3.4` |
 | 0.4 | `v0.3.4` |
 | 0.5 | `v0.3.4` |
+| 0.6 | `v0.4.0` |
 
 ## What a host writes
 
@@ -102,7 +103,7 @@ rolls them together. The host never writes to the `drive` schema directly.
 7. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
 8. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
 9. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`), or deleted from a host reaction (`delete_drive_in_reaction`); frozen in the host's own gesture (`freeze_drive`); `set_metadata`, `drive_of` for curation; `file_counts` and `processing_counts` for a host view showing its drives' counts.
-10. **Catalogue watch (optional, information only)**: a host booting through the engine's `run_service` / `BootPlan` starts it at the end of its `register` closure, on the engine's own NATS and PostgreSQL handles, and lets it run until the process exits: `register: move |engine| { register(engine)?; br_drive::watch_runner_types_of(engine).detach(); Ok(()) }` (see `src/bin/service.rs` of the example). A host assembling the engine by hand calls `br_drive::watch_runner_types(nats, pool)` once its boot can no longer fail and `CatalogueWatch::stop` at shutdown. The watch fills the local copy of Jobs' runner-type catalogue that the save's `unknownRunnerTypes` warning and `<p>RunnerTypes` read. Only a host that starts it needs the `PUBLISHED_LANGUAGE` KV bucket on its broker. Nothing waits for it and no launch consults it: a host without it launches every step all the same, reports every step's type as unknown at save and lists no type.
+10. **Catalogue watch (optional, information only)**: a host booting through the engine's `run_service` / `BootPlan` starts it at the end of its `register` closure and lets it run until the process exits: `register: move |engine| { register(engine)?; br_drive::watch_runner_types_of(engine).detach(); Ok(()) }` (see `src/bin/service.rs` of the example). It runs on the engine's NATS handle and, since engine 0.4.0 hands its PostgreSQL pool to no caller, on a small pool of its own (at most two connections, connected lazily) on `DATABASE_URL` — the URL `run_service` boots the engine's pool from; without a usable `DATABASE_URL` it does not start and says so in a `warn`. A host assembling the engine by hand calls `br_drive::watch_runner_types(nats, pool)` once its boot can no longer fail and `CatalogueWatch::stop` at shutdown. The watch fills the local copy of Jobs' runner-type catalogue that the save's `unknownRunnerTypes` warning and `<p>RunnerTypes` read. Only a host that starts it needs the `PUBLISHED_LANGUAGE` KV bucket on its broker. Nothing waits for it and no launch consults it: a host without it launches every step all the same, reports every step's type as unknown at save and lists no type.
 
 ### The `DriveHost` seam
 
@@ -258,7 +259,7 @@ renders it, is committed at
 | `<p>MoveFolder(driveId, oldPrefix, newPrefix): MutationAck!` | gate `MoveFolder`, then the `move` decision of every file under the prefix (all or nothing: the first refusal's code; `FOLDER_NOT_FOUND` for a file the caller cannot see); bulk pipeline: one `UPDATE` on the prefix (the rows are locked first), then `folder_moved`; `FOLDER_NOT_FOUND`, `FOLDER_INTO_ITSELF`, `NAME_TAKEN` (refused as a whole), `INVALID_PATH` for the root or a rebased path over 1024 bytes. |
 | `<p>DeleteFolder(driveId, prefix): MutationAck!` | gate `DeleteFolder`, then the `delete` decision of every file under the prefix (same all-or-nothing rule); bulk pipeline: one `DELETE` for every file under the prefix, one blob release per file, then `folder_deleted`. |
 | `<p>File(fileId): DriveFile` | the file as the caller sees it, or `null`. |
-| `<p>DriveFiles(driveId): [DriveFile!]!` | the drive's files as the caller sees them (the tree is a path prefix; empty folders do not exist). |
+| `<p>DriveFiles(driveId): [DriveFile!]!` | the drive's files as the caller sees them (the tree is a path prefix; empty folders do not exist); `WINDOW_TOO_LARGE` for a drive holding more files than the engine's `window_capacity` (below). |
 | `<p>Pages(fileId): [DrivePage!]!` | the file's rendition, page by page (milestone 3); empty when the caller cannot read the file. |
 | `<p>Rulesets: [DriveRuleset!]!`, `<p>CreateRuleset(…)`, `<p>UpdateRuleset(…)`, `<p>DeleteRuleset(id)` | the host's processing rules (milestone 4, "Processing rules" below). |
 | `<p>Labels: [DriveLabel!]!` | the host's label catalogue: `DriveLabel { id, name, color, description, createdAt, updatedAt }` in id order (UUIDv7: creation order); gated by the host's `ReadLabels` — a refused principal (a runner, typically) gets an empty list and an empty live window, exactly as `ReadRulesets` does for the rules; both live windows repopulate when the principal's facts change, so gaining or losing the gate shows at once (the creator's id stays on the row, off the wire). |
@@ -269,6 +270,19 @@ renders it, is committed at
 | `<p>LabelsChanged: DriveDelta!` | the label catalogue live: a `DriveReset` of `DriveLabel`s, then an upsert (`Created`, `Updated`) or a remove per label. |
 | `<p>RulesetsChanged: DriveDelta!` | the rule table live, for the manager's screen: an upsert per save with `Saved { unknown_runner_types }` as its cause (the same warning the save answers), a remove per delete. |
 | `<p>FilePages(fileId): DriveDelta!` | one file's rendition (milestone 3): a `DriveReset` with every `DrivePage` of the file, then a `DriveUpsert` / `DriveRemove` per page; gated on `ReadFile` for the file's drive, so a caller who cannot read the file gets an empty window and a caller who loses the drive gets one `DriveRemove` per page. |
+
+**Window capacity (engine 0.4.0).** Every list above is an engine window
+bounded by `EngineConfig::window_capacity` (default 10,000 keys): a list
+query (`<p>DriveFiles`, `<p>Pages`, `<p>Labels`, `<p>Rulesets`,
+`<p>RunnerTypes`) or a new subscription (`<p>DriveChanged`,
+`<p>FilePages`, `<p>LabelsChanged`, `<p>RulesetsChanged`) whose window holds
+more is refused `WINDOW_TOO_LARGE` before any row is read — each populate
+binds the engine's ceiling as its `LIMIT`, so the refusal reads one key past
+the capacity, never the whole drive. A session already live is never ended
+for its size (the engine logs and counts it). A file of such a drive still
+reads (`<p>File`) and downloads (`<p>FileAccess`) by its one row. The lists
+take no paging argument: a host whose drives outgrow the default raises
+`EngineConfig::with_window_capacity`.
 
 `DriveFile`: `id`, `driveId`, `path` (normalized, `""` = root), `name`,
 `title` (the human-facing title, independent of the name),
@@ -341,7 +355,7 @@ runner reports and never interprets a media type.
 
 | Root | Shape |
 |---|---|
-| `<p>RunnerContext(fileId, jobId): RunnerContext!` | `{ fileId, mediaType, name, pageCount, summary, pages[] { number, markdown, origin, updatedAt }, images[], sourceUrl }` — a **fresh** presigned GET on the source (inline) at every call, plus the current rendition read directly by file id, so an indexer or a page-regeneration runner reads the pages, not the source. `FILE_NOT_FOUND` for an unknown file, `JOB_NOT_ACTIVE` for any job but the file's, `SOURCE_NOT_AVAILABLE` while the engine reaper has not promoted the source yet (retry). |
+| `<p>RunnerContext(fileId, jobId): RunnerContext!` | `{ fileId, mediaType, name, pageCount, summary, pages[] { number, markdown, origin, updatedAt }, images[], sourceUrl }` — a **fresh** presigned GET on the source (inline) at every call, plus the current rendition read directly by file id, so an indexer or a page-regeneration runner reads the pages, not the source. `FILE_NOT_FOUND` for an unknown file, `JOB_NOT_ACTIVE` for any job but the file's, `SOURCE_NOT_AVAILABLE` while the engine reaper has not promoted the source yet (retry). The file, its pages and its image names are read in one read-only snapshot behind the runner source gate (`Query::behind`). |
 | `<p>RunnerRequestImageUpload(fileId, jobId, name, mediaType, size: ByteCount, sha256): UploadTicket!` | a verified presigned POST for a `drive_image` blob (the runner hashes first; `FILE_TOO_LARGE` past `DriveHost::IMAGE_MAX_BYTES`) and the `file_image` row, unique per file by name. An existing name is **replaced only when the new object lands**: until then the old image stays readable and a failed replacement upload changes nothing; when it lands, the row swaps and the old object is released in the same transaction. A re-request for a name whose upload is still in flight is refused with `IMAGE_UPLOAD_PENDING` (the first ticket stands, one blob per request — the same posture as the source's `KEY_REUSED`); past the host's `upload_window` a re-request replaces the abandoned blob. |
 | `<p>RunnerReport(fileId, jobId, pages: [ReportedPageInput!], origin: PageOrigin, summary, pageCount, estimatedTokens, done): MutationAck!` | pages in one or several batches of at most `MAX_REPORT_PAGES` (512, `BATCH_TOO_LARGE`), **upserted by number** (a replayed batch changes nothing; a number twice in one batch is `INVALID_PAGE`) — except that the run of an `upload` or `reprocess` chain never overwrites a page whose origin is `EDITED` (a person's correction is kept; a `regenerate_page` run does overwrite it); each page written reaches `<p>FilePages` on its own key (`Reported { job_id, origin }`) and the file row is touched only by the indexer's triple. `origin` `RUNNER` (default) or `REGENERATED` — on a regenerated page the images of that page that its new markdown no longer references (matched on the whole name, `![…](p001-img01.png)`, never as a substring) are dropped and released (`ImagesDropped { names }` on the file); `summary` and `pageCount` are the indexer's pair and move together, `estimatedTokens` is optional and only rides along with them (`INDEXER_FIELDS_TOGETHER` otherwise, `INVALID_INDEXER_VALUE` when negative; an indexing without an estimate clears a previous one; `ReportStored { job_id, done }` on the file when any of the three changes); an empty report is `NOTHING_TO_CHANGE` unless `done`; `done: true` ends the job in the report's transaction — the chain moves on and `job.finish.v2` is staged (see "Processing rules"); a replayed final report meets a job that no longer runs (`JOB_NOT_ACTIVE`). |
 | `<p>RunnerReportFailure(fileId, jobId, reasonCode, message?): MutationAck!` | the runner declares its job failed: the same runner-scope and running-job checks as a report; `reasonCode` is a code, `[a-z][a-z0-9_]*` up to 128 bytes, `message` free text up to 4 KiB (`INVALID_FAILURE_REASON` otherwise). The job ends there: the file is `FAILED` with `reasonCode` as its `processingError` (`ProcessingFailed { reason }`), `job.fail.v2` is staged with `"{reasonCode}: {message}"` as its note, and what the run reported so far stays readable. |
@@ -409,7 +423,7 @@ run *steps* in order" — a list, never a graph.
 | `<p>Rulesets: [DriveRuleset!]!` | `{ id, name, trigger, mediaTypes, steps[] { runnerType, options }, isDefault, createdBy, createdAt, updatedAt }`; empty for a caller the host's `ReadRulesets` gate refuses. |
 | `<p>CreateRuleset(id, name, trigger: Trigger!, mediaTypes: [String!]!, steps: [RulesetStepInput!]!, isDefault): RulesetSaved!` | gate `ManageRulesets`; `trigger` `UPLOAD \| REPROCESS \| REGENERATE_PAGE`; `mediaTypes` are `type/subtype`, `type/*` or `*` (lowercased, `INVALID_MEDIA_TYPE`); `name` unique per host, case-insensitive (`RULESET_NAME_TAKEN`); 1–32 steps of `{ runnerType, options? }` (`INVALID_RULESET`). One default per (trigger, media-type pattern): a second default whose patterns overlap an existing default's is `DEFAULT_ALREADY_SET` (`*` is its own bucket). Answers `{ id, unknownRunnerTypes }`: the steps' runner types the local catalogue copy does not know as `ACTIVE` (absent or `DEPRECATED`), sorted, once each — a warning only, the rule is saved. Jobs alone judges a runner type, when the step's job is created (below). |
 | `<p>UpdateRuleset(id, name?, mediaTypes?, steps?, isDefault?): RulesetSaved!` | same rules and the same warning; `NOTHING_TO_CHANGE` when nothing differs; the trigger is immutable. |
-| `<p>RunnerTypes: [DriveRunnerType!]!` | the whole local copy of Jobs' runner-type catalogue — every type the watch last saw, not only the ones the rules name — for a rule-editing screen: `{ runnerType, lifecycle: ACTIVE \| DEPRECATED, seenAt }` in name order (`seenAt` is when the watch last wrote the entry). Gated by the host's `ReadRulesets`, the gate of `<p>Rulesets`: a principal it refuses gets an empty list. Empty on a host that does not run the catalogue watch. A plain read, not a live window: the watch writes outside the engine's pipelines and stages no impact. |
+| `<p>RunnerTypes: [DriveRunnerType!]!` | the whole local copy of Jobs' runner-type catalogue, read through the closed `DriveRunnerTypes` view — every type the watch last saw, not only the ones the rules name — for a rule-editing screen: `{ runnerType, lifecycle: ACTIVE \| DEPRECATED, seenAt }` in name order (`seenAt` is when the watch last wrote the entry). Gated by the host's `ReadRulesets`, the gate of `<p>Rulesets`: a principal it refuses gets an empty list. Empty on a host that does not run the catalogue watch. A plain read, not a live window: the watch writes outside the engine's pipelines and stages no impact. |
 | `<p>DeleteRuleset(id): MutationAck!` | `RULESET_NOT_FOUND`; files keep the `rulesetId` and the `steps` snapshot of a deleted rule. |
 
 Matching: the given `rulesetId` must exist (`RULESET_NOT_FOUND`) and carry
@@ -872,9 +886,9 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
 - `drive.file_processing.past_job_ids` grows by one id per job of the file,
   for the life of the file (a GIN index serves the lookup of a late fact).
   A file reprocessed thousands of times may want a bound later.
-- The stores are written for the engine's 0.4.0 contract (batched
-  `read_many`, `row_lock` / `FOR UPDATE` locks); the library stays on engine
-  v0.3.4 for this release.
+- The stores implement the engine's 0.4.0 contract (one batched `read_many`
+  per store, `row_lock` / `FOR UPDATE` locks); a one-key read is the engine's
+  `PersistenceExt::load` over it.
 - `select_ruleset` reads the defaults of one trigger per gesture — fine at a
   host's scale (tens of rules), noted for the record.
 - The catalogue watch stamps `seen_at` from the database clock: it runs
@@ -908,13 +922,13 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
   publish `completed` / `failed` on its own after a `job.finish` /
   `job.fail` — the scenarios publish them afterwards, to prove they change
   nothing.
-- Engine 0.3.0's `Query::download` populates the projector with its default
-  window and then asks membership by key, so the runner's source presign
-  cannot be told which file it is about through the window. The runner
-  context resolver scopes the population to the job's own file (a task-local
-  set around the download, `br_drive::scoped_to_job`), and the population
-  re-checks that the job is still the file's active one; a key-aware download
-  in the engine would remove the scoping.
+- Engine 0.4.0's `Query::download` gates on the row's visibility, never on
+  a window, but a view's `visible` sees the row and the principal only, not
+  the job the runner names. The runner context resolver therefore still
+  scopes the presign to the job's own file (a task-local set around the
+  download, `br_drive::scoped_to_job`), and `RunnerSources::visible`
+  re-checks that the job is still the file's active one; a job-aware gate in
+  the engine would remove the scoping.
 
 ## The example host
 

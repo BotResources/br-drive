@@ -10,7 +10,7 @@ use service_engine::error::EngineError;
 use service_engine::gate::{ActionName, Affordances};
 use service_engine::impact::{Dims, Impact};
 use service_engine::name::{NounName, ProjectorName};
-use service_engine::persistence::{Aggregate, Persistence, PersistenceStyle};
+use service_engine::persistence::{Aggregate, Persistence, PersistenceExt, PersistenceStyle};
 use service_engine::population::{Interest, Population, WindowQuery};
 use service_engine::projector::Emission;
 use service_engine::view::{Populate, Projector};
@@ -178,13 +178,6 @@ impl<H: DriveHost> Persistence for PageStore<H> {
 
     const STYLE: PersistenceStyle = PersistenceStyle::SoftEda;
 
-    fn load<'a>(
-        conn: &'a mut PgConnection,
-        key: &'a PageKey,
-    ) -> BoxFuture<'a, Result<Option<PageRecord<H>>, EngineError>> {
-        Box::pin(async move { Ok(load_pages(conn, std::slice::from_ref(key)).await?.pop()) })
-    }
-
     fn lock<'a>(
         conn: &'a mut PgConnection,
         key: &'a PageKey,
@@ -345,7 +338,7 @@ async fn readable_file<H: DriveHost>(
     principal: &H,
     file_id: Uuid,
 ) -> Result<Option<FileRow<H>>, EngineError> {
-    let Some(file) = <FileStore<H> as Persistence>::load(conn, &file_id).await? else {
+    let Some(file) = FileStore::<H>::load(conn, &file_id).await? else {
         return Ok(None);
     };
     let visible = principal.visible_drives().contains(&file.drive_id);
@@ -374,7 +367,7 @@ impl<H: DriveHost> Projector for DrivePages<H> {
                 .await?
                 .is_some()
             {
-                keys = super::store::page_numbers(&mut conn, file_id)
+                keys = super::store::page_numbers(&mut conn, file_id, cx.limit_all())
                     .await?
                     .into_iter()
                     .map(|number| PageKey { file_id, number })

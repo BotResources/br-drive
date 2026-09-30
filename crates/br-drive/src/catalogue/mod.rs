@@ -7,21 +7,24 @@
 //! (`known_runner_types`). Nothing else reads it: a step's job is created
 //! whatever the copy says, and Jobs alone judges the runner type.
 
+mod view;
 mod watch;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use service_engine::Query;
 use service_engine::error::EngineError;
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgConnection;
 
-use crate::fault::DriveFault;
 use crate::file::UnknownDbValue;
-use crate::host::{DriveHost, DriveRequest};
+use crate::host::DriveHost;
 
+pub use view::{DriveRunnerTypes, KnownRunnerType, RunnerTypeAccess, RunnerTypeStore};
 pub use watch::{CatalogueWatch, watch_runner_types, watch_runner_types_of};
 
 /// A runner type's lifecycle as Jobs publishes it. A retired type is not
 /// published at all, so it is absent from the copy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, async_graphql::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, async_graphql::Enum)]
 pub enum DriveRunnerTypeLifecycle {
     Active,
     Deprecated,
@@ -45,7 +48,7 @@ impl DriveRunnerTypeLifecycle {
 }
 
 /// One runner type of the local catalogue copy, as the watch last saw it.
-#[derive(Debug, Clone, PartialEq, Eq, async_graphql::SimpleObject)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, async_graphql::SimpleObject)]
 pub struct DriveRunnerType {
     pub runner_type: String,
     pub lifecycle: DriveRunnerTypeLifecycle,
@@ -54,37 +57,14 @@ pub struct DriveRunnerType {
 }
 
 /// The whole local catalogue copy — every runner type the watch last saw,
-/// not only the ones the rules name — in name order. Gated by the host's
-/// `ReadRulesets` (the gate of `<p>Rulesets`): a principal it refuses gets an
-/// empty list. Empty too on a host that never started the watch.
+/// not only the ones the rules name — in name order, read through the
+/// [`DriveRunnerTypes`] view. Gated by the host's `ReadRulesets` (the gate of
+/// `<p>Rulesets`): a principal it refuses gets an empty list. Empty too on a
+/// host that never started the watch.
 pub async fn known_runner_types<H: DriveHost>(
-    pool: &PgPool,
-    principal: &H,
-) -> Result<Vec<DriveRunnerType>, DriveFault> {
-    if !principal
-        .drive_gate(&DriveRequest::ReadRulesets)
-        .is_allowed()
-    {
-        return Ok(Vec::new());
-    }
-    let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT runner_type, lifecycle, seen_at FROM drive.known_runner_type \
-         ORDER BY runner_type",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(EngineError::from)?;
-    let mut known = Vec::with_capacity(rows.len());
-    for (runner_type, lifecycle, seen_at) in rows {
-        let lifecycle = DriveRunnerTypeLifecycle::from_db_str(&lifecycle)
-            .map_err(|e| EngineError::Config(e.to_string()))?;
-        known.push(DriveRunnerType {
-            runner_type,
-            lifecycle,
-            seen_at,
-        });
-    }
-    Ok(known)
+    query: &Query<'_, H>,
+) -> async_graphql::Result<Vec<DriveRunnerType>> {
+    query.fetch_view_window::<DriveRunnerTypes<H>>(&()).await
 }
 
 /// The runner types among `runner_types` the copy does not know as `ACTIVE`

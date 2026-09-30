@@ -883,21 +883,6 @@ impl<H: DriveHost> Persistence for FileProcessingStore<H> {
 
     const STYLE: PersistenceStyle = PersistenceStyle::SoftEda;
 
-    fn load<'a>(
-        conn: &'a mut PgConnection,
-        key: &'a Uuid,
-    ) -> BoxFuture<'a, Result<Option<FileProcessing<H>>, EngineError>> {
-        Box::pin(async move {
-            let row = sqlx::query(&format!(
-                "SELECT {COLUMNS} FROM drive.file_processing WHERE file_id = $1"
-            ))
-            .bind(key)
-            .fetch_optional(conn)
-            .await?;
-            row.as_ref().map(row_to_processing).transpose()
-        })
-    }
-
     fn lock<'a>(
         conn: &'a mut PgConnection,
         key: &'a Uuid,
