@@ -305,6 +305,11 @@ async fn defaults_of(
     rows.iter().map(row_to_ruleset).collect()
 }
 
+/// Serializes the name and default-overlap checks of two concurrent saves, so
+/// a collision is answered with its code and never a constraint error. Not a
+/// row lock: what a save claims (a name, a default's patterns) has no
+/// aggregate to load, and the engine offers no pipeline lock for it. It is
+/// always taken before any aggregate of the gesture.
 pub(super) async fn serialize_rulesets(conn: &mut PgConnection) -> Result<(), EngineError> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('drive.ruleset'))")
         .execute(conn)

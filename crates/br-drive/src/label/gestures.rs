@@ -8,8 +8,8 @@ use uuid::Uuid;
 use service_engine::pipeline::Bulk;
 
 use super::store::{
-    LabelRecord, existing_ids, files_with_label, hand_deleted, labels_of_file,
-    lock_files_with_label, name_taken, replace_file_labels, serialize_labels,
+    LabelRecord, files_with_label, hand_deleted, labels_of_file, name_taken, replace_file_labels,
+    serialize_labels,
 };
 use super::{Label, LabelCause, validate_color, validate_description, validate_name};
 use crate::facts::{self, FactMeta};
@@ -130,16 +130,28 @@ pub fn delete_label<'m, H: DriveHost>(
 ) -> BoxFuture<'m, Result<(), DriveFault>> {
     Box::pin(async move {
         manage_gate(cx.principal())?;
-        // The label's files first, as every writer of a file's labels locks
-        // the file before it touches the label (its link's foreign key): the
-        // detach below then moves them without waiting on such a writer.
-        lock_files_with_label(cx.connection(), input.id).await?;
+        // The engine's lock order: the label's files (the file store) before
+        // the label (the label store), as `SetFileLabels` takes them — so the
+        // two never wait on each other the other way round.
+        let seen = files_with_label(cx.connection(), input.id).await?;
+        let mut files = cx.load_many::<FileRow<H>>(&seen).await?;
         let label = cx
             .load::<LabelRecord<H>>(&input.id)
             .await?
             .ok_or(DriveFault::Refused(codes::LABEL_NOT_FOUND))?;
         let label_id = label.row.id;
-        let detached = files_with_label(cx.connection(), label_id).await?;
+        // Under the label's lock no link to it can change any more: a
+        // `SetFileLabels` that linked another file before it committed, and
+        // released that file.
+        let late: Vec<Uuid> = files_with_label(cx.connection(), label_id)
+            .await?
+            .into_iter()
+            .filter(|id| !files.iter().any(|file| file.id == *id))
+            .collect();
+        if !late.is_empty() {
+            files.extend(cx.load_many::<FileRow<H>>(&late).await?);
+        }
+        let detached: Vec<Uuid> = files.iter().map(|file| file.id).collect();
         if crate::owner::refreshes::<H>() {
             for drive in file_store::drives_of(cx.connection(), &detached).await? {
                 crate::owner::touch::<H>(cx, drive)?;
@@ -199,14 +211,21 @@ pub fn set_file_labels<'m, H: DriveHost>(
         file.set_labels_gate(cx.principal()).require()?;
         let wanted: BTreeSet<Uuid> = input.label_ids.iter().copied().collect();
         let wanted: Vec<Uuid> = wanted.into_iter().collect();
-        let known = existing_ids(cx.connection(), &wanted).await?;
-        if known.len() != wanted.len() {
-            return Err(DriveFault::Refused(codes::LABEL_NOT_FOUND));
-        }
         let current: BTreeSet<Uuid> = labels_of_file(cx.connection(), file.id)
             .await?
             .into_iter()
             .collect();
+        // Every label the change touches, through the pipeline and after the
+        // file (the engine's lock order): a label deleted concurrently is
+        // either gone here or waits for this change.
+        let touched: Vec<Uuid> = wanted.iter().chain(current.iter()).copied().collect();
+        let known = cx.load_many::<LabelRecord<H>>(&touched).await?;
+        if wanted
+            .iter()
+            .any(|id| !known.iter().any(|label| label.row.id == *id))
+        {
+            return Err(DriveFault::Refused(codes::LABEL_NOT_FOUND));
+        }
         if current.iter().copied().eq(wanted.iter().copied()) {
             return Err(DriveFault::Refused(codes::NOTHING_TO_CHANGE));
         }

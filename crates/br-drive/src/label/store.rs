@@ -276,7 +276,10 @@ pub async fn all_ids(conn: &mut PgConnection) -> Result<Vec<Uuid>, EngineError> 
 }
 
 /// Serializes the name checks of two concurrent saves, so a collision is
-/// answered `LABEL_NAME_TAKEN` and never the unique index's error.
+/// answered `LABEL_NAME_TAKEN` and never the unique index's error. Not a row
+/// lock: the name a create or a rename claims has no aggregate to load yet,
+/// and the engine offers no pipeline lock for it. It is always taken before
+/// any aggregate of the gesture, so it adds no lock-order cycle.
 pub async fn serialize_labels(conn: &mut PgConnection) -> Result<(), EngineError> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('drive.label'))")
         .execute(conn)
@@ -297,14 +300,6 @@ pub async fn name_taken(
     .fetch_one(conn)
     .await?;
     Ok(taken)
-}
-
-pub async fn existing_ids(conn: &mut PgConnection, ids: &[Uuid]) -> Result<Vec<Uuid>, EngineError> {
-    let rows = sqlx::query("SELECT id FROM drive.label WHERE id = ANY($1)")
-        .bind(ids)
-        .fetch_all(conn)
-        .await?;
-    Ok(rows.iter().map(|row| row.get::<Uuid, _>("id")).collect())
 }
 
 /// The label ids of every file asked for, set-based.
@@ -380,20 +375,4 @@ pub async fn files_with_label(
         .iter()
         .map(|row| row.get::<Uuid, _>("file_id"))
         .collect())
-}
-
-/// Locks the files a label is on, in id order.
-pub async fn lock_files_with_label(
-    conn: &mut PgConnection,
-    label: Uuid,
-) -> Result<(), EngineError> {
-    sqlx::query(
-        "SELECT id FROM drive.file WHERE id IN \
-           (SELECT file_id FROM drive.file_label WHERE label_id = $1) \
-         ORDER BY id FOR UPDATE",
-    )
-    .bind(label)
-    .execute(conn)
-    .await?;
-    Ok(())
 }

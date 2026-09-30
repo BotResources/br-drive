@@ -11,7 +11,7 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use crate::file::store;
-use crate::file::{File, FileCause};
+use crate::file::{File, FileCause, FileRow};
 use crate::host::DriveHost;
 
 /// The person id every anonymised `created_by` / `triggered_by` / page
@@ -58,18 +58,6 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
         .await?;
         rows += done.rows_affected();
     }
-    // Lock the files whose processing names the person first: a chain
-    // advancing at the same moment copies the initiator into its next job
-    // under that lock, so the rewrite below — a new statement, after the lock —
-    // sees that job.
-    sqlx::query(
-        "SELECT id FROM drive.file WHERE id IN \
-           (SELECT file_id FROM drive.file_processing WHERE triggered_by_id = $1) \
-         ORDER BY id FOR UPDATE",
-    )
-    .bind(person)
-    .execute(&mut *conn)
-    .await?;
     let done = sqlx::query(
         "UPDATE drive.file_processing SET triggered_by_id = $2, triggered_by_name = NULL \
          WHERE triggered_by_id = $1",
@@ -86,6 +74,17 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
         .await?;
     rows += done.rows_affected();
     Ok(rows)
+}
+
+async fn files_started_by(conn: &mut PgConnection, person: Uuid) -> Result<Vec<Uuid>, EngineError> {
+    let rows = sqlx::query("SELECT file_id FROM drive.file_processing WHERE triggered_by_id = $1")
+        .bind(person)
+        .fetch_all(conn)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<Uuid, _>("file_id"))
+        .collect())
 }
 
 async fn files_created_by(conn: &mut PgConnection, person: Uuid) -> Result<Vec<Uuid>, EngineError> {
@@ -153,6 +152,12 @@ impl<H: DriveHost> Erasable for DriveErasure<H> {
                     }
                 }
             }
+            // The files whose processing names the person first, through the
+            // pipeline: a chain advancing at the same moment copies the
+            // initiator into its next job under the file's lock, so the
+            // rewrite below — a new statement, after the lock — sees that job.
+            let started = files_started_by(cx.connection(), person).await?;
+            cx.load_many::<FileRow<H>>(&started).await?;
             let rows = anonymise(cx.connection(), person).await?;
             erased.rows(rows);
             Ok(erased)
