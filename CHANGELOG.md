@@ -9,6 +9,79 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.5.0 — 2026-09-30
+
+State tables only, soft-EDA: the library ships **no fact table** any more.
+Each host owns one fact table for everything it does, and the library hands
+it its facts in the transaction that writes the state.
+
+### Breaking
+
+- **New required `DriveHost::record_facts(conn, &[DriveFact])`**: a host that
+  does not implement it does not compile. Every change of a library state row
+  reaches it, in the gesture's transaction; an `Err` rolls the gesture back.
+  The README gives the reference fact table a host creates (the example host
+  creates it as `workspace_fact`).
+- **Dropped tables** (migration `9121000011`, rows included): `drive.fact`,
+  the five job fact tables (`drive.file_job`, `drive.file_job_end`,
+  `drive.file_job_cancel`, `drive.file_job_plan`, `drive.file_job_step`) and
+  the `drive.file_status` view. A host reading them reads its own fact table
+  and `drive.file_processing` instead.
+- The stores of files, pages, labels, rules and file processing are
+  `PersistenceStyle::SoftEda`: their `Persistence::Event` is
+  `Stamped<…Event>`, and `LabelStore` / `RulesetStore` are generic over the
+  host (`LabelStore<H>`, `RulesetStore<H>`), their aggregates `LabelRecord<H>`
+  / `RulesetRecord<H>` wrapping the unchanged `LabelRow` / `RulesetRow`. The
+  crate-private `fact` module is gone.
+
+### Added
+
+- `DriveFact`, `FactMeta` (aligned on `br-core-events`' `EventMetadata`:
+  `actor_id`, `actor_kind` `human | service`, `is_runner`, `impersonator_id`,
+  `correlation_id`, `causation_id` — the inbound message of a reaction —
+  `occurred_at`) and `ActorKind`.
+- One event enum per aggregate, tagged by `kind`, each at payload version 1:
+  `FileEvent` (`drive_file`), `PageEvent` (`drive_page`, keyed
+  `{file_id, number}`), `LabelEvent` (`drive_label`), `RulesetEvent`
+  (`drive_ruleset`) and `ProcessingEvent` (`drive_file_processing`). `seq` is
+  the aggregate's version after the event: gap-free per `(noun, key)`.
+- **`drive.file_processing`**: one state row per processed file — its last
+  job, the chain step, the initiator, the error, where the runner says it is,
+  the cancel request, the earlier job ids, `version` and `updated_at`. No row:
+  `PENDING` or `READY`, as before.
+- **Every Jobs fact received is recorded**: the ones that change nothing any
+  more — an end after the job's first end, a progress fact of an ended job
+  or one already known, any fact about an earlier job of the file — as
+  `JobFactIgnored { job_id, received, why }`; Jobs' `queued`, `started` and
+  `completed` as themselves.
+- `version bigint NOT NULL` on `drive.file`, `drive.file_page`,
+  `drive.label`, `drive.ruleset` (and `drive.file_processing`).
+
+### Changed
+
+- The last change is state again: `drive.file.updated_at`,
+  `drive.file_page.updated_at` / `updated_by`, `drive.label.updated_at`,
+  `drive.ruleset.updated_at`, written by the store with every event. A file's
+  `updatedAt` is the latest of its row's and its processing's. The GraphQL
+  API and the live deltas are unchanged; a file's `updatedAt` now also moves
+  on its label and image changes, which are facts of the file.
+- The library's erase rewrites the chain initiator on `drive.file_processing`
+  and a page's `updated_by`; the facts, in the host's table, are the host's to
+  erase.
+- Deleting a label locks the files it is on before the label, as every writer
+  of a file's labels does, then records `LabelsChanged` on each.
+
+### Upgrading from 0.4
+
+- Create the host's fact table and implement `record_facts` before booting
+  0.5.0. Migration `9121000011` builds `drive.file_processing` from each
+  file's last job and its end (the rules of the dropped view), backfills
+  `version` to 1 and `updated_at` / `updated_by` from each object's last
+  `drive.fact` row (else its creation; a page: its file's), then drops the
+  fact tables, `drive.fact` included, with their rows. Every
+  `processingState`, `processingError`, `progress` and `updatedAt` reads as
+  before. A migrated aggregate's first fact in the host's table is `seq` 2.
+
 ## 0.4.0 — 2026-09-28
 
 ### Added
