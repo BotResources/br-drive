@@ -19,7 +19,7 @@ pub use gestures::{
     CreateRuleset, DeleteRuleset, RulesetSaved, UpdateRuleset, create_ruleset, delete_ruleset,
     update_ruleset,
 };
-pub use store::select_ruleset;
+pub use store::{RulesetRecord, RulesetStore, select_ruleset};
 pub use view::{DriveRuleset, DriveRulesets};
 
 pub const MAX_RULESET_NAME_BYTES: usize = 255;
@@ -152,6 +152,45 @@ impl RulesetRow {
             .iter()
             .map(|step| step.runner_type.clone())
             .collect()
+    }
+}
+
+/// The payload schema version of [`RulesetEvent`].
+pub const RULESET_EVENT_VERSION: i32 = 1;
+
+/// What happened to a rule, as the host's fact table records it (the
+/// `drive_ruleset` noun).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+#[non_exhaustive]
+pub enum RulesetEvent {
+    Created {
+        name: String,
+        trigger: Trigger,
+        media_types: Vec<String>,
+        steps: Vec<RulesetStep>,
+        is_default: bool,
+    },
+    /// The rule now reads as given.
+    Saved {
+        name: String,
+        media_types: Vec<String>,
+        steps: Vec<RulesetStep>,
+        is_default: bool,
+    },
+    Deleted,
+}
+
+impl crate::facts::DriveEvent for RulesetEvent {
+    const NOUN: &'static str = "drive_ruleset";
+    const VERSION: i32 = RULESET_EVENT_VERSION;
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Created { .. } => "Created",
+            Self::Saved { .. } => "Saved",
+            Self::Deleted => "Deleted",
+        }
     }
 }
 

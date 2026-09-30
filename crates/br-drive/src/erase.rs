@@ -14,9 +14,10 @@ use crate::file::store;
 use crate::file::{File, FileCause};
 use crate::host::DriveHost;
 
-/// The person id every anonymised `created_by` / `triggered_by` /
-/// `requested_by` / fact `actor_id` / `impersonator_id` is rewritten to: the
-/// nil UUID, which no real principal carries.
+/// The person id every anonymised `created_by` / `triggered_by` / page
+/// `updated_by` is rewritten to: the nil UUID, which no real principal
+/// carries. The facts live in the host's fact table: their erasure is the
+/// host's.
 pub const REDACTED_PERSON: Uuid = Uuid::nil();
 
 /// What the library does with a person's rows when the host erases them.
@@ -57,19 +58,20 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
         .await?;
         rows += done.rows_affected();
     }
-    // Lock the files whose jobs name the person first: a chain advancing at
-    // the same moment copies the initiator into its next job under that lock,
-    // so the rewrites below — new statements, after the lock — see that job.
+    // Lock the files whose processing names the person first: a chain
+    // advancing at the same moment copies the initiator into its next job
+    // under that lock, so the rewrite below — a new statement, after the lock —
+    // sees that job.
     sqlx::query(
         "SELECT id FROM drive.file WHERE id IN \
-           (SELECT file_id FROM drive.file_job WHERE triggered_by_id = $1) \
+           (SELECT file_id FROM drive.file_processing WHERE triggered_by_id = $1) \
          ORDER BY id FOR UPDATE",
     )
     .bind(person)
     .execute(&mut *conn)
     .await?;
     let done = sqlx::query(
-        "UPDATE drive.file_job SET triggered_by_id = $2, triggered_by_name = NULL \
+        "UPDATE drive.file_processing SET triggered_by_id = $2, triggered_by_name = NULL \
          WHERE triggered_by_id = $1",
     )
     .bind(person)
@@ -77,25 +79,12 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
     .execute(&mut *conn)
     .await?;
     rows += done.rows_affected();
-    let done =
-        sqlx::query("UPDATE drive.file_job_cancel SET requested_by = $2 WHERE requested_by = $1")
-            .bind(person)
-            .bind(REDACTED_PERSON)
-            .execute(&mut *conn)
-            .await?;
-    rows += done.rows_affected();
-    // The audit trail keeps what happened and loses who did it: the person's
-    // hand, acting or impersonating.
-    for column in ["actor_id", "impersonator_id"] {
-        let done = sqlx::query(&format!(
-            "UPDATE drive.fact SET {column} = $2 WHERE {column} = $1"
-        ))
+    let done = sqlx::query("UPDATE drive.file_page SET updated_by = $2 WHERE updated_by = $1")
         .bind(person)
         .bind(REDACTED_PERSON)
         .execute(&mut *conn)
         .await?;
-        rows += done.rows_affected();
-    }
+    rows += done.rows_affected();
     Ok(rows)
 }
 
@@ -147,7 +136,7 @@ impl<H: DriveHost> Erasable for DriveErasure<H> {
                     // left to Jobs' own backstops (none fires for a job no
                     // runner ever picked up; an administrator cancels it in
                     // Jobs, the file being gone).
-                    let deleted = store::delete_many(cx.connection(), &files).await?;
+                    let deleted = store::delete_many::<H>(cx.connection(), &files, None).await?;
                     erased.rows(deleted);
                     for reference in sources.into_iter().chain(images) {
                         erased.purge_blob(BlobRef(reference));

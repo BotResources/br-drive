@@ -10,7 +10,7 @@ use service_engine::error::EngineError;
 use service_engine::gate::{ActionName, Affordances};
 use service_engine::impact::{Dims, Impact};
 use service_engine::name::{NounName, ProjectorName};
-use service_engine::persistence::{Persistence, PersistenceStyle};
+use service_engine::persistence::{Aggregate, Persistence, PersistenceStyle};
 use service_engine::population::{Interest, Population, WindowQuery};
 use service_engine::projector::Emission;
 use service_engine::view::{Populate, Projector};
@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use super::aggregate::{File, FileRow, PageOrigin, drive_memberships};
 use super::store::{FILE_FROM, FileStore, config_error, file_select, row_to_file_prefixed};
+use crate::facts::{self, FactMeta, Pending, SoftEda, Stamped};
 use crate::host::{DRIVE_DIM, DriveHost};
 
 pub const EDIT_PAGE_ACTION: ActionName = ActionName::from_static("editPage");
@@ -38,6 +39,36 @@ pub struct Page;
 impl Noun for Page {
     type Key = PageKey;
     const NAME: NounName = NounName::from_static("drive_page");
+}
+
+/// The payload schema version of [`PageEvent`].
+pub const PAGE_EVENT_VERSION: i32 = 1;
+
+/// What happened to a page, as the host's fact table records it (the
+/// `drive_page` noun, keyed `{file_id, number}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+#[non_exhaustive]
+pub enum PageEvent {
+    /// A runner reported the page, in a run of `job_id`.
+    Reported { job_id: Uuid, origin: PageOrigin },
+    /// A person edited the page.
+    Edited,
+    /// The chain ended with fewer pages than the file had: the page is gone.
+    Trimmed,
+}
+
+impl crate::facts::DriveEvent for PageEvent {
+    const NOUN: &'static str = "drive_page";
+    const VERSION: i32 = PAGE_EVENT_VERSION;
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Reported { .. } => "Reported",
+            Self::Edited => "Edited",
+            Self::Trimmed => "Trimmed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +90,9 @@ pub struct PageRecord<H> {
     pub updated_by: Uuid,
     pub updated_at: DateTime<Utc>,
     pub file: FileRow<H>,
+    /// One per event of the page (`drive.file_page.version`).
+    pub(crate) version: i64,
+    pending: Pending<PageEvent>,
 }
 
 impl<H> Clone for PageRecord<H> {
@@ -70,15 +104,29 @@ impl<H> Clone for PageRecord<H> {
             updated_by: self.updated_by,
             updated_at: self.updated_at,
             file: self.file.clone(),
+            version: self.version,
+            pending: self.pending.clone(),
         }
     }
 }
 
-pub struct PageStore<H>(PhantomData<fn() -> H>);
+impl<H> PageRecord<H> {
+    /// A person rewrote the page: it becomes `EDITED`, theirs, now.
+    pub(crate) fn edit(&mut self, markdown: String, meta: &FactMeta) {
+        self.markdown = markdown;
+        self.origin = PageOrigin::Edited;
+        self.updated_by = meta.actor_id;
+        self.updated_at = meta.occurred_at;
+        self.pending
+            .push(&mut self.version, PageEvent::Edited, meta);
+    }
 
-fn read_only() -> EngineError {
-    EngineError::Config("pages are written through the file's report and edit gestures".into())
+    fn base_version(&self) -> i64 {
+        self.version - self.pending.len()
+    }
 }
+
+pub struct PageStore<H>(PhantomData<fn() -> H>);
 
 pub(crate) async fn load_pages<H: DriveHost>(
     conn: &mut PgConnection,
@@ -86,20 +134,18 @@ pub(crate) async fn load_pages<H: DriveHost>(
 ) -> Result<Vec<PageRecord<H>>, EngineError> {
     let files: Vec<Uuid> = keys.iter().map(|key| key.file_id).collect();
     let numbers: Vec<i32> = keys.iter().map(|key| key.number).collect();
-    // A page's last writer and instant are its latest fact; a page with none
-    // (never, since every write records one) reads as the file's creation.
+    // A page whose last writer is unknown (erased, or carried over without
+    // one) reads as the nil id.
     let rows = sqlx::query(&format!(
-        "SELECT p.file_id, p.number, p.markdown, p.origin, \
-                COALESCE(pc.actor_id, '00000000-0000-0000-0000-000000000000'::uuid) AS updated_by, \
-                COALESCE(pc.occurred_at, f.created_at) AS updated_at, {} \
+        "SELECT p.file_id, p.number, p.markdown, p.origin, p.version, \
+                COALESCE(p.updated_by, '00000000-0000-0000-0000-000000000000'::uuid) AS updated_by, \
+                p.updated_at, {} \
          FROM {FILE_FROM} \
          JOIN drive.file_page p ON p.file_id = f.id \
          JOIN unnest($1::uuid[], $2::int[]) AS wanted(file_id, number) \
            ON wanted.file_id = p.file_id AND wanted.number = p.number \
-         {} \
          ORDER BY p.file_id, p.number",
         file_select("f_"),
-        crate::fact::last_page_change("pc", "p.file_id", "p.number"),
     ))
     .bind(&files)
     .bind(&numbers)
@@ -118,6 +164,8 @@ pub(crate) async fn load_pages<H: DriveHost>(
                 updated_by: row.get("updated_by"),
                 updated_at: row.get("updated_at"),
                 file: row_to_file_prefixed(row, "f_")?,
+                version: row.get("version"),
+                pending: Pending::default(),
             })
         })
         .collect()
@@ -126,15 +174,31 @@ pub(crate) async fn load_pages<H: DriveHost>(
 impl<H: DriveHost> Persistence for PageStore<H> {
     type Aggregate = PageRecord<H>;
     type Key = PageKey;
-    type Event = ();
+    type Event = Stamped<PageEvent>;
 
-    const STYLE: PersistenceStyle = PersistenceStyle::Crud;
+    const STYLE: PersistenceStyle = PersistenceStyle::SoftEda;
 
     fn load<'a>(
         conn: &'a mut PgConnection,
         key: &'a PageKey,
     ) -> BoxFuture<'a, Result<Option<PageRecord<H>>, EngineError>> {
         Box::pin(async move { Ok(load_pages(conn, std::slice::from_ref(key)).await?.pop()) })
+    }
+
+    fn lock<'a>(
+        conn: &'a mut PgConnection,
+        key: &'a PageKey,
+    ) -> BoxFuture<'a, Result<(), EngineError>> {
+        Box::pin(async move {
+            sqlx::query(
+                "SELECT 1 FROM drive.file_page WHERE file_id = $1 AND number = $2 FOR UPDATE",
+            )
+            .bind(key.file_id)
+            .bind(key.number)
+            .execute(conn)
+            .await?;
+            Ok(())
+        })
     }
 
     fn read_many<'a>(
@@ -151,19 +215,75 @@ impl<H: DriveHost> Persistence for PageStore<H> {
     }
 
     fn save<'a>(
-        _conn: &'a mut PgConnection,
-        _page: &'a PageRecord<H>,
-        _events: &'a [()],
+        conn: &'a mut PgConnection,
+        page: &'a PageRecord<H>,
+        events: &'a [Stamped<PageEvent>],
     ) -> BoxFuture<'a, Result<(), EngineError>> {
-        Box::pin(async { Err(read_only()) })
+        Box::pin(async move {
+            upsert(conn, page).await?;
+            hand_page_facts::<H>(conn, page, events).await
+        })
     }
 
     fn create<'a>(
-        _conn: &'a mut PgConnection,
-        _page: &'a PageRecord<H>,
-        _events: &'a [()],
+        conn: &'a mut PgConnection,
+        page: &'a PageRecord<H>,
+        events: &'a [Stamped<PageEvent>],
     ) -> BoxFuture<'a, Result<(), EngineError>> {
-        Box::pin(async { Err(read_only()) })
+        Box::pin(async move {
+            super::processed::ensure(conn, page.key.file_id).await?;
+            upsert(conn, page).await?;
+            hand_page_facts::<H>(conn, page, events).await
+        })
+    }
+}
+
+async fn upsert<H>(conn: &mut PgConnection, page: &PageRecord<H>) -> Result<(), EngineError> {
+    sqlx::query(
+        "INSERT INTO drive.file_page \
+           (file_id, number, markdown, origin, version, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (file_id, number) DO UPDATE SET markdown = EXCLUDED.markdown, \
+           origin = EXCLUDED.origin, version = EXCLUDED.version, \
+           updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by",
+    )
+    .bind(page.key.file_id)
+    .bind(page.key.number)
+    .bind(&page.markdown)
+    .bind(page.origin.as_str())
+    .bind(page.version)
+    .bind(page.updated_at)
+    .bind(page.updated_by)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+async fn hand_page_facts<H: DriveHost>(
+    conn: &mut PgConnection,
+    page: &PageRecord<H>,
+    events: &[Stamped<PageEvent>],
+) -> Result<(), EngineError> {
+    let key = super::store::page_key(page.key.file_id, page.key.number);
+    let facts = facts::facts_of(&key, page.base_version(), events)?;
+    facts::hand::<H>(conn, &facts).await
+}
+
+impl<H: DriveHost> Aggregate for PageRecord<H> {
+    type Store = PageStore<H>;
+
+    fn key(&self) -> PageKey {
+        self.key
+    }
+
+    fn pending_events(&self) -> &[Stamped<PageEvent>] {
+        self.pending.as_slice()
+    }
+}
+
+impl<H: DriveHost> SoftEda for PageRecord<H> {
+    fn clear_pending(&mut self) {
+        self.pending.clear();
     }
 }
 
@@ -305,13 +425,10 @@ pub async fn read_pages(
     conn: &mut PgConnection,
     file_id: Uuid,
 ) -> Result<Vec<RunnerPage>, EngineError> {
-    let rows = sqlx::query(&format!(
-        "SELECT p.number, p.markdown, p.origin, \
-                COALESCE(pc.occurred_at, f.created_at) AS updated_at \
-         FROM drive.file_page p JOIN drive.file f ON f.id = p.file_id {} \
-         WHERE p.file_id = $1 ORDER BY p.number",
-        crate::fact::last_page_change("pc", "p.file_id", "p.number"),
-    ))
+    let rows = sqlx::query(
+        "SELECT p.number, p.markdown, p.origin, p.updated_at \
+         FROM drive.file_page p WHERE p.file_id = $1 ORDER BY p.number",
+    )
     .bind(file_id)
     .fetch_all(conn)
     .await?;

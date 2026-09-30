@@ -1,12 +1,13 @@
 use std::time::Duration;
 
-use br_drive::{DriveHost, DrivePath, DriveRequest};
+use br_drive::{DriveFact, DriveHost, DrivePath, DriveRequest};
 use futures_util::future::BoxFuture;
 use service_engine::error::EngineError;
 use service_engine::gate::{Gate, Reason};
 use service_engine::impact::Deps;
 use service_engine::pipeline::Ops;
 use service_engine::principal::Principal;
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::kernel::facts::HostSettings;
@@ -29,6 +30,11 @@ pub const FORBIDDEN_PREFIX: &str = "forbidden";
 pub const MANAGE_SCOPE: &str = "workspace:manage";
 pub const NOT_A_MANAGER: Reason = Reason::new("NOT_A_WORKSPACE_MANAGER");
 pub const DISPLAY_NAME_CLAIM: &str = "name";
+/// A title the host's fact table refuses to record: retitling a file to it
+/// fails the gesture, which the suite uses to prove the state change rolls
+/// back with the facts.
+pub const UNRECORDABLE_TITLE: &str = "unrecordable";
+pub const FACT_REFUSED: Reason = Reason::new("FACT_REFUSED");
 
 impl DriveHost for AppPrincipal {
     const SERVICE: &'static str = crate::SERVICE;
@@ -115,6 +121,13 @@ impl DriveHost for AppPrincipal {
         }
     }
 
+    fn record_facts<'a>(
+        conn: &'a mut PgConnection,
+        facts: &'a [DriveFact],
+    ) -> BoxFuture<'a, Result<(), EngineError>> {
+        Box::pin(record_facts(conn, facts))
+    }
+
     fn visible_drives(&self) -> Vec<Uuid> {
         self.owned_workspaces()
     }
@@ -165,6 +178,75 @@ impl DriveHost for AppPrincipal {
             log_folder_gesture(ops, drive, "deleted", prefix.as_str(), None).await
         })
     }
+}
+
+/// Inserts `facts` into the host's fact table (`workspace_fact`), one
+/// statement for the batch.
+pub async fn record_facts(conn: &mut PgConnection, facts: &[DriveFact]) -> Result<(), EngineError> {
+    let refused = facts.iter().any(|fact| {
+        fact.event_type == "Retitled"
+            && fact.payload.get("to").and_then(serde_json::Value::as_str)
+                == Some(UNRECORDABLE_TITLE)
+    });
+    if refused {
+        return Err(EngineError::PolicyRefused {
+            code: FACT_REFUSED.code(),
+        });
+    }
+    let mut ids = Vec::with_capacity(facts.len());
+    let mut nouns = Vec::with_capacity(facts.len());
+    let mut keys = Vec::with_capacity(facts.len());
+    let mut seqs = Vec::with_capacity(facts.len());
+    let mut versions = Vec::with_capacity(facts.len());
+    let mut types = Vec::with_capacity(facts.len());
+    let mut payloads = Vec::with_capacity(facts.len());
+    let mut actors = Vec::with_capacity(facts.len());
+    let mut kinds = Vec::with_capacity(facts.len());
+    let mut runners = Vec::with_capacity(facts.len());
+    let mut impersonators = Vec::with_capacity(facts.len());
+    let mut correlations = Vec::with_capacity(facts.len());
+    let mut causations = Vec::with_capacity(facts.len());
+    let mut instants = Vec::with_capacity(facts.len());
+    for fact in facts {
+        ids.push(Uuid::now_v7());
+        nouns.push(fact.noun);
+        keys.push(fact.key.clone());
+        seqs.push(fact.seq);
+        versions.push(fact.version);
+        types.push(fact.event_type);
+        payloads.push(fact.payload.clone());
+        actors.push(fact.meta.actor_id);
+        kinds.push(fact.meta.actor_kind.as_str());
+        runners.push(fact.meta.is_runner);
+        impersonators.push(fact.meta.impersonator_id);
+        correlations.push(fact.meta.correlation_id);
+        causations.push(fact.meta.causation_id);
+        instants.push(fact.meta.occurred_at);
+    }
+    sqlx::query(
+        "INSERT INTO workspace_fact (id, noun, key, seq, version, event_type, payload, actor_id, \
+           actor_kind, is_runner, impersonator_id, correlation_id, causation_id, occurred_at) \
+         SELECT * FROM unnest($1::uuid[], $2::text[], $3::jsonb[], $4::bigint[], $5::int[], \
+           $6::text[], $7::jsonb[], $8::uuid[], $9::text[], $10::bool[], $11::uuid[], \
+           $12::uuid[], $13::uuid[], $14::timestamptz[])",
+    )
+    .bind(&ids)
+    .bind(&nouns)
+    .bind(&keys)
+    .bind(&seqs)
+    .bind(&versions)
+    .bind(&types)
+    .bind(&payloads)
+    .bind(&actors)
+    .bind(&kinds)
+    .bind(&runners)
+    .bind(&impersonators)
+    .bind(&correlations)
+    .bind(&causations)
+    .bind(&instants)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 fn refuse_forbidden(prefix: &DrivePath) -> Result<(), EngineError> {

@@ -4,16 +4,14 @@
 
 mod chain;
 mod commands;
-mod log;
 mod reactions;
 mod roots;
+mod state;
 
 pub use chain::{ChainPlan, cancel_active_job};
-pub(crate) use chain::{refresh_status, report_done, report_failed, start_chain};
+pub(crate) use chain::{load_processing, report_done, report_failed, start_chain};
 pub use commands::Initiator;
 pub(crate) use commands::JobCancel;
-pub use log::{FileJob, RunProgress, kind as job_event};
-pub(crate) use log::{RunningFacts, request_cancel};
 pub use reactions::{
     CancelledFact, CompletedFact, CreationRejectedFact, DURABLE_CANCELLED, DURABLE_COMPLETED,
     DURABLE_CREATION_REJECTED, DURABLE_FAILED, DURABLE_PLAN_DECLARED, DURABLE_QUEUED,
@@ -22,9 +20,12 @@ pub use reactions::{
     on_queued, on_started, on_step_started,
 };
 pub use roots::{RootNames, declare_roots};
-
-/// The `processingError` of a file whose job Jobs cancelled.
-pub const CANCELLED: &str = "cancelled";
+pub(crate) use state::RunningFacts;
+pub use state::{
+    CANCELLED, FileJob, FileProcessing, FileProcessingNoun, FileProcessingStore,
+    PROCESSING_EVENT_VERSION, ProcessingEvent, RunProgress, kind as job_event,
+    why as ignored_because,
+};
 
 /// The name of one of the library's durables on the host's NATS consumers: every
 /// host service gets its own consumer on the shared integration streams, so two

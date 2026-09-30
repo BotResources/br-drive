@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::blob::DriveImage;
-use crate::fact::Author;
+use crate::facts::{self, FactMeta};
 use crate::fault::{DriveFault, codes};
 use crate::file::images::{
     BlobFacts, ImageKey, ImageRecord, drop_images, image_names_of, image_names_of_page,
@@ -26,7 +26,7 @@ use crate::file::pages::{Page, PageCause, PageKey, RunnerPage, read_pages};
 use crate::file::processed;
 use crate::file::rendition::{apply_indexing, validate_rendition};
 use crate::file::store::{self, FileStore, PageWrite};
-use crate::file::{File, FileCause, FileRow, PageOrigin};
+use crate::file::{File, FileCause, FileEvent, FileRow, PageEvent, PageOrigin};
 use crate::host::DriveHost;
 use crate::image::ImageName;
 use crate::media::MediaType;
@@ -204,28 +204,49 @@ pub fn runner_request_image_upload<'m, H: DriveHost>(
             .map_err(|_| DriveFault::Refused(codes::INVALID_SHA256))?;
         let size_bytes =
             i64::try_from(input.size).map_err(|_| DriveFault::Refused(codes::FILE_TOO_LARGE))?;
-        let file = cx
+        let mut file = cx
             .load::<FileRow<H>>(&input.file_id)
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.require_active_job(input.job_id)?;
         let window = cx.principal().upload_window();
-        let ticket = stage_image(cx, &file, name, media_type, size_bytes, digest, window).await?;
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        let upload = ImageUpload {
+            name,
+            media_type,
+            size_bytes,
+            digest,
+            window,
+        };
+        let ticket = stage_image(cx, &meta, &mut file, upload).await?;
         Ok(OneShot(ticket))
     })
+}
+
+/// An image a runner asks to upload.
+pub(crate) struct ImageUpload {
+    pub name: ImageName,
+    pub media_type: MediaType,
+    pub size_bytes: i64,
+    pub digest: Sha256Digest,
+    pub window: std::time::Duration,
 }
 
 /// Stages a verified image upload on `file`: a new row, or the replacement of
 /// an existing name that swaps only when the new object lands.
 pub(crate) async fn stage_image<H: DriveHost>(
     cx: &mut Ops<'_>,
-    file: &FileRow<H>,
-    name: ImageName,
-    media_type: MediaType,
-    size_bytes: i64,
-    digest: Sha256Digest,
-    window: std::time::Duration,
+    meta: &FactMeta,
+    file: &mut FileRow<H>,
+    upload: ImageUpload,
 ) -> Result<UploadTicket, DriveFault> {
+    let ImageUpload {
+        name,
+        media_type,
+        size_bytes,
+        digest,
+        window,
+    } = upload;
     let key = ImageKey {
         file_id: file.id,
         name: name.as_str().to_string(),
@@ -263,6 +284,13 @@ pub(crate) async fn stage_image<H: DriveHost>(
             cx.create(&image).await?;
         }
     }
+    file.record(
+        FileEvent::ImageRequested {
+            name: name.as_str().to_string(),
+        },
+        meta,
+    );
+    facts::save(cx, file).await?;
     crate::file::file_changed::<H>(
         cx,
         file,
@@ -345,8 +373,7 @@ pub fn runner_report<'m, H: DriveHost>(
             .active_job()
             .cloned()
             .ok_or(DriveFault::Refused(codes::JOB_NOT_ACTIVE))?;
-        let author = Author::of(cx.principal());
-        let now = cx.now().as_datetime();
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
 
         // A page a person edited is kept by an upload or a reprocess run; a
         // page regeneration is asked for that very page, and overwrites it.
@@ -389,7 +416,11 @@ pub fn runner_report<'m, H: DriveHost>(
             job_id: input.job_id,
             origin: input.origin,
         };
-        store::upsert_pages(cx.connection(), &author, file.id, &writes, &reported, now).await?;
+        let event = PageEvent::Reported {
+            job_id: input.job_id,
+            origin: input.origin,
+        };
+        store::upsert_pages::<H>(cx.connection(), &meta, file.id, &writes, &event).await?;
         for page in &pages {
             cx.impact_caused::<Page, _>(
                 &PageKey {
@@ -399,8 +430,15 @@ pub fn runner_report<'m, H: DriveHost>(
                 reported.clone(),
             )?;
         }
+        let mut causes = Vec::new();
         if !dropped.is_empty() {
-            crate::file::file_changed::<H>(cx, &file, FileCause::ImagesDropped { names: dropped })?;
+            file.record(
+                FileEvent::ImagesDropped {
+                    names: dropped.clone(),
+                },
+                &meta,
+            );
+            causes.push(FileCause::ImagesDropped { names: dropped });
         }
         if let (Some(summary), Some(page_count)) = (input.summary, input.page_count)
             && apply_indexing(&mut file, summary, page_count, input.estimated_tokens)
@@ -413,22 +451,28 @@ pub fn runner_report<'m, H: DriveHost>(
                 file.estimated_tokens,
             )
             .await?;
-            crate::file::file_recorded::<H>(
-                cx,
-                &author,
-                &mut file,
-                FileCause::ReportStored {
+            file.record(
+                FileEvent::ReportStored {
                     job_id: input.job_id,
                     done: input.done,
                 },
-            )
-            .await?;
+                &meta,
+            );
+            causes.push(FileCause::ReportStored {
+                job_id: input.job_id,
+                done: input.done,
+            });
+        }
+        facts::save(cx, &mut file).await?;
+        for cause in causes {
+            crate::file::file_changed::<H>(cx, &file, cause)?;
         }
         // The final report ends the job, here: the chain moves on in this
         // transaction and Jobs is told (`job.finish`); its `completed` then
         // only confirms it.
         if input.done {
-            crate::processing::report_done(cx, &author, &mut file, &job).await?;
+            let mut processing = crate::processing::load_processing(cx, &file).await?;
+            crate::processing::report_done(cx, &meta, &mut file, &mut processing).await?;
         }
         Ok(())
     })
@@ -488,16 +532,13 @@ pub fn runner_report_failure<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.require_active_job(input.job_id)?;
-        let job = file
-            .active_job()
-            .cloned()
-            .ok_or(DriveFault::Refused(codes::JOB_NOT_ACTIVE))?;
-        let author = Author::of(cx.principal());
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        let mut processing = crate::processing::load_processing(cx, &file).await?;
         crate::processing::report_failed(
             cx,
-            &author,
+            &meta,
             &mut file,
-            &job,
+            &mut processing,
             &input.reason_code,
             input.message.as_deref(),
         )

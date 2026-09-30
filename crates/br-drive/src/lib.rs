@@ -2,7 +2,7 @@ mod blob;
 mod catalogue;
 mod drive;
 mod erase;
-mod fact;
+mod facts;
 mod fault;
 mod file;
 mod folders;
@@ -32,13 +32,15 @@ pub use catalogue::{
 };
 pub use drive::{DriveDeleted, create_drive, create_unowned_drive, delete_drive};
 pub use erase::{DriveErasure, EraseMode, REDACTED_PERSON};
+pub use facts::{ActorKind, DriveFact, FactMeta};
 pub use fault::{DriveFault, DriveReactionFault, codes};
 pub use file::{
     ByteCount, CancelProcessing, DeleteFile, DriveDelta, DriveFile, DriveFiles, DriveImage,
     DrivePage, DrivePages, DriveProgress, DriveRemove, DriveReset, DriveUpsert, DriveView,
-    DriveWindow, EDIT_PAGE_ACTION, EditPage, File, FileCause, FileRow, FileStatus, FileVisibility,
-    IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE, IMAGE_LANDED_VERB, ImageKey, ImageLanded,
-    ImageRecord, Page, PageCause, PageKey, PageOrigin, PageWindow, ProcessFile, ProcessingState,
+    DriveWindow, EDIT_PAGE_ACTION, EditPage, FILE_EVENT_VERSION, File, FileCause, FileEvent,
+    FilePlace, FileRow, FileStatus, FileVisibility, IMAGE_LANDED_AGGREGATE, IMAGE_LANDED_DURABLE,
+    IMAGE_LANDED_VERB, ImageKey, ImageLanded, ImageRecord, PAGE_EVENT_VERSION, Page, PageCause,
+    PageEvent, PageKey, PageOrigin, PageWindow, ProcessFile, ProcessingState,
     REGENERATE_PAGE_ACTION, RegeneratePage, RetitleFile, RunnerPage, UnknownDbValue, UpdateFile,
     drive_of, references_image, set_metadata,
 };
@@ -46,8 +48,9 @@ pub use folders::{DeleteFolder, MoveFolder};
 pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
 pub use image::{ImageName, InvalidImageName, MAX_IMAGE_NAME_BYTES};
 pub use label::{
-    CreateLabel, DeleteLabel, DriveLabel, DriveLabels, Label, LabelCause, LabelRow, LabelWindow,
-    MAX_LABEL_DESCRIPTION_BYTES, MAX_LABEL_NAME_CHARS, SetFileLabels, UpdateLabel,
+    CreateLabel, DeleteLabel, DriveLabel, DriveLabels, LABEL_EVENT_VERSION, Label, LabelCause,
+    LabelEvent, LabelRecord, LabelRow, LabelStore, LabelWindow, MAX_LABEL_DESCRIPTION_BYTES,
+    MAX_LABEL_NAME_CHARS, SetFileLabels, UpdateLabel,
 };
 pub use media::{InvalidMediaType, MAX_MEDIA_TYPE_BYTES, MediaType};
 pub use owner::{
@@ -55,13 +58,16 @@ pub use owner::{
 };
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
 pub use processing::{
-    CANCELLED, ChainPlan, FileJob, Initiator, RootNames, RunProgress, durable, job_event,
+    CANCELLED, ChainPlan, FileJob, FileProcessing, FileProcessingNoun, FileProcessingStore,
+    Initiator, PROCESSING_EVENT_VERSION, ProcessingEvent, RootNames, RunProgress, durable,
+    ignored_because, job_event,
 };
 pub use register::register;
 pub use ruleset::{
     ANY_MEDIA_TYPE, CreateRuleset, DeleteRuleset, DriveRuleset, DriveRulesets, DriveStep,
-    MAX_RULESET_NAME_BYTES, MAX_RULESET_STEPS, MAX_RUNNER_TYPE_BYTES, RulesetCause, RulesetRow,
-    RulesetSaved, RulesetStep, RulesetStepInput, Trigger, UpdateRuleset,
+    MAX_RULESET_NAME_BYTES, MAX_RULESET_STEPS, MAX_RUNNER_TYPE_BYTES, RULESET_EVENT_VERSION,
+    RulesetCause, RulesetEvent, RulesetRecord, RulesetRow, RulesetSaved, RulesetStep,
+    RulesetStepInput, RulesetStore, Trigger, UpdateRuleset,
 };
 pub use runner::{
     MAX_FAILURE_MESSAGE_BYTES, MAX_FAILURE_REASON_BYTES, MAX_REPORT_PAGES, ReportedPage,

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use br_core_auth::Passport;
 use br_core_integration::Actor;
-use br_drive::{DriveHost, DriveRequest, EraseMode};
+use br_drive::{DriveFact, DriveHost, DriveRequest, EraseMode};
 use futures_util::future::BoxFuture;
 use service_engine::config::EngineConfig;
 use service_engine::error::EngineError;
@@ -20,7 +20,7 @@ use service_engine::principal::{Principal, PrincipalId, PrincipalResolver};
 use service_engine::{
     Engine, PassportPrincipal, PrincipalRejected, Readiness, ReadinessHandle, engine_schema,
 };
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -119,6 +119,15 @@ impl DriveHost for ArchivePrincipal {
         } else {
             Gate::blocked(NOT_THE_ARCHIVIST)
         }
+    }
+
+    /// The archive's own database carries the example's migrations: its
+    /// facts land in the same reference table there.
+    fn record_facts<'a>(
+        conn: &'a mut PgConnection,
+        facts: &'a [DriveFact],
+    ) -> BoxFuture<'a, Result<(), EngineError>> {
+        Box::pin(br_drive_example::kernel::drive::record_facts(conn, facts))
     }
 
     fn visible_drives(&self) -> Vec<Uuid> {
@@ -287,14 +296,13 @@ impl ArchiveHost {
 
     pub async fn job_of(&self, file_id: Uuid) -> Option<Uuid> {
         sqlx::query_scalar(
-            "SELECT last_job_id FROM drive.file_status \
-             WHERE file_id = $1 AND processing_state = 'processing'",
+            "SELECT job_id FROM drive.file_processing \
+             WHERE file_id = $1 AND state = 'processing'",
         )
         .bind(file_id)
         .fetch_optional(&self.db.app)
         .await
-        .expect("the archive file's status")
-        .flatten()
+        .expect("the archive file's processing")
     }
 
     pub async fn file_state(

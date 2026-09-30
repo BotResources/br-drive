@@ -10,10 +10,10 @@ pub(crate) mod store;
 mod view;
 
 pub use aggregate::{
-    File, FileCause, FileRow, FileStatus, FileVisibility, PageOrigin, ProcessingState,
-    UnknownDbValue,
+    FILE_EVENT_VERSION, File, FileCause, FileEvent, FilePlace, FileRow, FileStatus, FileVisibility,
+    PageOrigin, ProcessingState, UnknownDbValue,
 };
-pub(crate) use aggregate::{file_changed, file_progressed, file_recorded};
+pub(crate) use aggregate::{file_changed, file_progressed};
 pub use curation::{drive_of, set_metadata};
 pub use delta::{DriveDelta, DriveRemove, DriveReset, DriveUpsert, DriveView};
 pub use gestures::{
@@ -26,8 +26,8 @@ pub use images::{
     ImageRecord, references_image,
 };
 pub use pages::{
-    DrivePage, DrivePages, EDIT_PAGE_ACTION, Page, PageCause, PageKey, PageWindow,
-    REGENERATE_PAGE_ACTION, RunnerPage,
+    DrivePage, DrivePages, EDIT_PAGE_ACTION, PAGE_EVENT_VERSION, Page, PageCause, PageEvent,
+    PageKey, PageWindow, REGENERATE_PAGE_ACTION, RunnerPage,
 };
 pub use view::{ByteCount, DriveFile, DriveFiles, DriveImage, DriveProgress, DriveWindow};
 
@@ -66,6 +66,9 @@ pub(crate) mod tests_support {
             created_by: Uuid::now_v7(),
             created_at: now,
             updated_at: now,
+            file_updated_at: now,
+            version: 1,
+            pending: Default::default(),
             status: FileStatus {
                 state,
                 error: None,

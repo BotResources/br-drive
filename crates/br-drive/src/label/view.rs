@@ -12,8 +12,8 @@ use service_engine::view::{Populate, Projector};
 use service_engine::visibility::Unrestricted;
 use uuid::Uuid;
 
-use super::store::{LabelStore, all_ids};
-use super::{Label, LabelRow};
+use super::Label;
+use super::store::{LabelRecord, LabelStore, all_ids};
 use crate::host::{DriveHost, DriveRequest};
 use crate::host_window::catalogue_window;
 
@@ -49,10 +49,10 @@ impl<H> DriveLabels<H> {
 impl<H: DriveHost> Projector for DriveLabels<H> {
     type Principal = H;
     type Noun = Label;
-    type Store = LabelStore;
+    type Store = LabelStore<H>;
     type Query = LabelWindow;
     type Out = DriveLabel;
-    type Visibility = Unrestricted<LabelRow, H, LabelAccess>;
+    type Visibility = Unrestricted<LabelRecord<H>, H, LabelAccess>;
 
     const NAME: ProjectorName = Self::NAME;
 
@@ -72,7 +72,8 @@ impl<H: DriveHost> Projector for DriveLabels<H> {
         Ok(catalogue_window::<Label>(keys))
     }
 
-    fn project(row: &LabelRow, _principal: &H) -> Result<DriveLabel, EngineError> {
+    fn project(label: &LabelRecord<H>, _principal: &H) -> Result<DriveLabel, EngineError> {
+        let row = &label.row;
         Ok(DriveLabel {
             id: row.id,
             name: row.name.clone(),

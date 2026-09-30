@@ -6,12 +6,12 @@ use service_engine::pipeline::Ops;
 use uuid::Uuid;
 
 use super::commands::{Initiator, JobCancel, JobCreate, JobFail, JobFinish};
-use super::log::{End, EndKind, FileJob, end, insert_job};
 use super::roots::roots;
-use crate::fact::Author;
+use super::state::{CANCELLED, FileProcessing};
+use crate::facts::{self, FactMeta};
 use crate::fault::{DriveFault, codes};
 use crate::file::images::drop_images;
-use crate::file::{FileCause, FileRow, Page, PageKey, processed, store};
+use crate::file::{FileCause, FileEvent, FileRow, Page, PageKey, processed, store};
 use crate::host::DriveHost;
 use crate::ruleset::{RulesetRow, RulesetStep, Trigger};
 
@@ -57,23 +57,38 @@ impl ChainPlan {
     }
 }
 
-/// Reads the file's status again after the library recorded a job fact in this
-/// transaction, so the rest of the gesture sees what the view now computes.
-pub(crate) async fn refresh_status<H>(
+/// The file's processing, locked: the stored one, or a blank for a file never
+/// processed (saved only once a chain gave it a job).
+pub(crate) async fn load_processing<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    file: &FileRow<H>,
+) -> Result<FileProcessing<H>, DriveFault> {
+    Ok(match cx.load::<FileProcessing<H>>(&file.id).await? {
+        Some(processing) => processing,
+        None => FileProcessing::blank(file.id, cx.now().as_datetime()),
+    })
+}
+
+/// Saves the processing and lets the rest of the gesture read the file as it
+/// now is: its status, and its last change.
+async fn save_processing<H: DriveHost>(
     cx: &mut Ops<'_>,
     file: &mut FileRow<H>,
+    processing: &mut FileProcessing<H>,
 ) -> Result<(), DriveFault> {
-    if let Some(status) = store::status_of(cx.connection(), file.id).await? {
-        file.status = status;
-    }
+    facts::save(cx, processing).await?;
+    file.status = processing.status();
+    file.updated_at = file.updated_at.max(processing.updated_at);
     Ok(())
 }
 
-/// Starts step `index` of the file's snapshot: a new job in the file's log and
-/// its `job.create`, staged through the outbox. `None` past the last step.
+/// Starts step `index` of the file's snapshot: the file's running job and its
+/// `job.create`, staged through the outbox. `None` past the last step.
 async fn launch_step<H: DriveHost>(
     cx: &mut Ops<'_>,
-    file: &mut FileRow<H>,
+    meta: &FactMeta,
+    file: &FileRow<H>,
+    processing: &mut FileProcessing<H>,
     index: usize,
     trigger: Option<Trigger>,
     initiator: Option<Initiator>,
@@ -86,18 +101,11 @@ async fn launch_step<H: DriveHost>(
         DriveFault::Engine(EngineError::Config("a chain step index overflows".into()))
     })?;
     let roots = roots::<H>()?;
-    let job = FileJob {
-        job_id: Uuid::now_v7(),
-        step_index,
-        trigger,
-        triggered_by: initiator,
-        events: Vec::new(),
-        created_at: cx.now().as_datetime(),
-    };
+    let job_id = Uuid::now_v7();
     let config = serde_json::json!({
         "host": H::SERVICE,
         "file_id": file.id,
-        "job_id": job.job_id,
+        "job_id": job_id,
         "context_root": roots.context_root,
         "image_upload_root": roots.image_upload_root,
         "report_root": roots.report_root,
@@ -105,45 +113,35 @@ async fn launch_step<H: DriveHost>(
         "step": index,
         "options": step.options,
     });
-    let initiator = job.triggered_by.clone().unwrap_or(Initiator {
+    let named = initiator.clone().unwrap_or(Initiator {
         id: file.created_by,
         display_name: None,
     });
-    insert_job(cx.connection(), file.id, &job)
-        .await
-        .map_err(live_job_taken)?;
+    processing.create_job(
+        job_id,
+        step_index,
+        step.runner_type.clone(),
+        trigger,
+        initiator,
+        meta,
+    );
     // The chain is a host-side sequence correlated by the file id: no step names
     // a parent. Jobs refuses a terminal parent, and a live one would make the
     // step the parent runner's work instead of the host's.
     cx.command(JobCreate {
         payload: CreateJob {
-            job_id: job.job_id,
+            job_id,
             runner_type: step.runner_type.clone(),
             producer: H::SERVICE.to_string(),
             config: Some(config),
             parent_job_id: None,
-            triggered_by: initiator.triggered_by(),
+            triggered_by: named.triggered_by(),
             source_bc: Some(H::SERVICE.to_string()),
             source_entity_id: Some(file.id),
             max_attempts: None,
         },
     })?;
-    let job_id = job.job_id;
-    refresh_status(cx, file).await?;
     Ok(Some(job_id))
-}
-
-/// A second job numbered alike for one file violates the `(file_id, number)`
-/// primary key: another writer created the file's next job first. The file's
-/// row lock every writer takes prevents it; this keeps the answer a code
-/// should it ever happen.
-fn live_job_taken(error: EngineError) -> DriveFault {
-    match &error {
-        EngineError::Db(sqlx::Error::Database(db)) if db.is_unique_violation() => {
-            DriveFault::Refused(codes::FILE_PROCESSING)
-        }
-        _ => DriveFault::Engine(error),
-    }
 }
 
 /// Starts a chain on a READY or FAILED file: the plan becomes the file's
@@ -151,83 +149,96 @@ fn live_job_taken(error: EngineError) -> DriveFault {
 /// touched — they stay readable while the new run reports over them.
 pub(crate) async fn start_chain<H: DriveHost>(
     cx: &mut Ops<'_>,
-    author: &Author,
+    meta: &FactMeta,
     file: &mut FileRow<H>,
     plan: ChainPlan,
     trigger: Trigger,
     initiator: Initiator,
 ) -> Result<(), DriveFault> {
     file.ruleset_id = plan.ruleset_id;
-    file.steps = Some(plan.steps);
-    cx.save(file).await?;
-    let Some(job_id) = launch_step(cx, file, 0, Some(trigger), Some(initiator)).await? else {
+    file.steps = Some(plan.steps.clone());
+    facts::save(cx, file).await?;
+    let mut processing = load_processing(cx, file).await?;
+    processing.start_chain(trigger, plan.ruleset_id, plan.steps, meta);
+    let Some(job_id) = launch_step(
+        cx,
+        meta,
+        file,
+        &mut processing,
+        0,
+        Some(trigger),
+        Some(initiator),
+    )
+    .await?
+    else {
         return Err(DriveFault::Refused(codes::INVALID_RULESET));
     };
-    crate::file::file_recorded::<H>(
-        cx,
-        author,
-        file,
-        FileCause::ProcessingStarted { job_id, step: 0 },
-    )
-    .await?;
+    save_processing(cx, file, &mut processing).await?;
+    crate::file::file_changed::<H>(cx, file, FileCause::ProcessingStarted { job_id, step: 0 })?;
     Ok(())
 }
 
-/// The runner's final report ended `job`, the file's running job, in the
-/// report's transaction: its end `reported_done` is recorded (the job
-/// settles), Jobs is told (`job.finish`), and the chain moves on — the next
-/// step's job, or the end of the chain (READY). Jobs' own `completed` then only confirms it. A
-/// user's cancel that crossed the report stops the chain there: the next step
-/// is recorded as never started, `cancelled`; on the last step there is
-/// nothing left to stop and the file is READY.
+/// The runner's final report ended the file's running job, in the report's
+/// transaction: the job settles, Jobs is told (`job.finish`), and the chain
+/// moves on — the next step's job, or the end of the chain (READY). Jobs' own
+/// `completed` then only confirms it. A user's cancel that crossed the report
+/// stops the chain there: the next step is recorded as never started,
+/// `cancelled`; on the last step there is nothing left to stop and the file
+/// is READY.
 pub(crate) async fn report_done<H: DriveHost>(
     cx: &mut Ops<'_>,
-    author: &Author,
+    meta: &FactMeta,
     file: &mut FileRow<H>,
-    job: &FileJob,
+    processing: &mut FileProcessing<H>,
 ) -> Result<(), DriveFault> {
-    let now = cx.now().as_datetime();
-    end(
-        cx.connection(),
-        job.job_id,
-        End {
-            kind: EndKind::ReportedDone,
-            reason_code: None,
-            message: None,
-            at: now,
-        },
-    )
-    .await?;
-    finish_job(cx, job.job_id)?;
-    let next = usize::try_from(job.step_index).unwrap_or(0) + 1;
+    let job_id = processing.job_id;
+    let step_index = processing.step_index;
+    let trigger = processing.trigger;
+    let initiator = processing.triggered_by.clone();
+    let cancel_requested = processing.cancel_requested();
+    processing.report_done(meta);
+    finish_job(cx, job_id)?;
+    let next = usize::try_from(step_index).unwrap_or(0) + 1;
     let has_next = file.steps.as_ref().is_some_and(|steps| next < steps.len());
-    if job.cancel_requested() && has_next {
-        return stop_before(cx, author, file, next, job).await;
+    if cancel_requested && has_next {
+        processing.stop_before(i32::try_from(next).unwrap_or(i32::MAX), meta);
+        save_processing(cx, file, processing).await?;
+        crate::file::file_changed::<H>(
+            cx,
+            file,
+            FileCause::ProcessingFailed {
+                reason: CANCELLED.to_string(),
+            },
+        )?;
+        return Ok(());
     }
-    let cause = match launch_step(cx, file, next, job.trigger, job.triggered_by.clone()).await? {
+    let cause = match launch_step(cx, meta, file, processing, next, trigger, initiator).await? {
         Some(job_id) => FileCause::ProcessingStarted {
             job_id,
             step: i32::try_from(next).unwrap_or(i32::MAX),
         },
         None => {
-            refresh_status(cx, file).await?;
-            conclude::<H>(cx, file).await?;
+            conclude::<H>(cx, meta, file).await?;
             FileCause::ProcessingFinished
         }
     };
-    cx.save(file).await?;
-    crate::file::file_recorded::<H>(cx, author, file, cause).await?;
+    save_processing(cx, file, processing).await?;
+    crate::file::file_changed::<H>(cx, file, cause)?;
     Ok(())
 }
 
 /// The chain is over: the pages numbered above the file's page count go —
 /// edited ones included — and so do the images no page references any more.
 /// What the run did not report again stays as it was.
-async fn conclude<H: DriveHost>(cx: &mut Ops<'_>, file: &FileRow<H>) -> Result<(), DriveFault> {
+async fn conclude<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    meta: &FactMeta,
+    file: &mut FileRow<H>,
+) -> Result<(), DriveFault> {
     if let Some(page_count) = file.page_count {
         // A trimmed page leaves its live windows: the engine delivers the
         // `DriveRemove` by repopulation, without a cause.
-        for number in processed::trim_pages(cx.connection(), file.id, page_count).await? {
+        for number in store::trim_pages::<H>(cx.connection(), meta, file.id, page_count).await? {
             cx.impact::<Page>(
                 &PageKey {
                     file_id: file.id,
@@ -244,6 +255,13 @@ async fn conclude<H: DriveHost>(cx: &mut Ops<'_>, file: &FileRow<H>) -> Result<(
     for reference in drop_images(cx.connection(), file.id, &unreferenced).await? {
         cx.release_blob(BlobRef(reference))?;
     }
+    file.record(
+        FileEvent::ImagesDropped {
+            names: unreferenced.clone(),
+        },
+        meta,
+    );
+    facts::save(cx, file).await?;
     crate::file::file_changed::<H>(
         cx,
         file,
@@ -254,95 +272,37 @@ async fn conclude<H: DriveHost>(cx: &mut Ops<'_>, file: &FileRow<H>) -> Result<(
     Ok(())
 }
 
-/// The runner declared `job`, the file's running job, failed: the declaration
-/// is recorded as its end, with its reason (the job settles, the file is
-/// FAILED with that reason) and Jobs is told (`job.fail`). The results
+/// The runner declared the file's running job failed: the job settles, the
+/// file is FAILED with that reason, and Jobs is told (`job.fail`). The results
 /// reported so far stay.
 pub(crate) async fn report_failed<H: DriveHost>(
     cx: &mut Ops<'_>,
-    author: &Author,
+    meta: &FactMeta,
     file: &mut FileRow<H>,
-    job: &FileJob,
+    processing: &mut FileProcessing<H>,
     reason_code: &str,
     message: Option<&str>,
 ) -> Result<(), DriveFault> {
-    let now = cx.now().as_datetime();
-    end(
-        cx.connection(),
-        job.job_id,
-        End {
-            kind: EndKind::ReportedFailed,
-            reason_code: Some(reason_code),
-            message,
-            at: now,
-        },
-    )
-    .await?;
+    let job_id = processing.job_id;
+    processing.report_failed(reason_code, message, meta);
     let note = match message {
         Some(message) => format!("{reason_code}: {message}"),
         None => reason_code.to_string(),
     };
     cx.command(JobFail {
         payload: FailJob {
-            job_id: job.job_id,
+            job_id,
             note: Some(note),
         },
     })?;
-    refresh_status(cx, file).await?;
-    crate::file::file_recorded::<H>(
+    save_processing(cx, file, processing).await?;
+    crate::file::file_changed::<H>(
         cx,
-        author,
         file,
         FileCause::ProcessingFailed {
             reason: reason_code.to_string(),
         },
-    )
-    .await?;
-    Ok(())
-}
-
-/// Records step `next` as cancelled before it started: a job row of its own,
-/// never sent to Jobs, ended at once by the library's `cancelled`.
-async fn stop_before<H: DriveHost>(
-    cx: &mut Ops<'_>,
-    author: &Author,
-    file: &mut FileRow<H>,
-    next: usize,
-    ended: &FileJob,
-) -> Result<(), DriveFault> {
-    let now = cx.now().as_datetime();
-    let stopped = FileJob {
-        job_id: Uuid::now_v7(),
-        step_index: i32::try_from(next).unwrap_or(i32::MAX),
-        trigger: ended.trigger,
-        triggered_by: ended.triggered_by.clone(),
-        events: Vec::new(),
-        created_at: now,
-    };
-    insert_job(cx.connection(), file.id, &stopped)
-        .await
-        .map_err(live_job_taken)?;
-    end(
-        cx.connection(),
-        stopped.job_id,
-        End {
-            kind: EndKind::Cancelled,
-            reason_code: None,
-            message: None,
-            at: now,
-        },
-    )
-    .await?;
-    refresh_status(cx, file).await?;
-    crate::file::file_recorded::<H>(
-        cx,
-        author,
-        file,
-        FileCause::ProcessingFailed {
-            reason: super::CANCELLED.to_string(),
-        },
-    )
-    .await?;
+    )?;
     Ok(())
 }
 

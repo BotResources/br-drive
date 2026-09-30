@@ -139,6 +139,125 @@ pub enum FileCause {
     DriveDeleted,
 }
 
+/// Where a file sits in its drive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePlace {
+    pub path: String,
+    pub name: String,
+}
+
+impl FilePlace {
+    pub(crate) fn of<H>(file: &FileRow<H>) -> Self {
+        Self {
+            path: file.path.as_str().to_string(),
+            name: file.name.as_str().to_string(),
+        }
+    }
+}
+
+/// The payload schema version of [`FileEvent`].
+pub const FILE_EVENT_VERSION: i32 = 1;
+
+/// What happened to a file, as the host's fact table records it (the
+/// `drive_file` noun). The live views keep speaking [`FileCause`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+#[non_exhaustive]
+pub enum FileEvent {
+    /// A file was created, pending its upload.
+    UploadRequested {
+        drive_id: Uuid,
+        path: String,
+        name: String,
+        title: String,
+        media_type: String,
+        size_bytes: i64,
+    },
+    /// Its upload was confirmed: the file is stored.
+    UploadCommitted,
+    /// Its upload was never confirmed in time: the file is gone.
+    UploadAbandoned,
+    /// It changed path or name in its drive.
+    Renamed {
+        from: FilePlace,
+        to: FilePlace,
+    },
+    /// It changed drive.
+    Moved {
+        from_drive: Uuid,
+        to_drive: Uuid,
+        from: FilePlace,
+        to: FilePlace,
+    },
+    /// Its folder moved.
+    FolderMoved {
+        from_path: String,
+        to_path: String,
+    },
+    Retitled {
+        from: String,
+        to: String,
+    },
+    /// The host's free JSON changed.
+    MetadataChanged {
+        metadata: serde_json::Value,
+    },
+    LabelsChanged {
+        added: Vec<Uuid>,
+        removed: Vec<Uuid>,
+    },
+    /// A runner asked to upload an extracted image.
+    ImageRequested {
+        name: String,
+    },
+    /// An extracted image landed.
+    ImageAvailable {
+        name: String,
+    },
+    /// Extracted images no page references any more were dropped.
+    ImagesDropped {
+        names: Vec<String>,
+    },
+    /// A runner's report stored an indexing.
+    ReportStored {
+        job_id: Uuid,
+        done: bool,
+    },
+    Deleted,
+    /// Its folder was deleted.
+    FolderDeleted {
+        prefix: String,
+    },
+    /// Its drive was deleted.
+    DriveDeleted,
+}
+
+impl crate::facts::DriveEvent for FileEvent {
+    const NOUN: &'static str = "drive_file";
+    const VERSION: i32 = FILE_EVENT_VERSION;
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::UploadRequested { .. } => "UploadRequested",
+            Self::UploadCommitted => "UploadCommitted",
+            Self::UploadAbandoned => "UploadAbandoned",
+            Self::Renamed { .. } => "Renamed",
+            Self::Moved { .. } => "Moved",
+            Self::FolderMoved { .. } => "FolderMoved",
+            Self::Retitled { .. } => "Retitled",
+            Self::MetadataChanged { .. } => "MetadataChanged",
+            Self::LabelsChanged { .. } => "LabelsChanged",
+            Self::ImageRequested { .. } => "ImageRequested",
+            Self::ImageAvailable { .. } => "ImageAvailable",
+            Self::ImagesDropped { .. } => "ImagesDropped",
+            Self::ReportStored { .. } => "ReportStored",
+            Self::Deleted => "Deleted",
+            Self::FolderDeleted { .. } => "FolderDeleted",
+            Self::DriveDeleted => "DriveDeleted",
+        }
+    }
+}
+
 pub struct FileRow<H> {
     pub id: Uuid,
     pub drive_id: Uuid,
@@ -159,16 +278,23 @@ pub struct FileRow<H> {
     pub steps: Option<Vec<RulesetStep>>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
+    /// The file's last change: the latest of its own row's and of its
+    /// processing's.
     pub updated_at: DateTime<Utc>,
-    /// The file's processing status, read from `drive.file_status` when the
-    /// row is loaded — never written: the library changes it by writing the
-    /// file's job facts.
+    /// The last change of the file's own row (`drive.file.updated_at`).
+    pub(crate) file_updated_at: DateTime<Utc>,
+    /// One per event of the file (`drive.file.version`).
+    pub(crate) version: i64,
+    pub(crate) pending: crate::facts::Pending<FileEvent>,
+    /// The file's processing status, read from `drive.file_processing` when
+    /// the row is loaded — never written by the file's store: the processing
+    /// is an aggregate of its own.
     pub(crate) status: FileStatus,
     pub(crate) host: PhantomData<fn() -> H>,
 }
 
-/// A file's processing status as `drive.file_status` computes it from the
-/// file's last job, with that job.
+/// A file's processing status, from its processing row (none: PENDING while
+/// the upload is not confirmed, READY once it is), with its last job.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileStatus {
     pub state: ProcessingState,
@@ -209,6 +335,9 @@ impl<H> Clone for FileRow<H> {
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            file_updated_at: self.file_updated_at,
+            version: self.version,
+            pending: self.pending.clone(),
             status: self.status.clone(),
             host: PhantomData,
         }
@@ -216,12 +345,25 @@ impl<H> Clone for FileRow<H> {
 }
 
 impl<H> FileRow<H> {
-    /// `PENDING | PROCESSING | READY | FAILED`, computed from the job facts.
+    /// Records `event` on the file: its version moves, and so does its last
+    /// change. The store hands it to the host on the next save.
+    pub(crate) fn record(&mut self, event: FileEvent, meta: &crate::facts::FactMeta) {
+        self.pending.push(&mut self.version, event, meta);
+        self.file_updated_at = meta.occurred_at;
+        self.updated_at = self.updated_at.max(meta.occurred_at);
+    }
+
+    /// The file's version before its pending events.
+    pub(crate) fn base_version(&self) -> i64 {
+        self.version - self.pending.len()
+    }
+
+    /// `PENDING | PROCESSING | READY | FAILED`, from the file's processing.
     pub fn processing_state(&self) -> ProcessingState {
         self.status.state
     }
 
-    /// The reason a FAILED file failed, read from its last job's log.
+    /// The reason a FAILED file failed.
     pub fn processing_error(&self) -> Option<&str> {
         self.status.error.as_deref()
     }
@@ -375,27 +517,6 @@ pub(crate) fn file_changed<H: DriveHost>(
 ) -> Result<(), service_engine::error::EngineError> {
     crate::owner::touch::<H>(ops, file.drive_id)?;
     ops.impact_caused::<File, _>(&file.id, cause)
-}
-
-/// Records a change of `file` as a fact (`cause`, by `author`, now) — its
-/// last change moves — and stages its impact (`file_changed`).
-pub(crate) async fn file_recorded<H: DriveHost>(
-    ops: &mut service_engine::pipeline::Ops<'_>,
-    author: &crate::fact::Author,
-    file: &mut FileRow<H>,
-    cause: FileCause,
-) -> Result<(), service_engine::error::EngineError> {
-    let now = ops.now().as_datetime();
-    crate::fact::record(
-        ops.connection(),
-        author,
-        crate::fact::Subject::File(file.id),
-        &cause,
-        now,
-    )
-    .await?;
-    file.updated_at = now;
-    file_changed::<H>(ops, file, cause)
 }
 
 /// Stages the progress of `file`'s running job: its own views, with the

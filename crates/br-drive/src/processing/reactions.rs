@@ -8,111 +8,55 @@ use service_engine::inbound::{ReactionCoordinates, ReactionMessage};
 use service_engine::pipeline::Reaction;
 use uuid::Uuid;
 
-use super::chain::refresh_status;
 use super::commands::JobCancel;
-use super::log::{self, End, EndKind, FileJob};
-use crate::fact::Author;
+use super::state::{self, Applied, CANCELLED, FileProcessing, Received};
+use crate::facts::{self, FactMeta};
 use crate::fault::DriveReactionFault;
 use crate::file::{FileCause, FileRow};
 use crate::host::DriveHost;
 
-/// The job a Jobs fact is about, with its file (loaded, so locked: a
-/// concurrent fact of the same file waits) and whether the job is the file's
-/// running one — its last job, not ended — the only job whose facts may move
-/// the file. `None` for a job no file holds (a deleted file, a job the library
-/// never created): the fact is acknowledged and ignored.
-struct Target<H> {
-    file: FileRow<H>,
-    job_id: Uuid,
-    running: bool,
-}
-
-async fn target<H: DriveHost>(
+/// Records a Jobs fact about `job_id` on the processing of the file that job
+/// belongs to — the file loaded first, so locked: a concurrent fact of the
+/// same file waits — and stages what it moved: the file's status when it
+/// ended the running job (`updatedAt` moves), its progress when it moved what
+/// the runner says (`ProgressChanged`, never on the host object: progress
+/// changes no count), nothing otherwise. A fact that changes nothing any more
+/// is still recorded, as `JobFactIgnored`. A job no file holds (a deleted
+/// file, a job the library never created) is acknowledged and not recorded:
+/// there is no processing to record it on. Answers the file when the fact
+/// ended its running job.
+async fn receive<H: DriveHost>(
     cx: &mut Reaction<'_>,
     job_id: Uuid,
-) -> Result<Option<Target<H>>, DriveReactionFault> {
-    let Some(file_id) = log::file_of(cx.connection(), job_id).await? else {
+    fact: Received,
+) -> Result<Option<FileRow<H>>, DriveReactionFault> {
+    let Some(file_id) = state::file_of_job(cx.connection(), job_id).await? else {
+        tracing::debug!(%job_id, "a Jobs fact about a job no file holds; not recorded");
         return Ok(None);
     };
-    let Some(file) = cx.load::<FileRow<H>>(&file_id).await? else {
+    let Some(mut file) = cx.load::<FileRow<H>>(&file_id).await? else {
         return Ok(None);
     };
-    let running = file.active_job().is_some_and(|job| job.job_id == job_id);
-    Ok(Some(Target {
-        file,
-        job_id,
-        running,
-    }))
-}
-
-/// A progress fact of the running job is recorded, and a live session hears
-/// of it only when what it shows moved (`ProgressChanged`, never on the host
-/// object: progress changes no count). A progress fact of any other job — an
-/// older one, or one that already ended — is read by nothing and not stored.
-async fn record_progress<H: DriveHost>(
-    cx: &mut Reaction<'_>,
-    job_id: Uuid,
-    record: impl for<'c> FnOnce(
-        &'c mut sqlx::PgConnection,
-    ) -> BoxFuture<'c, Result<(), service_engine::error::EngineError>>,
-) -> Result<(), DriveReactionFault> {
-    let Some(mut target) = target::<H>(cx, job_id).await? else {
-        return Ok(());
+    let Some(mut processing) = cx.load::<FileProcessing<H>>(&file_id).await? else {
+        return Ok(None);
     };
-    if !target.running {
-        tracing::debug!(%job_id, "a progress fact of a job that no longer runs; not recorded");
-        return Ok(());
+    let meta = FactMeta::of_reaction(cx);
+    let applied = processing.receive(job_id, fact, &meta);
+    facts::save(cx, &mut processing).await?;
+    file.status = processing.status();
+    file.updated_at = file.updated_at.max(processing.updated_at);
+    match applied {
+        Applied::Ended => {
+            let reason = file.processing_error().unwrap_or(CANCELLED).to_string();
+            crate::file::file_changed::<H>(cx, &file, FileCause::ProcessingFailed { reason })?;
+            Ok(Some(file))
+        }
+        Applied::Progressed => {
+            crate::file::file_progressed::<H>(cx, &file)?;
+            Ok(None)
+        }
+        Applied::Noted | Applied::Ignored => Ok(None),
     }
-    let before = target.file.active_job().map(FileJob::progress);
-    record(cx.connection()).await?;
-    refresh_status(cx, &mut target.file).await?;
-    let after = target.file.active_job().map(FileJob::progress);
-    if before != after {
-        crate::file::file_progressed::<H>(cx, &target.file)?;
-    }
-    Ok(())
-}
-
-/// A Jobs end of the job is recorded — unless the job had already ended: the
-/// first end wins. The end of the running job lands the file FAILED with
-/// `reason` (`updatedAt` moves); nothing else moves.
-async fn record_end<H: DriveHost>(
-    cx: &mut Reaction<'_>,
-    target: &mut Target<H>,
-    kind: EndKind,
-    reason: Option<&str>,
-    message: Option<&str>,
-) -> Result<bool, DriveReactionFault> {
-    let now = cx.now().as_datetime();
-    let first = log::end(
-        cx.connection(),
-        target.job_id,
-        End {
-            kind,
-            reason_code: reason,
-            message,
-            at: now,
-        },
-    )
-    .await?;
-    if !(first && target.running) {
-        return Ok(false);
-    }
-    refresh_status(cx, &mut target.file).await?;
-    let reason = target
-        .file
-        .processing_error()
-        .unwrap_or(super::CANCELLED)
-        .to_string();
-    let author = Author::of_reaction(cx);
-    crate::file::file_recorded::<H>(
-        cx,
-        &author,
-        &mut target.file,
-        FileCause::ProcessingFailed { reason },
-    )
-    .await?;
-    Ok(true)
 }
 
 macro_rules! job_fact {
@@ -189,39 +133,45 @@ pub const DURABLE_COMPLETED: &str = "job-completed";
 pub const DURABLE_FAILED: &str = "job-failed";
 pub const DURABLE_CANCELLED: &str = "job-cancelled";
 
-/// Jobs queued the job, started a run of it, or completed it: nothing reads
-/// these facts — Jobs' `completed` only confirms the library's own
-/// `job.finish`, sent when the runner's final report ended the job. They are
-/// acknowledged, so the host's durables never hold them.
-macro_rules! unread_reaction {
-    ($(#[$doc:meta])* $name:ident, $fact:ident) => {
-        $(#[$doc])*
-        pub fn $name<'r>(
-            _cx: &'r mut Reaction<'r>,
-            fact: $fact,
-        ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
-            Box::pin(async move {
-                tracing::trace!(job_id = %fact.0.job_id, "a Jobs fact nothing reads");
-                Ok(())
-            })
-        }
-    };
+/// Jobs queued the job.
+pub fn on_queued<'r, H: DriveHost>(
+    cx: &'r mut Reaction<'r>,
+    fact: QueuedFact,
+) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
+    Box::pin(async move {
+        let JobQueued {
+            job_id,
+            runner_type,
+        } = fact.0;
+        receive::<H>(cx, job_id, Received::Queued { runner_type }).await?;
+        Ok(())
+    })
 }
 
-unread_reaction!(
-    /// Jobs queued the job.
-    on_queued, QueuedFact
-);
-unread_reaction!(
-    /// A run of the job started.
-    on_started, StartedFact
-);
-unread_reaction!(
-    /// Jobs completed the job — only ever after the library's own
-    /// `job.finish`, sent in the transaction of the runner's final report,
-    /// which already ended the job and moved the chain on.
-    on_completed, CompletedFact
-);
+/// A run of the job started.
+pub fn on_started<'r, H: DriveHost>(
+    cx: &'r mut Reaction<'r>,
+    fact: StartedFact,
+) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
+    Box::pin(async move {
+        let JobStarted { job_id, run_id } = fact.0;
+        receive::<H>(cx, job_id, Received::Started { run_id }).await?;
+        Ok(())
+    })
+}
+
+/// Jobs completed the job — only ever after the library's own `job.finish`,
+/// sent in the transaction of the runner's final report, which already ended
+/// the job and moved the chain on: recorded, it moves nothing.
+pub fn on_completed<'r, H: DriveHost>(
+    cx: &'r mut Reaction<'r>,
+    fact: CompletedFact,
+) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
+    Box::pin(async move {
+        receive::<H>(cx, fact.0.job_id, Received::Completed).await?;
+        Ok(())
+    })
+}
 
 /// The runner declared its plan: `progress.plan` (the latest declaration).
 pub fn on_plan_declared<'r, H: DriveHost>(
@@ -234,11 +184,16 @@ pub fn on_plan_declared<'r, H: DriveHost>(
             run_id,
             steps,
         } = fact.0;
-        let at = cx.now().as_datetime();
-        record_progress::<H>(cx, job_id, move |conn| {
-            Box::pin(async move { log::declare_plan(conn, job_id, run_id, &steps, at).await })
-        })
-        .await
+        receive::<H>(
+            cx,
+            job_id,
+            Received::PlanDeclared {
+                run_id,
+                labels: steps,
+            },
+        )
+        .await?;
+        Ok(())
     })
 }
 
@@ -257,12 +212,18 @@ pub fn on_step_started<'r, H: DriveHost>(
             started_at,
         } = fact.0;
         let index = i32::try_from(index).unwrap_or(i32::MAX);
-        record_progress::<H>(cx, job_id, move |conn| {
-            Box::pin(async move {
-                log::start_step(conn, job_id, run_id, index, &label, started_at).await
-            })
-        })
-        .await
+        receive::<H>(
+            cx,
+            job_id,
+            Received::StepStarted {
+                run_id,
+                index,
+                label,
+                started_at,
+            },
+        )
+        .await?;
+        Ok(())
     })
 }
 
@@ -276,26 +237,31 @@ pub fn on_creation_rejected<'r, H: DriveHost>(
     fact: CreationRejectedFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        let Some(mut target) = target::<H>(cx, fact.0.job_id).await? else {
-            return Ok(());
-        };
-        let reason = non_blank(&fact.0.reason_code, super::log::kind::CREATION_REJECTED);
-        let settled = record_end(
+        let JobCreationRejected {
+            job_id,
+            reason_code,
+            params,
+        } = fact.0;
+        let reason = non_blank(&reason_code, super::state::kind::CREATION_REJECTED).to_string();
+        let ended = receive::<H>(
             cx,
-            &mut target,
-            EndKind::CreationRejected,
-            Some(reason),
-            None,
+            job_id,
+            Received::CreationRejected {
+                reason_code: reason,
+                params: params.clone(),
+            },
         )
         .await?;
-        if settled && fact.0.reason_code == REASON_DUPLICATE_ACTIVE_ENTITY {
-            match active_job_of::<H>(&fact.0.params, target.file.id) {
+        if let Some(file) = ended
+            && reason_code == REASON_DUPLICATE_ACTIVE_ENTITY
+        {
+            match active_job_of::<H>(&params, file.id) {
                 Some(active) => cx.command(JobCancel {
                     payload: CancelJob { job_id: active },
                 })?,
                 None => tracing::warn!(
-                    file = %target.file.id,
-                    params = %fact.0.params,
+                    file = %file.id,
+                    params = %params,
                     "a duplicate_active_entity rejection names no active job of this file; \
                      nothing to cancel"
                 ),
@@ -336,22 +302,25 @@ pub fn on_failed<'r, H: DriveHost>(
     fact: FailedFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        let Some(mut target) = target::<H>(cx, fact.0.job_id).await? else {
-            return Ok(());
-        };
-        let cause = non_blank(&fact.0.failure_cause, super::log::kind::FAILED);
-        let reason = fact
-            .0
-            .failure_report
+        let JobFailed {
+            job_id,
+            failure_cause,
+            failure_report,
+            note,
+        } = fact.0;
+        let cause = non_blank(&failure_cause, super::state::kind::FAILED).to_string();
+        let reason = failure_report
             .as_ref()
-            .map(|report| non_blank(&report.reason_code, cause))
-            .unwrap_or(cause);
-        record_end(
+            .map(|report| non_blank(&report.reason_code, &cause).to_string())
+            .unwrap_or_else(|| cause.clone());
+        receive::<H>(
             cx,
-            &mut target,
-            EndKind::Failed,
-            Some(reason),
-            fact.0.note.as_deref(),
+            job_id,
+            Received::Failed {
+                failure_cause: cause,
+                reason_code: reason,
+                note,
+            },
         )
         .await?;
         Ok(())
@@ -364,10 +333,7 @@ pub fn on_cancelled<'r, H: DriveHost>(
     fact: CancelledFact,
 ) -> BoxFuture<'r, Result<(), DriveReactionFault>> {
     Box::pin(async move {
-        let Some(mut target) = target::<H>(cx, fact.0.job_id).await? else {
-            return Ok(());
-        };
-        record_end(cx, &mut target, EndKind::Cancelled, None, None).await?;
+        receive::<H>(cx, fact.0.job_id, Received::Cancelled).await?;
         Ok(())
     })
 }
