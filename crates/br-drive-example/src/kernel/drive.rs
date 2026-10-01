@@ -38,6 +38,10 @@ pub const UNRECORDABLE_TITLE: &str = "unrecordable";
 /// suite's proof that a commit starting a chain rolls back whole.
 pub const UNRECORDABLE_RUNNER_TYPE: &str = "unrecordable";
 pub const FACT_REFUSED: Reason = Reason::new("FACT_REFUSED");
+/// The host's admission at subscription open: a person whose account is
+/// deactivated opens no drive stream. The example reads the passport's
+/// `is_active` flag; a real host reads its own roster.
+pub const ACTIVE_USER_REQUIRED: Reason = Reason::new("ACTIVE_USER_REQUIRED");
 
 impl DriveHost for AppPrincipal {
     const SERVICE: &'static str = crate::SERVICE;
@@ -133,6 +137,14 @@ impl DriveHost for AppPrincipal {
 
     fn visible_drives(&self) -> Vec<Uuid> {
         self.owned_workspaces()
+    }
+
+    fn admit_subscription(&self) -> Gate {
+        if self.passport().is_active() {
+            Gate::allowed()
+        } else {
+            Gate::blocked(ACTIVE_USER_REQUIRED)
+        }
     }
 
     fn display_name(&self) -> Option<String> {

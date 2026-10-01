@@ -148,6 +148,21 @@ pub trait DriveHost: Principal {
 
     fn visible_drives(&self) -> Vec<Uuid>;
 
+    /// Whether this principal may open a subscription of the drive slice at
+    /// all (`<p>DriveChanged`, `<p>FilePages`, `<p>LabelsChanged`,
+    /// `<p>RulesetsChanged`): the host's admission, asked before the stream
+    /// is attached. A blocked gate refuses the subscription at open with its
+    /// reason as the error's `code`, and no stream is attached.
+    ///
+    /// The gateway authenticates; admitting is the host's job, read from its
+    /// own data — a person deactivated or unknown in its roster, a service
+    /// account on a surface meant for people. Hosts should implement it as
+    /// their own subscription roots do before attaching. The default admits
+    /// everyone, the behaviour before the hook existed.
+    fn admit_subscription(&self) -> Gate {
+        Gate::allowed()
+    }
+
     fn is_runner(&self) -> bool {
         let passport = self.passport();
         passport.service_account_id().is_some()
@@ -199,5 +214,77 @@ pub trait DriveHost: Principal {
         'o: 'a,
     {
         Box::pin(async { Ok(()) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use br_core_auth::{AuthMethod, Passport, PassportClaims};
+    use service_engine::principal::PrincipalId;
+
+    use super::*;
+    use crate::owner::NoDriveOwner;
+
+    /// A host that implements only what the trait requires.
+    #[derive(Clone)]
+    struct BareHost {
+        id: PrincipalId,
+        passport: Passport,
+    }
+
+    impl BareHost {
+        fn deactivated() -> Self {
+            let user = Uuid::now_v7();
+            Self {
+                id: PrincipalId::from(user),
+                passport: Passport::human(
+                    user,
+                    false,
+                    false,
+                    AuthMethod::Jwt,
+                    None,
+                    PassportClaims::new(),
+                ),
+            }
+        }
+    }
+
+    impl Principal for BareHost {
+        fn id(&self) -> PrincipalId {
+            self.id
+        }
+
+        fn passport(&self) -> &Passport {
+            &self.passport
+        }
+    }
+
+    impl DriveHost for BareHost {
+        const SERVICE: &'static str = "bare";
+        const RUNNER_SCOPE: &'static str = "bare:runner";
+        type DriveOwner = NoDriveOwner;
+
+        fn drive_gate(&self, _request: &DriveRequest<'_, Self>) -> Gate {
+            Gate::allowed()
+        }
+
+        fn record_facts<'a>(
+            _conn: &'a mut PgConnection,
+            _facts: &'a [DriveFact],
+        ) -> BoxFuture<'a, Result<(), EngineError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn visible_drives(&self) -> Vec<Uuid> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_host_that_does_not_implement_admission_admits_every_subscription() {
+        assert_eq!(
+            BareHost::deactivated().admit_subscription(),
+            Gate::allowed()
+        );
     }
 }

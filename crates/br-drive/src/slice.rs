@@ -575,6 +575,7 @@ macro_rules! drive_slice {
                     >,
                 > {
                     use ::futures_util::StreamExt;
+                    $crate::DriveHost::admit_subscription(ctx.data::<$p>()?).require()?;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
                         ::std::vec![::service_engine::OrInternal::or_internal(
@@ -600,6 +601,7 @@ macro_rules! drive_slice {
                     >,
                 > {
                     use ::futures_util::StreamExt;
+                    $crate::DriveHost::admit_subscription(ctx.data::<$p>()?).require()?;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
                         ::std::vec![::service_engine::OrInternal::or_internal(
@@ -624,6 +626,7 @@ macro_rules! drive_slice {
                     >,
                 > {
                     use ::futures_util::StreamExt;
+                    $crate::DriveHost::admit_subscription(ctx.data::<$p>()?).require()?;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
                         ::std::vec![::service_engine::OrInternal::or_internal(
@@ -648,6 +651,7 @@ macro_rules! drive_slice {
                     >,
                 > {
                     use ::futures_util::StreamExt;
+                    $crate::DriveHost::admit_subscription(ctx.data::<$p>()?).require()?;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
                         ::std::vec![::service_engine::OrInternal::or_internal(

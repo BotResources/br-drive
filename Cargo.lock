@@ -404,9 +404,10 @@ dependencies = [
 
 [[package]]
 name = "br-drive"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-graphql",
+ "br-core-auth",
  "br-core-integration",
  "chrono",
  "contract-jobs",
@@ -423,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "br-drive-example"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-graphql",
  "async-nats",

@@ -4,6 +4,7 @@ pub mod minio;
 pub mod nats;
 pub mod pg;
 pub mod runner;
+pub mod sse;
 pub mod upload;
 pub mod ws;
 
@@ -22,6 +23,7 @@ pub use jobs::JobsStandIn;
 pub use minio::TestMinio;
 pub use nats::TestNats;
 pub use pg::TestDb;
+pub use sse::SseSubscription;
 pub use ws::Subscription;
 
 pub struct World {
@@ -669,6 +671,20 @@ pub fn passport(user: Uuid) -> String {
         user,
         false,
         true,
+        AuthMethod::Jwt,
+        None,
+        PassportClaims::new(),
+    )
+    .to_header()
+}
+
+/// `user`'s session once their account is deactivated: the gateway still
+/// authenticates it, the host no longer admits it.
+pub fn deactivated_passport(user: Uuid) -> String {
+    Passport::human(
+        user,
+        false,
+        false,
         AuthMethod::Jwt,
         None,
         PassportClaims::new(),
