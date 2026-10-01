@@ -9,6 +9,50 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.6.2 — 2026-10-02
+
+Additive only: no signature changes, the committed SDL did not move, and a
+host on 0.6.1 upgrades by bumping the pin. A host that implements nothing
+keeps 0.6.1's behaviour; one that implemented `admit_subscription` keeps its
+subscriptions refused as before.
+
+### Added
+
+- **`DriveHost::admit(&self) -> Gate`**, the host's caller admission. The
+  default admits everyone; a host implements it with the rule its own roots
+  apply (a person deactivated or unknown in its roster, a service account on
+  a surface meant for people, a person without its access scope), read from
+  its own data.
+- The example host implements `admit` (a deactivated account is refused
+  `ACTIVE_USER_REQUIRED`); e2e prove that every query, mutation and
+  subscription root of the slice answers that code at the root, byte-identical
+  for an existing and a random id, with nothing recorded and no stream
+  opened, that the suite's root list matches the slice's schema, and that the
+  runner roots still answer `RUNNER_SCOPE_REQUIRED` to a non-runner, admitted
+  or not; unit tests pin the defaults.
+
+### Changed
+
+- **`DriveHost::admit_subscription` is deprecated** in favour of `admit`; its
+  default is now `self.admit()`, so a host implements `admit` only and the
+  four subscriptions get the same answer as every other root. A host that
+  implements it still builds warning-free (implementing a deprecated method
+  is not a use of it); only calling it warns.
+
+### Fixed
+
+- **Every root of the drive slice asks the host's admission first.** The
+  queries (`<p>File`, `<p>DriveFiles`, `<p>Pages`, `<p>FileAccess`,
+  `<p>Labels`, `<p>Rulesets`, `<p>RunnerTypes`), every mutation and the four
+  subscriptions call `admit` before any lookup and refuse with the gate's
+  reason as `errors[].extensions.code`. Through 0.6.1 only the subscriptions
+  asked: a mutation or a read looked the file, folder or drive up first, so a
+  caller the host does not admit met `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND` or
+  an empty catalogue — an answer depending on whether the id existed, and
+  never the host's own code. The four runner roots keep their runner-scope
+  check, asked before any lookup, and do not ask `admit`: a host refusing
+  service accounts on its human surface keeps its runners working.
+
 ## 0.6.1 — 2026-10-01
 
 Additive only: no signature changes, and a host on 0.6.0 upgrades by bumping
