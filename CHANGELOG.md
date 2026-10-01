@@ -9,6 +9,33 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.6.1 — 2026-10-01
+
+Additive only: no signature changes, and a host on 0.6.0 upgrades by bumping
+the pin. A host that implements nothing keeps 0.6.0's behaviour.
+
+### Added
+
+- **`DriveHost::admit_subscription(&self) -> Gate`**, the host's admission at
+  subscription open. The default admits everyone; a host implements it with
+  the rule its own subscription roots apply before `service_engine::attach`
+  (a person deactivated or unknown in its roster, a service account on a
+  surface meant for people), read from its own data.
+- The example host refuses a deactivated account `ACTIVE_USER_REQUIRED`;
+  e2e for the four subscriptions, refused and admitted, over
+  `graphql-transport-ws` and over the `text/event-stream` leg (a new SSE
+  reader in the harness).
+
+### Fixed
+
+- **The drive slice's subscriptions honour the host's admission.**
+  `<p>DriveChanged`, `<p>FilePages`, `<p>LabelsChanged` and
+  `<p>RulesetsChanged` ask `admit_subscription` before attaching: a refused
+  principal gets the gate's reason as `errors[].extensions.code` at open and
+  no stream. Through 0.6.0 they attached for any authenticated principal, so
+  one the host does not admit opened the streams (on an empty `DriveReset`
+  when `visible_drives` listed nothing) instead of being refused.
+
 ## 0.6.0 — 2026-09-30
 
 Moves the library to `br-service-engine` **v0.4.0** (the engine's breaking
