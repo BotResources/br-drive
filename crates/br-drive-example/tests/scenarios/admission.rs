@@ -1,4 +1,4 @@
-//! Admission at subscription open: the host's `DriveHost::admit_subscription`
+//! Admission at subscription open: the host's `DriveHost::admit`
 //! answers for every subscription of the drive slice, before any stream is
 //! attached. The example host refuses a deactivated account with
 //! `ACTIVE_USER_REQUIRED`.

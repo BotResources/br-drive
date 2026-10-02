@@ -1,3 +1,4 @@
+mod admission;
 mod blob;
 mod catalogue;
 mod drive;
@@ -25,6 +26,8 @@ use std::ops::RangeInclusive;
 
 use service_engine::LibraryMigrations;
 
+#[doc(hidden)]
+pub use admission::{admitted_mutation, admitted_query, admitted_subscription};
 pub use blob::{DriveImage as DriveImageBlob, DriveSource};
 pub use catalogue::{
     CatalogueWatch, DriveRunnerType, DriveRunnerTypeLifecycle, DriveRunnerTypes, KnownRunnerType,

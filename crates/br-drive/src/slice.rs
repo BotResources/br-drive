@@ -1,3 +1,10 @@
+// Every root asks the host's admission first (`DriveHost::admit`, through
+// `admitted_query` / `admitted_mutation` / `admitted_subscription`), before
+// any lookup: a caller the host does not admit gets the host's reason, the
+// same answer whether the id it named exists or not. The four runner roots
+// do not ask it: the runner scope is required there before any lookup
+// (`RUNNER_SCOPE_REQUIRED`), and a host refusing service accounts on its
+// human surface must not refuse its own runners.
 #[macro_export]
 macro_rules! drive_slice {
     (prefix = $prefix:ident ; principal = $p:ty) => {
@@ -12,6 +19,7 @@ macro_rules! drive_slice {
                     ctx: &::async_graphql::Context<'_>,
                     file_id: ::uuid::Uuid,
                 ) -> ::async_graphql::Result<::core::option::Option<$crate::DriveFile>> {
+                    $crate::admitted_query::<$p>(ctx)?;
                     ::service_engine::Query::<$p>::new(ctx)?
                         .fetch_view::<$crate::DriveFiles<$p>>(&file_id)
                         .await
@@ -22,6 +30,7 @@ macro_rules! drive_slice {
                     ctx: &::async_graphql::Context<'_>,
                     drive_id: ::uuid::Uuid,
                 ) -> ::async_graphql::Result<::std::vec::Vec<$crate::DriveFile>> {
+                    $crate::admitted_query::<$p>(ctx)?;
                     ::service_engine::Query::<$p>::new(ctx)?
                         .fetch_view_window::<$crate::DriveFiles<$p>>(
                             &$crate::DriveWindow::of(drive_id),
@@ -34,6 +43,7 @@ macro_rules! drive_slice {
                     ctx: &::async_graphql::Context<'_>,
                     file_id: ::uuid::Uuid,
                 ) -> ::async_graphql::Result<::std::vec::Vec<$crate::DrivePage>> {
+                    $crate::admitted_query::<$p>(ctx)?;
                     ::service_engine::Query::<$p>::new(ctx)?
                         .fetch_view_window::<$crate::DrivePages<$p>>(
                             &$crate::PageWindow::of(file_id),
@@ -45,6 +55,7 @@ macro_rules! drive_slice {
                     &self,
                     ctx: &::async_graphql::Context<'_>,
                 ) -> ::async_graphql::Result<::std::vec::Vec<$crate::DriveRuleset>> {
+                    $crate::admitted_query::<$p>(ctx)?;
                     ::service_engine::Query::<$p>::new(ctx)?
                         .fetch_view_window::<$crate::DriveRulesets<$p>>(
                             &::core::default::Default::default(),
@@ -56,6 +67,7 @@ macro_rules! drive_slice {
                     &self,
                     ctx: &::async_graphql::Context<'_>,
                 ) -> ::async_graphql::Result<::std::vec::Vec<$crate::DriveRunnerType>> {
+                    $crate::admitted_query::<$p>(ctx)?;
                     $crate::known_runner_types::<$p>(&::service_engine::Query::<$p>::new(ctx)?)
                         .await
                 }
@@ -64,6 +76,7 @@ macro_rules! drive_slice {
                     &self,
                     ctx: &::async_graphql::Context<'_>,
                 ) -> ::async_graphql::Result<::std::vec::Vec<$crate::DriveLabel>> {
+                    $crate::admitted_query::<$p>(ctx)?;
                     ::service_engine::Query::<$p>::new(ctx)?
                         .fetch_view_window::<$crate::DriveLabels<$p>>(
                             &::core::default::Default::default(),
@@ -77,6 +90,7 @@ macro_rules! drive_slice {
                     file_id: ::uuid::Uuid,
                     name: ::core::option::Option<::std::string::String>,
                 ) -> ::async_graphql::Result<::core::option::Option<::std::string::String>> {
+                    $crate::admitted_query::<$p>(ctx)?;
                     let query = ::service_engine::Query::<$p>::new(ctx)?;
                     let ::core::option::Option::Some(file) =
                         query.fetch_view::<$crate::DriveFiles<$p>>(&file_id).await?
@@ -171,6 +185,7 @@ macro_rules! drive_slice {
                     title: ::core::option::Option<::std::string::String>,
                     ruleset_id: ::core::option::Option<::uuid::Uuid>,
                 ) -> ::async_graphql::Result<$crate::UploadTicket> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     let upload = $crate::RequestUpload {
                         file_id,
                         drive_id,
@@ -204,6 +219,7 @@ macro_rules! drive_slice {
                     ctx: &::async_graphql::Context<'_>,
                     file_id: ::uuid::Uuid,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::CommitUpload>(
                         ctx,
                         $crate::CommitUpload { file_id },
@@ -217,6 +233,7 @@ macro_rules! drive_slice {
                     file_id: ::uuid::Uuid,
                     ruleset_id: ::core::option::Option<::uuid::Uuid>,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::ProcessFile>(
                         ctx,
                         $crate::ProcessFile { file_id, ruleset_id },
@@ -229,6 +246,7 @@ macro_rules! drive_slice {
                     ctx: &::async_graphql::Context<'_>,
                     file_id: ::uuid::Uuid,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::CancelProcessing>(
                         ctx,
                         $crate::CancelProcessing { file_id },
@@ -244,6 +262,7 @@ macro_rules! drive_slice {
                     comment: ::core::option::Option<::std::string::String>,
                     ruleset_id: ::core::option::Option<::uuid::Uuid>,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::RegeneratePage>(
                         ctx,
                         $crate::RegeneratePage {
@@ -267,6 +286,7 @@ macro_rules! drive_slice {
                     steps: ::std::vec::Vec<$crate::RulesetStepInput>,
                     #[graphql(default = false)] is_default: bool,
                 ) -> ::async_graphql::Result<$crate::RulesetSaved> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::core::result::Result::Ok(
                         ::service_engine::execute::<$p, $crate::CreateRuleset>(
                             ctx,
@@ -293,6 +313,7 @@ macro_rules! drive_slice {
                     steps: ::core::option::Option<::std::vec::Vec<$crate::RulesetStepInput>>,
                     is_default: ::core::option::Option<bool>,
                 ) -> ::async_graphql::Result<$crate::RulesetSaved> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::core::result::Result::Ok(
                         ::service_engine::execute::<$p, $crate::UpdateRuleset>(
                             ctx,
@@ -319,6 +340,7 @@ macro_rules! drive_slice {
                     color: ::std::string::String,
                     description: ::core::option::Option<::std::string::String>,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::CreateLabel>(
                         ctx,
                         $crate::CreateLabel {
@@ -339,6 +361,7 @@ macro_rules! drive_slice {
                     color: ::core::option::Option<::std::string::String>,
                     description: ::core::option::Option<::std::string::String>,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::UpdateLabel>(
                         ctx,
                         $crate::UpdateLabel {
@@ -356,6 +379,7 @@ macro_rules! drive_slice {
                     ctx: &::async_graphql::Context<'_>,
                     id: ::uuid::Uuid,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack_bulk::<$p, $crate::DeleteLabel>(
                         ctx,
                         $crate::DeleteLabel { id },
@@ -369,6 +393,7 @@ macro_rules! drive_slice {
                     file_id: ::uuid::Uuid,
                     label_ids: ::std::vec::Vec<::uuid::Uuid>,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::SetFileLabels>(
                         ctx,
                         $crate::SetFileLabels { file_id, label_ids },
@@ -381,6 +406,7 @@ macro_rules! drive_slice {
                     ctx: &::async_graphql::Context<'_>,
                     id: ::uuid::Uuid,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::DeleteRuleset>(
                         ctx,
                         $crate::DeleteRuleset { id },
@@ -396,6 +422,7 @@ macro_rules! drive_slice {
                     path: ::core::option::Option<::std::string::String>,
                     drive_id: ::core::option::Option<::uuid::Uuid>,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::UpdateFile>(
                         ctx,
                         $crate::UpdateFile {
@@ -414,6 +441,7 @@ macro_rules! drive_slice {
                     file_id: ::uuid::Uuid,
                     title: ::std::string::String,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::RetitleFile>(
                         ctx,
                         $crate::RetitleFile { file_id, title },
@@ -426,6 +454,7 @@ macro_rules! drive_slice {
                     ctx: &::async_graphql::Context<'_>,
                     file_id: ::uuid::Uuid,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::DeleteFile>(
                         ctx,
                         $crate::DeleteFile { file_id },
@@ -440,6 +469,7 @@ macro_rules! drive_slice {
                     number: i32,
                     markdown: ::std::string::String,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::EditPage>(
                         ctx,
                         $crate::EditPage {
@@ -535,6 +565,7 @@ macro_rules! drive_slice {
                     old_prefix: ::std::string::String,
                     new_prefix: ::std::string::String,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack_bulk::<$p, $crate::MoveFolder>(
                         ctx,
                         $crate::MoveFolder {
@@ -552,6 +583,7 @@ macro_rules! drive_slice {
                     drive_id: ::uuid::Uuid,
                     prefix: ::std::string::String,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
+                    $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack_bulk::<$p, $crate::DeleteFolder>(
                         ctx,
                         $crate::DeleteFolder { drive_id, prefix },
@@ -575,7 +607,7 @@ macro_rules! drive_slice {
                     >,
                 > {
                     use ::futures_util::StreamExt;
-                    $crate::DriveHost::admit_subscription(ctx.data::<$p>()?).require()?;
+                    $crate::admitted_subscription::<$p>(ctx)?;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
                         ::std::vec![::service_engine::OrInternal::or_internal(
@@ -601,7 +633,7 @@ macro_rules! drive_slice {
                     >,
                 > {
                     use ::futures_util::StreamExt;
-                    $crate::DriveHost::admit_subscription(ctx.data::<$p>()?).require()?;
+                    $crate::admitted_subscription::<$p>(ctx)?;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
                         ::std::vec![::service_engine::OrInternal::or_internal(
@@ -626,7 +658,7 @@ macro_rules! drive_slice {
                     >,
                 > {
                     use ::futures_util::StreamExt;
-                    $crate::DriveHost::admit_subscription(ctx.data::<$p>()?).require()?;
+                    $crate::admitted_subscription::<$p>(ctx)?;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
                         ::std::vec![::service_engine::OrInternal::or_internal(
@@ -651,7 +683,7 @@ macro_rules! drive_slice {
                     >,
                 > {
                     use ::futures_util::StreamExt;
-                    $crate::DriveHost::admit_subscription(ctx.data::<$p>()?).require()?;
+                    $crate::admitted_subscription::<$p>(ctx)?;
                     let stream = ::service_engine::attach::<$p>(
                         ctx,
                         ::std::vec![::service_engine::OrInternal::or_internal(

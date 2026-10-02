@@ -24,7 +24,7 @@ The workspace's MSRV is Rust 1.94 — the floor of the pinned `contract-jobs`
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.6.1", version = "0.6.1" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.6.2", version = "0.6.2" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -96,7 +96,7 @@ rolls them together. The host never writes to the `drive` schema directly.
 
 1. **Compose**: `slice drive ["drive"] from br_drive::drive_slice { query = drive::DriveQuery, mutation = drive::DriveMutation, subscription = drive::DriveSubscription }` under the host's `prefix`; every root below appears at that prefix.
 2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and both of the library's self-commands (`upload-deadline`, `image-landed`) arrive as a service actor, and a resolver that rejects services parks all ten reactions.
-3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `record_facts` (required), `visible_drives` (never a service principal), `admit_subscription` (the host's admission at subscription open), `display_name`, `upload_window`, `process_on_commit`, `erase_mode`, the two folder hooks.
+3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `record_facts` (required), `visible_drives` (never a service principal), `admit` (the host's caller admission, asked first by every root), `display_name`, `upload_window`, `process_on_commit`, `erase_mode`, the two folder hooks.
 4. **Fact table**: the host's own fact table (the reference table under [Facts](#facts-handed-to-the-host)), created by a host migration; `record_facts` inserts into it on the connection it is given.
 5. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
 6. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
@@ -117,7 +117,7 @@ impl DriveHost for AppPrincipal {
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate { … }
     fn record_facts(conn, facts: &[DriveFact]) -> BoxFuture<…> { … } // required: insert into the host's fact table
     fn visible_drives(&self) -> Vec<Uuid> { … }
-    fn admit_subscription(&self) -> Gate { … }          // default admits; refuse whom the host does not admit
+    fn admit(&self) -> Gate { … }                       // default admits; refuse whom the host does not admit, at every root
     fn display_name(&self) -> Option<String> { … }      // default None; feeds job.create's triggered_by
     fn erase_mode() -> EraseMode { … }                  // default Anonymise; Delete removes the person's files
     fn upload_window(&self) -> Duration { … }           // default 15 min
@@ -221,19 +221,29 @@ every `RequestUpload`.
   `cx.impact_principal_facts(principal, deps)` with a dependency inside
   `VISIBILITY_DEPS`, and every open `DriveChanged` session repopulates — a lost
   drive arrives as `Remove` deltas, a gained one as `Upsert`s.
-- `admit_subscription` (since 0.6.1) is the host's admission at
-  subscription open, asked by `<p>DriveChanged`, `<p>FilePages`,
-  `<p>LabelsChanged` and `<p>RulesetsChanged` before the stream is attached.
-  `Gate::blocked(reason)` refuses the subscription with the reason as its
-  `errors[].extensions.code` — over `/graphql/ws` and over the gateway's
-  `text/event-stream` leg alike — and no stream is attached; the default
-  admits everyone. The gateway authenticates; deciding whom the host admits —
-  a person deactivated or unknown in its roster, a service account on a
-  surface meant for people — is the host's, read from its own data, so a host
-  implements it with the same rule its own subscription roots apply before
-  `service_engine::attach`. Without it, a principal the host does not admit
-  still opens the four streams (on an empty `DriveReset` when
-  `visible_drives` lists nothing) instead of being refused.
+- `admit` (since 0.6.2) is the host's caller admission, asked FIRST by every
+  root of the slice — the queries (`<p>File`, `<p>DriveFiles`, `<p>Pages`,
+  `<p>FileAccess`, `<p>Labels`, `<p>Rulesets`, `<p>RunnerTypes`), every
+  mutation but the runner's, and the four subscriptions — before any lookup.
+  `Gate::blocked(reason)` refuses the root with the reason as its
+  `errors[].extensions.code`: nothing is looked up, recorded or attached, so
+  the answer is byte-identical whether the id the caller named exists or not
+  (without it, a refused caller met `FILE_NOT_FOUND`, `FOLDER_NOT_FOUND` or an
+  empty catalogue, depending on the id). Subscriptions are refused at open —
+  over `/graphql/ws` and over the gateway's `text/event-stream` leg alike —
+  and no stream is attached. The default admits everyone. The gateway
+  authenticates; deciding whom the host admits — a person deactivated or
+  unknown in its roster, a service account on a surface meant for people, a
+  person without the host's access scope — is the host's, read from its own
+  data, with the same rule its own roots apply. The four runner roots
+  (`<p>RunnerContext`, `<p>RunnerReport`, `<p>RunnerReportFailure`,
+  `<p>RunnerRequestImageUpload`) do not ask it: they require
+  `RUNNER_SCOPE` before any lookup (`RUNNER_SCOPE_REQUIRED` to anyone
+  else), so a host refusing service accounts in `admit` keeps its runners.
+- `admit_subscription` (0.6.1, deprecated since 0.6.2) is the admission the
+  four subscriptions ask; its default is `admit`, so a host implements `admit`
+  only. A 0.6.1 host that implemented `admit_subscription` keeps its
+  subscriptions refused as before, and should move the rule to `admit`.
 - `SOURCE_MAX_BYTES` (default 1 GiB) and `SOURCE_ORPHAN_AFTER` (default 24 h,
   must cover the engine's `upload_ttl`) are the `BlobPolicy` of the source kind.
   `upload_window` (default 15 min) should not be shorter than `upload_ttl`: a
@@ -285,9 +295,10 @@ renders it, is committed at
 | `<p>RulesetsChanged: DriveDelta!` | the rule table live, for the manager's screen: an upsert per save with `Saved { unknown_runner_types }` as its cause (the same warning the save answers), a remove per delete. |
 | `<p>FilePages(fileId): DriveDelta!` | one file's rendition (milestone 3): a `DriveReset` with every `DrivePage` of the file, then a `DriveUpsert` / `DriveRemove` per page; gated on `ReadFile` for the file's drive, so a caller who cannot read the file gets an empty window and a caller who loses the drive gets one `DriveRemove` per page. |
 
-**Admission (since 0.6.1).** The four subscriptions first ask the host's
-`DriveHost::admit_subscription`: a principal it refuses gets the gate's code
-at open and no stream (the `DriveHost` seam, above).
+**Admission (since 0.6.2; subscriptions since 0.6.1).** Every root above but
+the runner's first asks the host's `DriveHost::admit`: a principal it refuses
+gets the gate's code at the root, whatever id it named, and a subscription no
+stream (the `DriveHost` seam, above).
 
 **Window capacity (engine 0.4.0).** Every list above is an engine window
 bounded by `EngineConfig::window_capacity` (default 10,000 keys): a list
@@ -868,7 +879,7 @@ misread them:
 `RULESET_MISMATCH`, `NO_RULESET_MATCHES`, `FILE_NOT_PROCESSING`,
 `LABEL_NOT_FOUND`, `LABEL_NAME_TAKEN`,
 `INVALID_LABEL`, `INVALID_FAILURE_REASON` — plus the host's own codes through
-the gate, `admit_subscription`, the hooks and `record_facts`. On a `FAILED` file, `processingError` carries, from
+the gate, `admit`, the hooks and `record_facts`. On a `FAILED` file, `processingError` carries, from
 the end of the file's last job (`drive.file_processing.error_code`): the `reasonCode` the runner
 declared through `<p>RunnerReportFailure`, verbatim; the `reason_code` of the
 failure report a runner sent Jobs, else Jobs' `failure_cause`; Jobs'
@@ -973,7 +984,7 @@ its drive with `delete_drive_in_reaction`, the workspace view's
 (`BootOptions::watch_catalogue`, on by default) — a
 `{"hold": true}` metadata rule refusing to move or delete a file (the per-file
 rule the folder scenarios meet), a `workspace:sweep` scope allowed folder
-gestures but no file, an `admit_subscription` refusing a deactivated account
+gestures but no file, an `admit` refusing a deactivated account at every root
 (`ACTIVE_USER_REQUIRED`; the example reads the passport's `is_active`, a real
 host its roster), `src/bin/service.rs` handing everything to the engine boot kit, and `tests/`
 — the harness spawns real PostgreSQL roles, `nats-server` and `minio`, boots

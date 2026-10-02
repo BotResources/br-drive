@@ -148,19 +148,47 @@ pub trait DriveHost: Principal {
 
     fn visible_drives(&self) -> Vec<Uuid>;
 
-    /// Whether this principal may open a subscription of the drive slice at
-    /// all (`<p>DriveChanged`, `<p>FilePages`, `<p>LabelsChanged`,
-    /// `<p>RulesetsChanged`): the host's admission, asked before the stream
-    /// is attached. A blocked gate refuses the subscription at open with its
-    /// reason as the error's `code`, and no stream is attached.
+    /// The host's caller admission: whether this principal may use the drive
+    /// slice at all. Every GraphQL root of the slice asks it FIRST, before it
+    /// looks anything up — the file, page, file access, drive files, label,
+    /// ruleset and runner type queries, every non-runner mutation, and (through
+    /// [`DriveHost::admit_subscription`]) the four subscriptions. A blocked gate
+    /// refuses the root with its reason as the error's `code`; nothing is
+    /// looked up, recorded or attached, so the answer is the same whether the
+    /// id the caller named exists or not.
     ///
     /// The gateway authenticates; admitting is the host's job, read from its
     /// own data — a person deactivated or unknown in its roster, a service
-    /// account on a surface meant for people. Hosts should implement it as
-    /// their own subscription roots do before attaching. The default admits
-    /// everyone, the behaviour before the hook existed.
-    fn admit_subscription(&self) -> Gate {
+    /// account on a surface meant for people, a person without the host's
+    /// access scope. The default admits everyone, the behaviour before the
+    /// hook existed.
+    ///
+    /// The runner operations (`<p>RunnerContext`, `<p>RunnerReport`,
+    /// `<p>RunnerReportFailure`, `<p>RunnerRequestImageUpload`) do not ask it:
+    /// they are the runner's surface, refused to any caller without the host's
+    /// [`DriveHost::RUNNER_SCOPE`] (`RUNNER_SCOPE_REQUIRED`) before any lookup,
+    /// so a host that refuses service accounts here keeps its runners working.
+    fn admit(&self) -> Gate {
         Gate::allowed()
+    }
+
+    /// The admission asked at the open of a subscription of the drive slice
+    /// (`<p>DriveChanged`, `<p>FilePages`, `<p>LabelsChanged`,
+    /// `<p>RulesetsChanged`), before the stream is attached. A blocked gate
+    /// refuses the subscription at open with its reason as the error's `code`,
+    /// and no stream is attached.
+    ///
+    /// Kept for hosts written against 0.6.1; its default is
+    /// [`DriveHost::admit`], so a host implements `admit` only and every root,
+    /// subscriptions included, gets the same answer. A host that overrides it
+    /// replaces the subscription admission with its own.
+    #[deprecated(
+        since = "0.6.2",
+        note = "implement `DriveHost::admit`, which every root of the drive slice asks; \
+                `admit_subscription` defaults to it"
+    )]
+    fn admit_subscription(&self) -> Gate {
+        self.admit()
     }
 
     fn is_runner(&self) -> bool {
@@ -220,6 +248,7 @@ pub trait DriveHost: Principal {
 #[cfg(test)]
 mod tests {
     use br_core_auth::{AuthMethod, Passport, PassportClaims};
+    use service_engine::gate::Reason;
     use service_engine::principal::PrincipalId;
 
     use super::*;
@@ -280,11 +309,115 @@ mod tests {
         }
     }
 
+    /// A 0.6.1 host: it implements only the subscription admission. It builds
+    /// under `-D warnings` with no `allow`: implementing a deprecated method
+    /// is not a use of it, so the deprecation warns no 0.6.1 host.
+    #[derive(Clone)]
+    struct SubscriptionOnlyHost(BareHost);
+
+    impl Principal for SubscriptionOnlyHost {
+        fn id(&self) -> PrincipalId {
+            self.0.id
+        }
+
+        fn passport(&self) -> &Passport {
+            &self.0.passport
+        }
+    }
+
+    const CLOSED: Reason = Reason::new("CLOSED");
+
+    impl DriveHost for SubscriptionOnlyHost {
+        const SERVICE: &'static str = "subscription-only";
+        const RUNNER_SCOPE: &'static str = "subscription-only:runner";
+        type DriveOwner = NoDriveOwner;
+
+        fn drive_gate(&self, _request: &DriveRequest<'_, Self>) -> Gate {
+            Gate::allowed()
+        }
+
+        fn record_facts<'a>(
+            _conn: &'a mut PgConnection,
+            _facts: &'a [DriveFact],
+        ) -> BoxFuture<'a, Result<(), EngineError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn visible_drives(&self) -> Vec<Uuid> {
+            Vec::new()
+        }
+
+        fn admit_subscription(&self) -> Gate {
+            Gate::blocked(CLOSED)
+        }
+    }
+
+    /// A host that implements only `admit`.
+    #[derive(Clone)]
+    struct AdmitOnlyHost(BareHost);
+
+    impl Principal for AdmitOnlyHost {
+        fn id(&self) -> PrincipalId {
+            self.0.id
+        }
+
+        fn passport(&self) -> &Passport {
+            &self.0.passport
+        }
+    }
+
+    impl DriveHost for AdmitOnlyHost {
+        const SERVICE: &'static str = "admit-only";
+        const RUNNER_SCOPE: &'static str = "admit-only:runner";
+        type DriveOwner = NoDriveOwner;
+
+        fn drive_gate(&self, _request: &DriveRequest<'_, Self>) -> Gate {
+            Gate::allowed()
+        }
+
+        fn record_facts<'a>(
+            _conn: &'a mut PgConnection,
+            _facts: &'a [DriveFact],
+        ) -> BoxFuture<'a, Result<(), EngineError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn visible_drives(&self) -> Vec<Uuid> {
+            Vec::new()
+        }
+
+        fn admit(&self) -> Gate {
+            Gate::blocked(CLOSED)
+        }
+    }
+
     #[test]
+    fn a_host_that_does_not_implement_admission_admits_every_caller() {
+        assert_eq!(BareHost::deactivated().admit(), Gate::allowed());
+    }
+
+    #[test]
+    #[allow(deprecated)]
     fn a_host_that_does_not_implement_admission_admits_every_subscription() {
         assert_eq!(
             BareHost::deactivated().admit_subscription(),
             Gate::allowed()
         );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn the_subscription_admission_defaults_to_the_host_admission() {
+        let host = AdmitOnlyHost(BareHost::deactivated());
+        assert_eq!(host.admit(), Gate::blocked(CLOSED));
+        assert_eq!(host.admit_subscription(), Gate::blocked(CLOSED));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn a_host_written_for_0_6_1_still_refuses_subscriptions_and_admits_the_rest() {
+        let host = SubscriptionOnlyHost(BareHost::deactivated());
+        assert_eq!(host.admit_subscription(), Gate::blocked(CLOSED));
+        assert_eq!(host.admit(), Gate::allowed());
     }
 }
