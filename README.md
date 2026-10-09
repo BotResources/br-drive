@@ -24,7 +24,7 @@ The workspace's MSRV is Rust 1.94 — the floor of the pinned `contract-jobs`
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.6.2", version = "0.6.2" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.6.3", version = "0.6.3" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -38,7 +38,8 @@ The `version` beside the `tag` is required: a tag-only git dependency carries a
 | 0.3 | `v0.3.4` |
 | 0.4 | `v0.3.4` |
 | 0.5 | `v0.3.4` |
-| 0.6 | `v0.4.0` |
+| 0.6.0 – 0.6.2 | `v0.4.0` |
+| 0.6.3 | `v0.4.1` |
 
 ## What a host writes
 
