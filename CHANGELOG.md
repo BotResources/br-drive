@@ -9,6 +9,19 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.6.3 — 2026-10-09
+
+Engine patch only: no API change, the committed SDL did not move, and a host
+on 0.6.2 upgrades by bumping both pins together (br-drive v0.6.3 and
+service-engine v0.4.1).
+
+### Changed
+
+- **service-engine v0.4.0 → v0.4.1.** A host pins the same engine tag as the
+  library, and 0.4.1 fixes a led mirror that dropped KV changes with two or
+  more pods, signs the blob confirm's checksum header, and adds full scope
+  specs. No br-drive code changes.
+
 ## 0.6.2 — 2026-10-02
 
 Additive only: no signature changes, the committed SDL did not move, and a

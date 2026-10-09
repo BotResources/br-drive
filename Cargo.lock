@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "br-drive"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "async-graphql",
  "br-core-auth",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "br-drive-example"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "async-graphql",
  "async-nats",
@@ -2960,8 +2960,8 @@ dependencies = [
 
 [[package]]
 name = "service-engine"
-version = "0.4.0"
-source = "git+https://github.com/BotResources/br-service-engine?tag=v0.4.0#481eb605062812f9f07ed02ebe4912ba77454196"
+version = "0.4.1"
+source = "git+https://github.com/BotResources/br-service-engine?tag=v0.4.1#584ff1683d161aa539aa1b45891269d362fc98c3"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
