@@ -9,6 +9,29 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.6.4 — 2026-10-20
+
+Engine patch only: no API change, the committed SDL did not move, and a host
+on 0.6.3 upgrades by bumping both pins together (br-drive v0.6.4 and
+service-engine `br-service-engine/v0.4.2`), moving its `br-rust-common`
+crates to their per-crate tags at the same time.
+
+### Changed
+
+- **service-engine v0.4.1 → v0.4.2.** A host pins the same engine tag as the
+  library. 0.4.2 fixes, among others, a static-musl binary that failed at
+  boot with `SchemaParse "stack limit reached"` once pest ≥ 2.9.3 resolves, a
+  passport rejection answered as plain text, a stale principal reused on a
+  WebSocket after a revocation, and a displaced pod that kept writing.
+- **`br-core-auth` and `br-core-integration` move to their per-crate tags**
+  (`br-core-auth/v0.1.0`, `br-core-integration/v0.1.0`), as the engine 0.4.2
+  does: `br-rust-common` is no longer released under one `v1.x` tag, and a
+  host must pin the same per-crate tags so that the shared types stay one.
+- **contract-jobs 0.5.0 → 0.5.1**, the release on the same per-crate tags.
+  No br-drive code changes.
+- `rustls` moves to 0.23.46 in the lockfile, which clears the
+  RUSTSEC-2026-0346, -0347, -0348 and -0349 advisories `cargo deny` reports.
+
 ## 0.6.3 — 2026-10-09
 
 Engine patch only: no API change, the committed SDL did not move, and a host
