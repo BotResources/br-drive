@@ -29,6 +29,8 @@ crates to their per-crate tags at the same time.
   host must pin the same per-crate tags so that the shared types stay one.
 - **contract-jobs 0.5.0 → 0.5.1**, the release on the same per-crate tags.
   No br-drive code changes.
+- `rustls` moves to 0.23.46 in the lockfile, which clears the
+  RUSTSEC-2026-0346, -0347, -0348 and -0349 advisories `cargo deny` reports.
 
 ## 0.6.3 — 2026-10-09
 
