@@ -439,3 +439,58 @@ async fn a_path_or_name_that_does_not_normalize_is_refused() {
 
     world.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_size_a_gateway_re_encoded_as_a_whole_float_is_accepted() {
+    // Some gateways forward the integers of a variables object as floats
+    // (`19` arrives as `19.0`): the byte count is still exact, so the request
+    // goes through and the upload completes.
+    let world = World::start("pod-upload-float-size").await;
+    let owner = passport(Uuid::now_v7());
+    let drive = world.create_workspace(&owner, "library").await;
+    let file_id = Uuid::now_v7();
+
+    let response = world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$d:UUID!,$p:String!,$n:String!,$m:String!,$s:ByteCount!,$h:String!){\
+             workspaceRequestUpload(fileId:$f,driveId:$d,path:$p,name:$n,mediaType:$m,size:$s,sha256:$h){fileId url fields}}",
+            serde_json::json!({
+                "f": file_id, "d": drive, "p": "", "n": "fox.txt", "m": "text/plain",
+                "s": PAYLOAD.len() as f64, "h": sha256_hex(PAYLOAD),
+            }),
+        )
+        .await;
+    let ticket = ticket(&response);
+    assert_eq!(ticket.file_id, file_id, "the request is accepted");
+
+    let status = post_bytes(&world, &ticket, PAYLOAD, "fox.txt").await;
+    assert!(
+        (200..300).contains(&status),
+        "object storage accepts the exact bytes: {status}"
+    );
+    ok(&commit(&world, &owner, file_id).await);
+}
+
+#[tokio::test]
+async fn a_fractional_size_is_refused() {
+    let world = World::start("pod-upload-fractional-size").await;
+    let owner = passport(Uuid::now_v7());
+    let drive = world.create_workspace(&owner, "library").await;
+
+    let response = world
+        .gql(
+            &owner,
+            "mutation($f:UUID!,$d:UUID!,$p:String!,$n:String!,$m:String!,$s:ByteCount!,$h:String!){\
+             workspaceRequestUpload(fileId:$f,driveId:$d,path:$p,name:$n,mediaType:$m,size:$s,sha256:$h){fileId url fields}}",
+            serde_json::json!({
+                "f": Uuid::now_v7(), "d": drive, "p": "", "n": "fox.txt", "m": "text/plain",
+                "s": 19.5, "h": sha256_hex(PAYLOAD),
+            }),
+        )
+        .await;
+    assert!(
+        response["errors"].as_array().is_some_and(|e| !e.is_empty()),
+        "a byte count with a fractional part is refused: {response}"
+    );
+}

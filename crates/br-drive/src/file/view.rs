@@ -27,7 +27,82 @@ use crate::ruleset::DriveStep;
 #[serde(transparent)]
 pub struct ByteCount(pub u64);
 
-async_graphql::scalar!(ByteCount);
+// A byte count on the wire: a non-negative integer. A whole number written as
+// a float (`33.0`) is accepted too: some gateways re-encode the integers of a
+// variables object as floats before forwarding them, and the value is exact.
+// A fractional, negative or non-finite number is refused, and so is a float
+// above 2^53, where a float no longer holds every integer.
+#[async_graphql::Scalar(name = "ByteCount")]
+impl async_graphql::ScalarType for ByteCount {
+    fn parse(value: async_graphql::Value) -> async_graphql::InputValueResult<Self> {
+        const MAX_EXACT_FLOAT: f64 = 9_007_199_254_740_992.0;
+        if let async_graphql::Value::Number(n) = &value {
+            if let Some(bytes) = n.as_u64() {
+                return Ok(Self(bytes));
+            }
+            if let Some(f) = n.as_f64()
+                && f.is_finite()
+                && f >= 0.0
+                && f.fract() == 0.0
+                && f <= MAX_EXACT_FLOAT
+            {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                return Ok(Self(f as u64));
+            }
+        }
+        Err(async_graphql::InputValueError::expected_type(value))
+    }
+
+    fn is_valid(value: &async_graphql::Value) -> bool {
+        matches!(value, async_graphql::Value::Number(_))
+    }
+
+    fn to_value(&self) -> async_graphql::Value {
+        async_graphql::Value::Number(self.0.into())
+    }
+}
+
+#[cfg(test)]
+mod byte_count_tests {
+    use super::ByteCount;
+    use async_graphql::{Number, ScalarType, Value};
+
+    fn float(f: f64) -> Value {
+        Value::Number(Number::from_f64(f).expect("finite"))
+    }
+
+    #[test]
+    fn accepts_an_integer() {
+        assert_eq!(
+            ByteCount::parse(Value::Number(33u64.into())).unwrap(),
+            ByteCount(33)
+        );
+    }
+
+    #[test]
+    fn accepts_a_whole_float() {
+        assert_eq!(ByteCount::parse(float(33.0)).unwrap(), ByteCount(33));
+        assert_eq!(ByteCount::parse(float(0.0)).unwrap(), ByteCount(0));
+    }
+
+    #[test]
+    fn refuses_a_fractional_negative_or_too_large_float() {
+        assert!(ByteCount::parse(float(33.5)).is_err());
+        assert!(ByteCount::parse(float(-1.0)).is_err());
+        assert!(ByteCount::parse(Value::Number((-1i64).into())).is_err());
+        assert!(ByteCount::parse(float(1e300)).is_err());
+    }
+
+    #[test]
+    fn refuses_a_string() {
+        assert!(ByteCount::parse(Value::String("33".into())).is_err());
+    }
+
+    #[test]
+    fn writes_an_integer() {
+        assert_eq!(ByteCount(33).to_value(), Value::Number(33u64.into()));
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageSummary {
