@@ -27,11 +27,11 @@ use crate::ruleset::DriveStep;
 #[serde(transparent)]
 pub struct ByteCount(pub u64);
 
-/// A byte count on the wire: a non-negative integer. A whole number written as
-/// a float (`33.0`) is accepted too: some gateways re-encode the integers of a
-/// variables object as floats before forwarding them, and the value is exact.
-/// A fractional, negative or non-finite number is refused, and so is a float
-/// above 2^53, where a float no longer holds every integer.
+// A byte count on the wire: a non-negative integer. A whole number written as
+// a float (`33.0`) is accepted too: some gateways re-encode the integers of a
+// variables object as floats before forwarding them, and the value is exact.
+// A fractional, negative or non-finite number is refused, and so is a float
+// above 2^53, where a float no longer holds every integer.
 #[async_graphql::Scalar(name = "ByteCount")]
 impl async_graphql::ScalarType for ByteCount {
     fn parse(value: async_graphql::Value) -> async_graphql::InputValueResult<Self> {

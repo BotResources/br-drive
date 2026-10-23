@@ -23,6 +23,13 @@ upgrades by bumping the br-drive pin alone (same engine tag).
   A whole, non-negative float up to 2^53 is now read as that byte count; a
   fractional, negative or non-finite number is still refused. The value is
   always written back as an integer.
+
+### Security
+
+- **Lockfile moves for three new advisories**: `ctutils` 0.4.5
+  (RUSTSEC-2026-0385), `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382) and
+  `webpki-roots` 1.0.11 (RUSTSEC-2026-0381). A host updates its own lockfile
+  the same way.
 ## 0.6.4 — 2026-10-20
 
 Engine patch only: no API change, the committed SDL did not move, and a host
