@@ -9,6 +9,20 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.6.5 — 2026-10-23
+
+Fix only: no API change, the committed SDL did not move, and a host on 0.6.4
+upgrades by bumping the br-drive pin alone (same engine tag).
+
+### Fixed
+
+- **`ByteCount` accepts a whole number written as a float.** A gateway that
+  re-encodes the integers of a variables object forwards `33` as `33.0`; the
+  scalar refused it (`invalid type: floating point 33.0, expected u64`), so an
+  upload requested with the size as a variable failed and nothing was stored.
+  A whole, non-negative float up to 2^53 is now read as that byte count; a
+  fractional, negative or non-finite number is still refused. The value is
+  always written back as an integer.
 ## 0.6.4 — 2026-10-20
 
 Engine patch only: no API change, the committed SDL did not move, and a host
