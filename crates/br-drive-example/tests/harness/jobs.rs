@@ -4,12 +4,14 @@ use std::time::Duration;
 
 use async_nats::jetstream::consumer::pull::Config as PullConfig;
 use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
+use br_core_auth::Passport;
 use br_core_integration::{
     Actor, EventCoords, EventMetadata, IntegrationCommand, IntegrationEvent, ServiceAccountId,
 };
 use chrono::Utc;
 use contract_jobs::catalog::{RunnerType, RunnerTypeLifecycle, runner_type_key};
-use contract_jobs::command::{CancelJob, CreateJob, FailJob, FinishJob};
+use contract_jobs::command::{CancelJob, FailJob, FinishJob};
+use contract_jobs::command_v3::CreateJobV3 as CreateJob;
 use contract_jobs::event::{
     EVENT_TYPE_CANCELLED, EVENT_TYPE_COMPLETED, EVENT_TYPE_CREATION_REJECTED, EVENT_TYPE_FAILED,
     EVENT_TYPE_PLAN_DECLARED, EVENT_TYPE_QUEUED, EVENT_TYPE_STARTED, EVENT_TYPE_STEP_STARTED,
@@ -17,7 +19,7 @@ use contract_jobs::event::{
     JobQueued, JobStarted, JobStepStarted, REASON_DUPLICATE_ACTIVE_ENTITY, REASON_ID_REUSE,
 };
 use contract_jobs::{
-    CMD_JOB_CANCEL_V2, CMD_JOB_CREATE_V1, CMD_JOB_FAIL_V2, CMD_JOB_FINISH_V2,
+    CMD_JOB_CANCEL_V2, CMD_JOB_CREATE_V1, CMD_JOB_CREATE_V3, CMD_JOB_FAIL_V2, CMD_JOB_FINISH_V2,
     evt_job_cancelled_v1_coords, evt_job_completed_v1_coords, evt_job_creation_rejected_v1_coords,
     evt_job_failed_v1_coords, evt_job_plan_declared_v1_coords, evt_job_queued_v1_coords,
     evt_job_started_v1_coords, evt_job_step_started_v1_coords,
@@ -55,11 +57,15 @@ struct Ledger {
     /// Drop every `job.cancel` unread, as Jobs does with a cancel it consumes
     /// before the creation of the job it names.
     dropping_cancels: bool,
+    /// Commands Jobs would refuse as a breach of its contract (a `job.create`
+    /// v1, a command that does not decode): each one fails the scenario.
+    violations: Vec<String>,
 }
 
-/// The input checks `svc-jobs` runs before the domain (`app/create.rs::build`
-/// and the value objects of `bc-jobs`): UUIDv7 ids, a source named whole and by
-/// its producer, a display name that is not blank and at most 512 characters.
+/// The input checks `svc-jobs` runs before the domain
+/// (`app/create/declare.rs::build` and the value objects of `bc-jobs`): UUIDv7
+/// ids, a source named whole and by its producer, a display name that is not
+/// blank and at most 512 characters, a passport that decodes as a Passport.
 fn malformed(create: &CreateJob) -> Option<(&'static str, &'static str)> {
     let v7 = |id: Uuid| id.get_version_num() == 7;
     if !v7(create.job_id) {
@@ -97,7 +103,31 @@ fn malformed(create: &CreateJob) -> Option<(&'static str, &'static str)> {
             return Some(("value_too_long", "display_name"));
         }
     }
+    if let Some(passport) = &create.passport
+        && serde_json::from_value::<Passport>(passport.clone()).is_err()
+    {
+        return Some(("passport_malformed", "passport"));
+    }
     None
+}
+
+/// The passport checks `bc-jobs` runs after the parent (`resolve_passport`,
+/// `resolve_triggered_by`): a root job without a passport is refused, and a
+/// `triggered_by` that is not the passport's own user — any one beside a
+/// service passport — too.
+fn passport_refusal(create: &CreateJob) -> Option<&'static str> {
+    let Some(document) = &create.passport else {
+        return create
+            .parent_job_id
+            .is_none()
+            .then_some(contract_jobs::event_v2::REASON_PASSPORT_REQUIRED);
+    };
+    let passport: Passport = serde_json::from_value(document.clone()).ok()?;
+    match (&create.triggered_by, passport.user_id()) {
+        (None, _) => None,
+        (Some(given), Some(user)) if given.id() == user => None,
+        _ => Some(contract_jobs::event_v2::REASON_PASSPORT_USER_MISMATCH),
+    }
 }
 
 impl Ledger {
@@ -162,6 +192,9 @@ impl Ledger {
                 Some(_) => {}
             }
         }
+        if let Some(code) = passport_refusal(create) {
+            return reject(code, serde_json::Map::new());
+        }
         None
     }
 
@@ -204,6 +237,24 @@ pub struct JobsStandIn {
 impl Drop for JobsStandIn {
     fn drop(&mut self) {
         self.drain.abort();
+        // A violation no read of the double surfaced still fails the scenario
+        // (never on top of a panic already unwinding).
+        if std::thread::panicking() {
+            return;
+        }
+        let violations = std::mem::take(
+            &mut self
+                .ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .violations,
+        );
+        if !violations.is_empty() {
+            panic!(
+                "jobs received what it refuses as a breach of its contract:\n{}",
+                violations.join("\n")
+            );
+        }
     }
 }
 
@@ -259,10 +310,23 @@ async fn publish_fact_as<T: Serialize>(
     message_id
 }
 
+/// Records a command Jobs would refuse as a breach of its contract — not a
+/// rejection it answers, a producer that is wrong. The scenario fails on its
+/// next read of the double, and at the latest when the double is dropped.
+fn violate(ledger: &std::sync::Mutex<Ledger>, violation: String) {
+    ledger
+        .lock()
+        .expect("the ledger lock")
+        .violations
+        .push(violation);
+}
+
 /// Reads every command addressed to jobs as it arrives, judges each
 /// `job.create` against the ledger and answers a refused one with
 /// `creation_rejected` — as Jobs would, before any test looks at it — then
-/// hands the command on to the test.
+/// hands the command on to the test. A command that breaks Jobs' contract is
+/// recorded as a violation and handed on too: this task never panics on what
+/// it reads, since a panic here would only close the inbox.
 async fn drain(
     mut commands: async_nats::jetstream::consumer::pull::Stream,
     js: async_nats::jetstream::Context,
@@ -271,70 +335,130 @@ async fn drain(
     inbox: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
 ) {
     while let Some(next) = commands.next().await {
-        let message = next.expect("read a command");
-        message.ack().await.expect("ack the command");
-        let subject = message.subject.to_string();
-        let envelope: IntegrationCommand<Value> =
-            serde_json::from_slice(&message.payload).expect("an integration command envelope");
-        let payload = envelope.payload;
-        let rejection = match subject.as_str() {
-            CMD_JOB_CREATE_V1 => {
-                let create: CreateJob =
-                    serde_json::from_value(payload.clone()).expect("a job.create decodes");
-                let mut ledger = ledger.lock().expect("the ledger lock");
-                let verdict = ledger.judge(&create);
-                match &verdict {
-                    Some(rejection) => {
-                        ledger.rejections.insert(create.job_id, rejection.clone());
-                    }
-                    None => ledger.accept(&create),
-                }
-                verdict
+        let message = match next {
+            Ok(message) => message,
+            Err(error) => {
+                violate(
+                    &ledger,
+                    format!("the double could not read a command: {error}"),
+                );
+                return;
             }
+        };
+        if let Err(error) = message.ack().await {
+            violate(
+                &ledger,
+                format!("the double could not ack a command: {error}"),
+            );
+            return;
+        }
+        let subject = message.subject.to_string();
+        let payload = match serde_json::from_slice::<IntegrationCommand<Value>>(&message.payload) {
+            Ok(envelope) => envelope.payload,
+            Err(error) => {
+                let raw = String::from_utf8_lossy(&message.payload).into_owned();
+                violate(
+                    &ledger,
+                    format!("{subject} is not an integration command envelope ({error}): {raw}"),
+                );
+                let _ = inbox.send((subject, Value::String(raw)));
+                continue;
+            }
+        };
+        let mut accepted = None;
+        let rejection = match subject.as_str() {
+            // A producer still on v1 breaks the contract: Jobs ≥ 0.6 refuses
+            // every root job it sends (no passport on v1).
+            CMD_JOB_CREATE_V1 => {
+                violate(
+                    &ledger,
+                    format!("a job.create v1 reached jobs, which refuses it: {payload}"),
+                );
+                None
+            }
+            CMD_JOB_CREATE_V3 => match serde_json::from_value::<CreateJob>(payload.clone()) {
+                Err(error) => {
+                    violate(
+                        &ledger,
+                        format!("a job.create v3 that does not decode ({error}): {payload}"),
+                    );
+                    None
+                }
+                Ok(create) => {
+                    let mut ledger = ledger.lock().expect("the ledger lock");
+                    let verdict = ledger.judge(&create);
+                    match &verdict {
+                        Some(rejection) => {
+                            ledger.rejections.insert(create.job_id, rejection.clone());
+                        }
+                        None => {
+                            ledger.accept(&create);
+                            accepted = Some(create);
+                        }
+                    }
+                    verdict
+                }
+            },
             CMD_JOB_FINISH_V2 => {
-                let finish: FinishJob =
-                    serde_json::from_value(payload.clone()).expect("a job.finish decodes");
-                ledger
-                    .lock()
-                    .expect("the ledger lock")
-                    .settle(finish.job_id);
+                match serde_json::from_value::<FinishJob>(payload.clone()) {
+                    Ok(finish) => {
+                        ledger
+                            .lock()
+                            .expect("the ledger lock")
+                            .settle(finish.job_id);
+                    }
+                    Err(error) => violate(
+                        &ledger,
+                        format!("a job.finish that does not decode ({error}): {payload}"),
+                    ),
+                }
                 None
             }
             CMD_JOB_FAIL_V2 => {
-                let fail: FailJob =
-                    serde_json::from_value(payload.clone()).expect("a job.fail decodes");
-                ledger.lock().expect("the ledger lock").settle(fail.job_id);
+                match serde_json::from_value::<FailJob>(payload.clone()) {
+                    Ok(fail) => {
+                        ledger.lock().expect("the ledger lock").settle(fail.job_id);
+                    }
+                    Err(error) => violate(
+                        &ledger,
+                        format!("a job.fail that does not decode ({error}): {payload}"),
+                    ),
+                }
                 None
             }
             CMD_JOB_CANCEL_V2 => {
-                let cancel: CancelJob =
-                    serde_json::from_value(payload.clone()).expect("a job.cancel decodes");
-                let was_live = {
-                    let mut ledger = ledger.lock().expect("the ledger lock");
-                    !ledger.dropping_cancels && ledger.settle(cancel.job_id)
-                };
-                // Jobs cancels a live job at once and says so; a cancel of a
-                // settled or unknown job changes nothing.
-                if was_live {
-                    publish_fact(
-                        &js,
-                        actor,
-                        evt_job_cancelled_v1_coords().unwrap(),
-                        EVENT_TYPE_CANCELLED,
-                        JobCancelled {
-                            job_id: cancel.job_id,
-                        },
-                    )
-                    .await;
+                match serde_json::from_value::<CancelJob>(payload.clone()) {
+                    Ok(cancel) => {
+                        let was_live = {
+                            let mut ledger = ledger.lock().expect("the ledger lock");
+                            !ledger.dropping_cancels && ledger.settle(cancel.job_id)
+                        };
+                        // Jobs cancels a live job at once and says so; a
+                        // cancel of a settled or unknown job changes nothing.
+                        if was_live {
+                            publish_fact(
+                                &js,
+                                actor,
+                                evt_job_cancelled_v1_coords().unwrap(),
+                                EVENT_TYPE_CANCELLED,
+                                JobCancelled {
+                                    job_id: cancel.job_id,
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                    Err(error) => violate(
+                        &ledger,
+                        format!("a job.cancel that does not decode ({error}): {payload}"),
+                    ),
                 }
                 None
             }
             _ => None,
         };
         // Jobs queues every job it accepts, and says so.
-        if subject == CMD_JOB_CREATE_V1 && rejection.is_none() {
-            let create: CreateJob =
-                serde_json::from_value(payload.clone()).expect("a job.create decodes");
+        if let Some(create) = accepted {
             publish_fact(
                 &js,
                 actor,
@@ -519,6 +643,7 @@ impl JobsStandIn {
     pub async fn await_rejection(&self, job_id: Uuid) -> JobCreationRejected {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
+            self.assert_sound();
             if let Some(rejection) = self
                 .ledger
                 .lock()
@@ -548,26 +673,71 @@ impl JobsStandIn {
 
     /// Sends a `job.create` to jobs as another producer would.
     pub async fn submit_create(&self, create: &CreateJob) {
+        self.submit_command(
+            CMD_JOB_CREATE_V3,
+            "job.create",
+            3,
+            serde_json::to_value(create).expect("a job.create encodes"),
+        )
+        .await;
+    }
+
+    /// Sends any command to jobs on `subject` as another producer would —
+    /// one Jobs may refuse as a breach of its contract.
+    pub async fn submit_command(
+        &self,
+        subject: &str,
+        command_type: &str,
+        version: u8,
+        payload: Value,
+    ) {
         let command = IntegrationCommand::new(
             Uuid::now_v7(),
-            "job.create",
-            1,
+            command_type,
+            version,
             Utc::now(),
             EventMetadata::new(
                 Actor::Service(ServiceAccountId::from(Uuid::now_v7())),
                 Uuid::now_v7(),
             ),
-            serde_json::to_value(create).expect("a job.create encodes"),
+            payload,
         );
         self.js
             .publish(
-                CMD_JOB_CREATE_V1,
+                subject.to_string(),
                 serde_json::to_vec(&command).expect("encode").into(),
             )
             .await
-            .expect("publish the job.create")
+            .expect("publish the command")
             .await
-            .expect("the stream acks the job.create");
+            .expect("the stream acks the command");
+    }
+
+    /// The contract breaches recorded so far, taken: a scenario that provokes
+    /// one on purpose acknowledges it here.
+    pub fn take_violations(&self) -> Vec<String> {
+        std::mem::take(&mut self.ledger.lock().expect("the ledger lock").violations)
+    }
+
+    /// Fails the scenario if Jobs received a command it refuses as a breach
+    /// of its contract, or if the drain stopped — after which no absence can
+    /// be proven and no wait means anything.
+    fn assert_sound(&self) {
+        let violations = self
+            .ledger
+            .lock()
+            .expect("the ledger lock")
+            .violations
+            .clone();
+        if !violations.is_empty() {
+            panic!(
+                "jobs received what it refuses as a breach of its contract:\n{}",
+                violations.join("\n")
+            );
+        }
+        if self.drain.is_finished() {
+            panic!("the jobs double's drain stopped; see the log above");
+        }
     }
 
     fn settle(&self, job_id: Uuid) {
@@ -746,6 +916,7 @@ impl JobsStandIn {
     /// The next command addressed to jobs: one skipped by an earlier wait
     /// first, then the stream.
     pub async fn next_command(&self, within: Duration) -> Option<(String, Value)> {
+        self.assert_sound();
         if let Some(skipped) = self.skipped.lock().await.pop_front() {
             return Some(skipped);
         }
@@ -753,8 +924,13 @@ impl JobsStandIn {
     }
 
     async fn read_command(&self, within: Duration) -> Option<(String, Value)> {
+        self.assert_sound();
         let mut inbox = self.inbox.lock().await;
-        match tokio::time::timeout(within, inbox.recv()).await {
+        let read = tokio::time::timeout(within, inbox.recv()).await;
+        // A breach is recorded before its command is handed on: checked again
+        // once the read is over, whatever it read.
+        self.assert_sound();
+        match read {
             Ok(Some(command)) => Some(command),
             // A closed inbox is a drain that stopped: no absence can be proven.
             Ok(None) => panic!("the jobs double's drain stopped; see the log above"),
@@ -767,6 +943,7 @@ impl JobsStandIn {
         subject: &str,
         matches: impl Fn(&T) -> bool,
     ) -> T {
+        self.assert_sound();
         let wanted = |found: &str, payload: &Value| -> Option<T> {
             if found != subject {
                 return None;
@@ -820,7 +997,7 @@ impl JobsStandIn {
     }
 
     async fn next_create(&self, file_id: Uuid) -> CreateJob {
-        self.await_command::<CreateJob>(CMD_JOB_CREATE_V1, |create| {
+        self.await_command::<CreateJob>(CMD_JOB_CREATE_V3, |create| {
             create.source_entity_id == Some(file_id)
         })
         .await

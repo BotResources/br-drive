@@ -67,8 +67,8 @@ pub use owner::{
 pub use path::{DrivePath, FileName, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, PathError};
 pub use processing::{
     CANCELLED, ChainPlan, FileJob, FileProcessing, FileProcessingNoun, FileProcessingStore,
-    Initiator, PROCESSING_EVENT_VERSION, ProcessingEvent, RootNames, RunProgress, durable,
-    ignored_because, job_event,
+    Initiator, PASSPORT_MISSING, PASSPORT_UNREADABLE, PROCESSING_EVENT_VERSION, ProcessingEvent,
+    RootNames, RunProgress, durable, ignored_because, job_event,
 };
 pub use register::register;
 pub use ruleset::{

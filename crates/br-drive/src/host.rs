@@ -109,6 +109,11 @@ impl<H> DriveRequest<'_, H> {
     }
 }
 
+/// The host's principal, as the drive slice sees it. Its
+/// `Principal::passport()` must answer the caller's own Passport, as the
+/// gateway forwarded it: a gesture that starts a processing chain keeps it
+/// with the chain and sends it to Jobs on every step's `job.create`, so the
+/// runner acts as that caller.
 pub trait DriveHost: Principal {
     const SERVICE: &'static str;
 

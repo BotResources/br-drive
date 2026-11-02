@@ -261,6 +261,14 @@ async fn a_page_regeneration_overwrites_the_page_even_when_a_person_edited_it() 
         .await);
     let create = jobs.await_create(file_id).await;
     assert_eq!(create.config.as_ref().unwrap()["options"]["page"], 2);
+    let carried: br_core_auth::Passport =
+        serde_json::from_value(create.passport.clone().expect("the job carries a passport"))
+            .expect("the carried passport decodes");
+    assert_eq!(
+        carried,
+        <br_core_auth::Passport as br_core_auth::PassportHeader>::from_header(&owner).unwrap(),
+        "a regeneration acts under the Passport of the person who asked it"
+    );
     let mut pages = pages_subscription(&world, &owner, file_id).await;
     ok(&report(
         &world,

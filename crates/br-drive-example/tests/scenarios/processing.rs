@@ -1,6 +1,8 @@
 use std::time::Duration;
 
+use br_core_auth::{Passport, PassportHeader};
 use contract_jobs::command::TriggeredBy;
+use contract_jobs::command_v3::CreateJobV3;
 use uuid::Uuid;
 
 use crate::harness::runner::{
@@ -15,6 +17,18 @@ use crate::harness::{
 };
 
 const BYTES: &[u8] = b"the source to process";
+
+/// The Passport a step's `job.create` carries, decoded the way Jobs decodes
+/// it (`serde_json::from_value::<Passport>`).
+fn carried_passport(create: &CreateJobV3) -> Passport {
+    serde_json::from_value(
+        create
+            .passport
+            .clone()
+            .expect("every step's job carries a passport"),
+    )
+    .expect("the carried passport decodes as a Passport")
+}
 
 async fn two_step_rule(world: &World, manager: &str) -> Uuid {
     ruleset_id(
@@ -92,6 +106,18 @@ async fn the_ruleset_chain_runs_step_by_step_over_jobs_facts_and_lands_ready() {
 
     let create = jobs.await_create(file_id).await;
     let job_a = create.job_id;
+    let presented = Passport::from_header(&owner).unwrap();
+    assert_eq!(
+        carried_passport(&create),
+        presented,
+        "the first step acts under the Passport the owner presented"
+    );
+    assert_eq!(carried_passport(&create).user_id(), Some(owner_id));
+    assert_eq!(
+        world.held_passport(file_id).await,
+        Some(serde_json::to_value(&presented).unwrap()),
+        "the processing holds the passport while it runs"
+    );
     assert_eq!(create.runner_type, RENDER);
     assert_eq!(create.producer, "workspace");
     assert_eq!(create.source_bc.as_deref(), Some("workspace"));
@@ -174,6 +200,13 @@ async fn the_ruleset_chain_runs_step_by_step_over_jobs_facts_and_lands_ready() {
     let create_b = jobs.await_create(file_id).await;
     let job_b = create_b.job_id;
     assert_ne!(job_b, job_a);
+    assert_eq!(
+        carried_passport(&create_b),
+        presented,
+        "the next step acts under the initiator's passport, not the runner's"
+    );
+    assert_eq!(create_b.triggered_by, create.triggered_by);
+    assert!(world.held_passport(file_id).await.is_some());
     assert_eq!(create_b.runner_type, INDEX);
     assert!(
         create_b.parent_job_id.is_none(),
@@ -223,6 +256,15 @@ async fn the_ruleset_chain_runs_step_by_step_over_jobs_facts_and_lands_ready() {
     );
     assert!(file["processingError"].is_null());
     assert_eq!(world.file_pages(&owner, file_id).await.len(), 1);
+    assert_eq!(
+        world.held_passport(file_id).await,
+        None,
+        "READY: the passport is gone"
+    );
+    assert!(
+        !world.facts_mention("auth_method").await,
+        "no fact ever records the passport"
+    );
     jobs.expect_no_command(Duration::from_secs(1)).await;
 
     world.cleanup().await;

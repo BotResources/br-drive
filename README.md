@@ -20,11 +20,13 @@ git tag is the release.
 ## Install
 
 The workspace's MSRV is Rust 1.94 — the floor of the pinned `contract-jobs`
-0.5.0, ahead of the engine's own 1.89.
+0.7.0, ahead of the engine's own 1.89. Since 0.7.0 the library needs a Jobs
+service that serves `contract-jobs` 0.7 (`svc-jobs` ≥ 0.6): every step's job
+is created on `job.create.v3`, with a Passport.
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.6.5", version = "0.6.5" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.7.0", version = "0.7.0" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -41,6 +43,7 @@ The `version` beside the `tag` is required: a tag-only git dependency carries a
 | 0.6.0 – 0.6.2 | `v0.4.0` |
 | 0.6.3 | `v0.4.1` |
 | 0.6.4 – 0.6.5 | `br-service-engine/v0.4.2` |
+| 0.7 | `br-service-engine/v0.4.2` |
 
 ## What a host writes
 
@@ -98,11 +101,11 @@ rolls them together. The host never writes to the `drive` schema directly.
 
 1. **Compose**: `slice drive ["drive"] from br_drive::drive_slice { query = drive::DriveQuery, mutation = drive::DriveMutation, subscription = drive::DriveSubscription }` under the host's `prefix`; every root below appears at that prefix.
 2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and both of the library's self-commands (`upload-deadline`, `image-landed`) arrive as a service actor, and a resolver that rejects services parks all ten reactions.
-3. **`DriveHost`** on the principal: `SERVICE`, `RUNNER_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `record_facts` (required), `visible_drives` (never a service principal), `admit` (the host's caller admission, asked first by every root), `display_name`, `upload_window`, `process_on_commit`, `erase_mode`, the two folder hooks.
+3. **`DriveHost`** on the principal — whose `Principal::passport()` must answer the caller's own Passport, as the gateway forwarded it (see [The chain's Passport](#the-chains-passport)): `SERVICE`, `RUNNER_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, the two `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `record_facts` (required), `visible_drives` (never a service principal), `admit` (the host's caller admission, asked first by every root), `display_name`, `upload_window`, `process_on_commit`, `erase_mode`, the two folder hooks.
 4. **Fact table**: the host's own fact table (the reference table under [Facts](#facts-handed-to-the-host)), created by a host migration; `record_facts` inserts into it on the connection it is given.
 5. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
 6. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); two blob kinds, `drive_source` and `drive_image`; an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
-7. **Jobs**: the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
+7. **Jobs**: a Jobs service serving `contract-jobs` 0.7 (`svc-jobs` ≥ 0.6: it takes `job.create.v3`); the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
 8. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
 9. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`), or deleted from a host reaction (`delete_drive_in_reaction`); frozen in the host's own gesture (`freeze_drive`); `set_metadata`, `drive_of` for curation; `file_counts` and `processing_counts` for a host view showing its drives' counts.
 10. **Catalogue watch (optional, information only)**: a host booting through the engine's `run_service` / `BootPlan` starts it at the end of its `register` closure and lets it run until the process exits: `register: move |engine| { register(engine)?; br_drive::watch_runner_types_of(engine).detach(); Ok(()) }` (see `src/bin/service.rs` of the example). It runs on the engine's NATS handle and, since engine 0.4.0 hands its PostgreSQL pool to no caller, on a small pool of its own (at most two connections, connected lazily) on `DATABASE_URL` — the URL `run_service` boots the engine's pool from; without a usable `DATABASE_URL` it does not start and says so in a `warn`. A host assembling the engine by hand calls `br_drive::watch_runner_types(nats, pool)` once its boot can no longer fail and `CatalogueWatch::stop` at shutdown. The watch fills the local copy of Jobs' runner-type catalogue that the save's `unknownRunnerTypes` warning and `<p>RunnerTypes` read. Only a host that starts it needs the `PUBLISHED_LANGUAGE` KV bucket on its broker. Nothing waits for it and no launch consults it: a host without it launches every step all the same, reports every step's type as unknown at save and lists no type.
@@ -120,7 +123,7 @@ impl DriveHost for AppPrincipal {
     fn record_facts(conn, facts: &[DriveFact]) -> BoxFuture<…> { … } // required: insert into the host's fact table
     fn visible_drives(&self) -> Vec<Uuid> { … }
     fn admit(&self) -> Gate { … }                       // default admits; refuse whom the host does not admit, at every root
-    fn display_name(&self) -> Option<String> { … }      // default None; feeds job.create's triggered_by
+    fn display_name(&self) -> Option<String> { … }      // default None; names job.create's triggered_by
     fn erase_mode() -> EraseMode { … }                  // default Anonymise; Delete removes the person's files
     fn upload_window(&self) -> Duration { … }           // default 15 min
     fn process_on_commit(&self) -> bool { … }           // default true: the commit starts the upload rule
@@ -486,14 +489,17 @@ The chain, one step at a time, in the library's own transactions:
    job, its chain step, the gesture that started its chain, its initiator —
    `ChainStarted` then `JobCreated` for the first step, `JobCreated` for the
    next ones) and stages
-   `integration.cmd.jobs.job.create.v1` through the engine outbox in the same
+   `integration.cmd.jobs.job.create.v3` through the engine outbox in the same
    transaction: `producer`, `source_bc` and `config.host` are the host
    service, `source_entity_id` is the file (so Jobs enforces one live job per
    file; `RequestUpload` refuses a file id that is not a UUIDv7 with
-   `INVALID_FILE_ID`, since Jobs would refuse every job of it),
-   `triggered_by` the principal of the gesture (`DriveHost::display_name`,
-   trimmed, blank as anonymous, cut at 512 characters; an erased initiator is
-   not named at all — what Jobs accepts), and **no `parent_job_id`**: the
+   `INVALID_FILE_ID`, since Jobs would refuse every job of it), `passport`
+   the chain's Passport (below), `triggered_by` the Passport's own user —
+   Jobs refuses any other (`passport_user_mismatch`) — named by the
+   initiator's `DriveHost::display_name` when the initiator is that user
+   (trimmed, blank as anonymous, cut at 512 characters), and nobody under a
+   service Passport; `payload`, `mode`, `priority`, `initial_job_id`,
+   `caller_address` and the `acting_*` pair are not set; and **no `parent_job_id`**: the
    chain is a host-side sequence correlated by the file id, and every step is
    owned by the host (Jobs refuses a terminal parent, and a live one would
    make the step the parent runner's work);
@@ -543,6 +549,54 @@ The chain, one step at a time, in the library's own transactions:
    nothing left to stop: the work is done and the file is `READY`; Jobs'
    `cancelled`, if it comes, changes nothing.
 
+### The chain's Passport
+
+Jobs (`svc-jobs` ≥ 0.6) refuses a root job created without a Passport
+(`creation_rejected` `passport_required`), and the runner acts **as the
+person who started the processing** — under their scopes, knowing whether
+they are a super user — never as the host service. So a chain acts under
+the Passport of its initiator:
+
+- the three gestures that start a chain — the commit that starts the
+  `upload` rule (`<p>CommitUpload` on a host that processes on commit),
+  `<p>ProcessFile` (`upload` or `reprocess`) and `<p>RegeneratePage` — take
+  it from the gesture's principal, `Principal::passport()`. A host's
+  principal must therefore answer the caller's own Passport, as the gateway
+  forwarded it (`X-Passport`), not one it built: the library forwards it to
+  Jobs as it is. A service account starting a chain gives its own service
+  Passport, and the jobs then name nobody in `triggered_by`. Every chain
+  starts from one of these three gestures: the library starts none on its
+  own, so it never falls back to the host service's Passport;
+- it is kept with the running processing (`drive.file_processing.passport`,
+  JSONB), written in the transaction that starts the chain, and every step's
+  `job.create.v3` carries it — the first one, and each next one created in
+  the transaction of the previous step's final report;
+- it is set back to `NULL` in the transaction of **every end** of the
+  processing — `READY`, a runner's declared failure, Jobs' `failed`,
+  `cancelled` or `creation_rejected`, a cancel crossing a final report, a
+  drive frozen — and goes with the row when the file or its drive is
+  deleted. It exists only while the file is `PROCESSING` (a check constraint
+  holds it). A retry by Jobs needs nothing from the library: Jobs keeps its
+  own copy with the job;
+- it is a **snapshot** taken when the chain starts: its scopes, its active
+  flag and its super-user flag are frozen for every later step. Deactivating
+  the initiator or revoking a scope does not stop a running chain — its next
+  steps still act under the stored Passport; only an erase of the initiator
+  (or of the impersonator of their session) takes it off the chain;
+- when the next step is due and the stored Passport is missing — a chain
+  started before 0.7.0, an initiator erased while it ran — or no longer
+  reads as a Passport, the step is never sent: the chain stops there, recorded
+  as `StepAbandoned { step_index, runner_type, after_job_id, reason_code }`,
+  and the file lands `FAILED` `passport_missing` or `passport_unreadable`
+  (`ProcessingFailed { reason }`), open to a reprocess;
+- no fact handed to the host, view, published event or KV entry, nor log
+  holds it. Beside the column, it is written only in the engine's outbox row
+  of each step's `job.create.v3` (`service_engine.integration_outbox`),
+  swept after the engine's message retention (a published row about an hour
+  after publication by default; a pending row stays until published, a
+  failed one until its retention passes) and not reached by the erase; Jobs
+  keeps its own copy with the job.
+
 The state is **stored**, one row per processed file (`drive.file_processing`,
 the `drive_file_processing` aggregate, soft-EDA like every library aggregate):
 
@@ -558,6 +612,7 @@ the `drive_file_processing` aggregate, soft-EDA like every library aggregate):
 | `cancel_requested_at` | a user asked to cancel the running job (the first request) |
 | `past_job_ids` | the file's earlier jobs, so a late fact about one is recognised and recorded as ignored |
 | `updated_at` | the processing's last change: every status change (a chain started, a job created or ended, a cancel request), never a progress fact nor Jobs' information |
+| `passport` | the Passport the running chain acts under ([The chain's Passport](#the-chains-passport)); `NULL` unless `processing` (0.7.0) |
 
 No row: `PENDING` without `committed_at`, `READY` with it (a stored,
 unprocessed file is ready). A row: its `state`; `processingError` its
@@ -776,7 +831,7 @@ writers of one aggregate would hand the same `seq`.
 | `drive_page` (`PageEvent`) | `Reported { job_id, origin }`, `Edited`, `Trimmed` |
 | `drive_label` (`LabelEvent`) | `Created { name, color, description }`, `Updated { name, color, description }`, `Deleted` |
 | `drive_ruleset` (`RulesetEvent`) | `Created { name, trigger, media_types, steps, is_default }`, `Saved { name, media_types, steps, is_default }`, `Deleted` |
-| `drive_file_processing` (`ProcessingEvent`) | `ChainStarted { trigger, ruleset_id, steps }`, `JobCreated { job_id, step_index, runner_type }`, `JobReportedDone { job_id }`, `JobReportedFailed { job_id, reason_code, message }`, `JobFailed { job_id, failure_cause, reason_code, note }`, `JobCancelled { job_id }`, `JobCancelledOnFreeze { job_id }` (0.5.1), `JobCreationRejected { job_id, reason_code, params }`, `JobCancelSent { job_id }`, `StepSkipped { step_index, runner_type, after_job_id }`, `JobPlanDeclared { job_id, run_id, labels }`, `JobStepStarted { job_id, run_id, index, label, started_at }`, `JobQueued { job_id, runner_type }`, `JobStarted { job_id, run_id }`, `JobCompleted { job_id }`, `JobFactIgnored { job_id, received, why }` |
+| `drive_file_processing` (`ProcessingEvent`) | `ChainStarted { trigger, ruleset_id, steps }`, `JobCreated { job_id, step_index, runner_type }`, `JobReportedDone { job_id }`, `JobReportedFailed { job_id, reason_code, message }`, `JobFailed { job_id, failure_cause, reason_code, note }`, `JobCancelled { job_id }`, `JobCancelledOnFreeze { job_id }` (0.5.1), `JobCreationRejected { job_id, reason_code, params }`, `JobCancelSent { job_id }`, `StepSkipped { step_index, runner_type, after_job_id }`, `StepAbandoned { step_index, runner_type, after_job_id, reason_code }` (0.7.0), `JobPlanDeclared { job_id, run_id, labels }`, `JobStepStarted { job_id, run_id, index, label, started_at }`, `JobQueued { job_id, runner_type }`, `JobStarted { job_id, run_id }`, `JobCompleted { job_id }`, `JobFactIgnored { job_id, received, why }` |
 
 Every payload is at schema version 1 (`FILE_EVENT_VERSION`,
 `PAGE_EVENT_VERSION`, `LABEL_EVENT_VERSION`, `RULESET_EVENT_VERSION`,
@@ -824,7 +879,14 @@ the engine's `PersonErased` fact. `DriveHost::erase_mode` picks the mode:
   files, labels, label links and rules, the initiator of the chains they
   started (`drive.file_processing.triggered_by_*`) and the `updated_by` of the
   pages they wrote last is rewritten to `br_drive::REDACTED_PERSON` (the nil
-  UUID); nothing is deleted. The facts naming the person live in the host's
+  UUID); nothing is deleted. The Passport a running chain acts under
+  (`drive.file_processing.passport`) is dropped when it is the person's own,
+  and when the person is its impersonator (an administrator who borrowed the
+  initiator's session — the Passport's `impersonator`): the chain is not
+  carried on as, nor on behalf of, someone erased, and its **next** step ends
+  it `FAILED` `passport_missing`. The step running at the erase is not
+  stopped: its job already carries the Passport, and it runs until its
+  runner reports. The facts naming the person live in the host's
   fact table: their erasure is the host's.
 - `Delete`: every file the person created is deleted (its pages, images and
   label links cascade, its objects are purged through the manifest), then the
@@ -886,7 +948,9 @@ the end of the file's last job (`drive.file_processing.error_code`): the `reason
 declared through `<p>RunnerReportFailure`, verbatim; the `reason_code` of the
 failure report a runner sent Jobs, else Jobs' `failure_cause`; Jobs'
 `creation_rejected` code (e.g. `duplicate_active_entity`,
-`runner_type_retired`); or `cancelled`. The upgrade from 0.1 adds one more,
+`runner_type_retired`); `cancelled`; or, since 0.7.0, `passport_missing` /
+`passport_unreadable` for a chain stopped before its next step (see
+[The chain's Passport](#the-chains-passport)). The upgrade from 0.1 adds one more,
 `interrupted`: a chain 0.1 left between two steps (the next step never asked
 of Jobs), a job Jobs completed without the runner's final report, and a file
 found `PROCESSING` without a job; a file that was `FAILED` before migration

@@ -9,6 +9,95 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.7.0 — 2026-11-02
+
+Breaking: the library now needs a Jobs service serving `contract-jobs` 0.7
+(`svc-jobs` ≥ 0.6), which refuses any root job created without a Passport
+(`creation_rejected` `passport_required`) — on 0.6.x every file processing was
+refused there. A host upgrades by bumping the br-drive pin (same engine tag,
+`br-service-engine/v0.4.2`) and `contract-jobs` to `contract-jobs/v0.7.0` if it
+pins it; no Rust signature of the host's moves. Its principal's
+`Principal::passport()` must answer the caller's own Passport, as the gateway
+forwarded it: the library now forwards it to Jobs.
+
+### Upgrading from 0.6
+
+- **Deploy a Jobs service ≥ 0.6 first.** An older one has no
+  `job.create.v3` consumer: the first step of every chain would never reach
+  it, and its files would stay `PROCESSING` until cancelled.
+- **Files processing at the upgrade need a reprocess.** Their chain has no
+  stored Passport: the running step's job, created without a Passport, fails
+  on the Jobs side (`passport_required`), and a step that ends anyway leaves
+  its next one `FAILED` `passport_missing`. Either way the file ends
+  `FAILED`; reprocess it once the upgrade is done.
+- The Passport is a snapshot taken at the chain's start (scopes, active and
+  super-user flags): deactivating a user or revoking a scope does not stop a
+  chain already running, unlike an erase.
+
+### Changed
+
+- **Every step's job is created on `integration.cmd.jobs.job.create.v3`**
+  (`contract_jobs::command_v3::CreateJobV3`), carrying the Passport of the
+  principal whose gesture started the chain — the commit that starts the
+  `upload` rule, `ProcessFile`, `RegeneratePage` — so the runner acts as that
+  person. `triggered_by` is the Passport's own user (Jobs refuses any other,
+  `passport_user_mismatch`), named by the initiator's `display_name` when the
+  initiator is that user, and nobody under a service Passport; `parent_job_id`
+  stays unset, and the other new fields (`payload`, `mode`, `priority`,
+  `initial_job_id`, `caller_address`, `acting_*`) are not set. Through 0.6.x a
+  next step whose initiator was unknown named the file's creator: it now
+  always names the Passport's user.
+- **contract-jobs 0.5.1 → 0.7.0.** `job.finish`, `job.fail`, `job.cancel`
+  (v2) and the eight `job.*.v1` facts the library consumes are unchanged:
+  Jobs 0.6 still serves them.
+
+### Added
+
+- **Migration `9121000013_processing_passport`**: a nullable JSONB column
+  `drive.file_processing.passport`, the Passport the running chain acts
+  under, with a check that it is set only while the processing is
+  `processing`. Written in the transaction that starts the chain, read back
+  for each next step, and set back to `NULL` in the transaction of every end
+  of the processing (`READY`, a runner's or Jobs' failure, a cancel, a
+  rejection, a drive frozen; the row goes with a deleted file or drive). No
+  fact, view, published event or KV entry, nor log holds it; beside the
+  column it is written only in the engine's outbox row of each step's
+  `job.create.v3`, swept after the engine's message retention (published
+  rows about an hour after publication; pending and failed ones longer) and
+  not reached by the erase — Jobs keeps its own copy with the job. The check
+  is added `NOT VALID` (the column is new and `NULL` everywhere), so the
+  migration does not scan the table under its lock; it holds for every
+  write. Additive: a 0.6.x binary ignores the column.
+- **A chain whose Passport is gone stops visibly.** When a next step is due
+  and the stored Passport is missing or no longer reads as a Passport, no job
+  is sent: the chain stops with the new processing fact
+  `StepAbandoned { step_index, runner_type, after_job_id, reason_code }` and
+  the file lands `FAILED` `passport_missing` or `passport_unreadable`
+  (`br_drive::PASSPORT_MISSING`, `br_drive::PASSPORT_UNREADABLE`), open to a
+  reprocess. A chain already running when the migration lands has no stored
+  Passport: it ends this way at its next step.
+- **The erase drops a running chain's Passport** of the erased person
+  (`Anonymise` and `Delete`) — their own, and one they hold as its
+  impersonator (the Passport's `impersonator`, an administrator who borrowed
+  the initiator's session): the chain is not carried on as, nor on behalf of,
+  someone erased, and ends `FAILED` `passport_missing` at its **next** step;
+  the step running at the erase goes on until its runner reports (its job
+  already carries the Passport). Through 0.6.x it ran
+  on, naming nobody.
+- The example host's Jobs double judges creates the way Jobs 0.6 does
+  (`job.create.v3` only — a v1 create fails the scenario —,
+  `passport_required`, `passport_malformed`, `passport_user_mismatch`), and
+  the e2e prove that every step's job carries the initiator's Passport and
+  names its user, that the column is filled while `PROCESSING` and `NULL`
+  after each kind of end, that no fact records it, that a chain whose
+  initiator — or the impersonator of its initiator's session — is erased ends
+  `FAILED` `passport_missing` with no job sent, that an impersonated session
+  and a service account each start a chain Jobs accepts, and that a chain
+  running on a 0.6 database at the upgrade ends `FAILED` `passport_missing`
+  at its next step. The double records a command Jobs refuses as a breach of
+  its contract (a v1 create, an undecodable command) and fails the scenario
+  on its next read, or at its drop, instead of dying silently.
+
 ## 0.6.5 — 2026-10-23
 
 Fix only: no API change, the committed SDL did not move, and a host on 0.6.4

@@ -249,6 +249,7 @@ pub fn commit_upload<'m, H: DriveHost>(
             let rule = commit_rule(cx.connection(), &file).await?;
             if let Some(rule) = rule {
                 let initiator = processing::Initiator::of(cx.principal());
+                let passport = cx.principal().passport().clone();
                 processing::start_chain(
                     cx,
                     &meta,
@@ -256,6 +257,7 @@ pub fn commit_upload<'m, H: DriveHost>(
                     processing::ChainPlan::from_ruleset(&rule, None),
                     Trigger::Upload,
                     initiator,
+                    &passport,
                 )
                 .await?;
             }

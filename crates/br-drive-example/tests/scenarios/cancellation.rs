@@ -904,14 +904,32 @@ async fn what_the_chain_tells_jobs_is_always_something_jobs_accepts() {
 
     // When: the owner is erased while the chain runs, then the first step ends
     world.erase(owner_id).await;
+    assert_eq!(
+        world.held_passport(file_id).await,
+        None,
+        "the erase takes the erased person's passport off the running chain"
+    );
     done(&world, &jobs, &runner, file_id, first.job_id).await;
 
-    // Then: the next step names no initiator at all, and Jobs accepts it
-    let second = jobs.await_create(file_id).await;
-    assert_eq!(second.runner_type, INDEX);
-    assert_eq!(second.triggered_by, None);
-    done(&world, &jobs, &runner, file_id, second.job_id).await;
-    world.await_state(&owner, file_id, "READY").await;
+    // Then: the chain does not go on as someone erased: its next step is never
+    // asked of Jobs — no job without a passport — and the file is FAILED
+    // `passport_missing`, visibly
+    let file = world.await_state(&owner, file_id, "FAILED").await;
+    assert_eq!(file["processingError"], br_drive::PASSPORT_MISSING);
+    jobs.expect_no_command(Duration::from_secs(1)).await;
+    // (Jobs' `completed` of the finished step may be recorded after it)
+    let last = world
+        .processing_facts(file_id)
+        .await
+        .into_iter()
+        .rfind(|fact| fact.event_type != "JobCompleted")
+        .expect("the chain's facts");
+    assert_eq!(last.event_type, "StepAbandoned");
+    assert_eq!(last.payload["step_index"], 1);
+    assert_eq!(last.payload["runner_type"], INDEX);
+    assert_eq!(last.payload["reason_code"], br_drive::PASSPORT_MISSING);
+    assert_eq!(last.payload["after_job_id"], first.job_id.to_string());
+    assert_eq!(world.held_passport(file_id).await, None);
 
     world.cleanup().await;
 }

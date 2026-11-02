@@ -36,6 +36,15 @@ use crate::ruleset::{RulesetStep, Trigger};
 /// The `processingError` of a file whose job was cancelled.
 pub const CANCELLED: &str = "cancelled";
 
+/// The `processingError` of a chain stopped before its next step because the
+/// Passport of its initiator is no longer held (a chain started before 0.7.0,
+/// an initiator erased while it ran): no step is ever sent to Jobs without one.
+pub const PASSPORT_MISSING: &str = "passport_missing";
+
+/// The `processingError` of a chain stopped before its next step because the
+/// Passport held for it no longer reads as a Passport.
+pub const PASSPORT_UNREADABLE: &str = "passport_unreadable";
+
 /// The names of what is known of a job, as the entries of
 /// [`FileJob::events`] name them.
 pub mod kind {
@@ -139,6 +148,17 @@ pub enum ProcessingEvent {
     /// Jobs completed the job — only ever after the library's own
     /// `job.finish`: information.
     JobCompleted { job_id: Uuid },
+    /// The chain stopped before step `step_index`: when `after_job_id`, the
+    /// previous step's job, was reported done, the Passport the chain acts
+    /// under was missing or unreadable (`reason_code`, [`PASSPORT_MISSING`] or
+    /// [`PASSPORT_UNREADABLE`]), so the step's job was never created nor asked
+    /// of Jobs and the file is FAILED with that code. Since 0.7.0.
+    StepAbandoned {
+        step_index: i32,
+        runner_type: String,
+        after_job_id: Uuid,
+        reason_code: String,
+    },
     /// A fact received about a job that changes nothing any more: an end
     /// after the job's first end, a progress fact of an ended job or one
     /// already known, any fact about an earlier job of the file. `received`
@@ -171,6 +191,7 @@ impl DriveEvent for ProcessingEvent {
             Self::JobCreationRejected { .. } => "JobCreationRejected",
             Self::JobCancelSent { .. } => "JobCancelSent",
             Self::StepSkipped { .. } => "StepSkipped",
+            Self::StepAbandoned { .. } => "StepAbandoned",
             Self::JobPlanDeclared { .. } => "JobPlanDeclared",
             Self::JobStepStarted { .. } => "JobStepStarted",
             Self::JobQueued { .. } => "JobQueued",
@@ -435,6 +456,10 @@ pub struct FileProcessing<H> {
     pub(crate) cancel_requested_at: Option<DateTime<Utc>>,
     pub(crate) past_job_ids: Vec<Uuid>,
     pub(crate) updated_at: DateTime<Utc>,
+    /// The Passport the running chain acts under, as its initiator presented
+    /// it: set when a chain starts, `None` from any end on. Never in a fact, a
+    /// view or a log (the `Debug` of the state leaves it out).
+    pub(crate) passport: Option<serde_json::Value>,
     pending: Pending<ProcessingEvent>,
     host: PhantomData<fn() -> H>,
 }
@@ -459,6 +484,7 @@ impl<H> Clone for FileProcessing<H> {
             cancel_requested_at: self.cancel_requested_at,
             past_job_ids: self.past_job_ids.clone(),
             updated_at: self.updated_at,
+            passport: self.passport.clone(),
             pending: self.pending.clone(),
             host: PhantomData,
         }
@@ -499,6 +525,7 @@ impl<H> FileProcessing<H> {
             cancel_requested_at: None,
             past_job_ids: Vec::new(),
             updated_at: at,
+            passport: None,
             pending: Pending::default(),
             host: PhantomData,
         }
@@ -557,14 +584,17 @@ impl<H> FileProcessing<H> {
         }
     }
 
-    /// A gesture started a chain on the settled file.
+    /// A gesture started a chain on the settled file, acting under its
+    /// initiator's `passport` until the chain ends.
     pub(crate) fn start_chain(
         &mut self,
         trigger: Trigger,
         ruleset_id: Option<Uuid>,
         steps: Vec<RulesetStep>,
+        passport: serde_json::Value,
         meta: &FactMeta,
     ) {
+        self.passport = Some(passport);
         self.updated_at = meta.occurred_at;
         self.push(
             ProcessingEvent::ChainStarted {
@@ -576,7 +606,10 @@ impl<H> FileProcessing<H> {
         );
     }
 
-    /// Makes `job_id` the file's running job, the chain's step `step_index`.
+    /// Makes `job_id` the file's running job, the chain's step `step_index`,
+    /// acting under `passport` (the chain's own, carried over from the
+    /// previous step).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_job(
         &mut self,
         job_id: Uuid,
@@ -584,9 +617,11 @@ impl<H> FileProcessing<H> {
         runner_type: String,
         trigger: Option<Trigger>,
         triggered_by: Option<Initiator>,
+        passport: serde_json::Value,
         meta: &FactMeta,
     ) {
         self.retire_current_job();
+        self.passport = Some(passport);
         self.state = ProcessingState::Processing;
         self.job_id = job_id;
         self.step_index = step_index;
@@ -619,8 +654,11 @@ impl<H> FileProcessing<H> {
         self.cancel_requested_at = None;
     }
 
-    /// The running job ended: READY on success, else FAILED with `error`.
+    /// The running job ended: READY on success, else FAILED with `error`. The
+    /// chain's Passport goes with it: a next step gets it back from the
+    /// caller (`create_job`), in the same transaction.
     fn end(&mut self, error: Option<(String, Option<String>)>, meta: &FactMeta) {
+        self.passport = None;
         match error {
             Some((code, message)) => {
                 self.state = ProcessingState::Failed;
@@ -681,6 +719,36 @@ impl<H> FileProcessing<H> {
             },
             meta,
         );
+    }
+
+    /// The chain stopped before step `step_index` because its Passport is
+    /// missing or unreadable (`reason_code`): the step is never launched and
+    /// the file is FAILED with that code. Like `skip_step`, the ended job
+    /// stays the file's last one.
+    pub(crate) fn abandon_step(
+        &mut self,
+        step_index: i32,
+        runner_type: String,
+        reason_code: &str,
+        meta: &FactMeta,
+    ) {
+        let after_job_id = self.job_id;
+        self.end(Some((reason_code.to_string(), None)), meta);
+        self.push(
+            ProcessingEvent::StepAbandoned {
+                step_index,
+                runner_type,
+                after_job_id,
+                reason_code: reason_code.to_string(),
+            },
+            meta,
+        );
+    }
+
+    /// The Passport the running chain acts under, taken out of the state —
+    /// what the next step's job carries.
+    pub(crate) fn take_passport(&mut self) -> Option<serde_json::Value> {
+        self.passport.take()
     }
 
     /// A user asked to cancel the running job; the first request is the one
@@ -818,7 +886,7 @@ impl<H> FileProcessing<H> {
 /// The columns of `drive.file_processing`.
 const COLUMNS: &str = "file_id, version, state, job_id, step_index, trigger, triggered_by_id, \
      triggered_by_name, job_created_at, error_code, error_message, plan, plan_index, plan_label, \
-     plan_at, cancel_requested_at, past_job_ids, updated_at";
+     plan_at, cancel_requested_at, past_job_ids, updated_at, passport";
 
 fn config_error(error: impl std::fmt::Display) -> EngineError {
     EngineError::Config(error.to_string())
@@ -853,6 +921,7 @@ fn row_to_processing<H>(row: &sqlx::postgres::PgRow) -> Result<FileProcessing<H>
         cancel_requested_at: row.get("cancel_requested_at"),
         past_job_ids: row.get("past_job_ids"),
         updated_at: row.get("updated_at"),
+        passport: row.get("passport"),
         pending: Pending::default(),
         host: PhantomData,
     })
@@ -943,7 +1012,7 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
     };
     sqlx::query(&format!(
         "INSERT INTO drive.file_processing ({COLUMNS}) VALUES \
-         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
          ON CONFLICT (file_id) DO UPDATE SET version = EXCLUDED.version, state = EXCLUDED.state, \
            job_id = EXCLUDED.job_id, step_index = EXCLUDED.step_index, \
            trigger = EXCLUDED.trigger, triggered_by_id = EXCLUDED.triggered_by_id, \
@@ -952,7 +1021,8 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
            error_message = EXCLUDED.error_message, plan = EXCLUDED.plan, \
            plan_index = EXCLUDED.plan_index, plan_label = EXCLUDED.plan_label, \
            plan_at = EXCLUDED.plan_at, cancel_requested_at = EXCLUDED.cancel_requested_at, \
-           past_job_ids = EXCLUDED.past_job_ids, updated_at = EXCLUDED.updated_at"
+           past_job_ids = EXCLUDED.past_job_ids, updated_at = EXCLUDED.updated_at, \
+           passport = EXCLUDED.passport"
     ))
     .bind(state.file_id)
     .bind(state.version)
@@ -972,6 +1042,7 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
     .bind(state.cancel_requested_at)
     .bind(&state.past_job_ids)
     .bind(state.updated_at)
+    .bind(&state.passport)
     .execute(conn)
     .await?;
     Ok(())
@@ -1022,16 +1093,21 @@ mod tests {
         }
     }
 
+    fn passport() -> serde_json::Value {
+        serde_json::json!({ "kind": "service", "service_account_id": Uuid::now_v7(), "claims": {} })
+    }
+
     fn running() -> FileProcessing<()> {
         let meta = meta();
         let mut processing = FileProcessing::<()>::blank(Uuid::now_v7(), meta.occurred_at);
-        processing.start_chain(Trigger::Upload, None, Vec::new(), &meta);
+        processing.start_chain(Trigger::Upload, None, Vec::new(), passport(), &meta);
         processing.create_job(
             Uuid::now_v7(),
             0,
             "render".into(),
             Some(Trigger::Upload),
             None,
+            passport(),
             &meta,
         );
         processing
@@ -1113,7 +1189,15 @@ mod tests {
         let mut processing = running();
         let first = processing.job_id;
         processing.report_done(&meta());
-        processing.create_job(Uuid::now_v7(), 1, "index".into(), None, None, &meta());
+        processing.create_job(
+            Uuid::now_v7(),
+            1,
+            "index".into(),
+            None,
+            None,
+            passport(),
+            &meta(),
+        );
         assert_eq!(processing.past_job_ids, vec![first]);
         assert_eq!(
             processing.receive(first, Received::Completed, &meta()),
@@ -1287,5 +1371,87 @@ mod tests {
         assert_eq!(progress.current_index, Some(1));
         assert_eq!(progress.current_label.as_deref(), Some("b"));
         assert_eq!(progress.at, Some(late));
+    }
+
+    #[test]
+    fn the_passport_is_held_only_while_the_chain_runs() {
+        let mut processing = running();
+        assert!(processing.passport.is_some(), "a running chain holds it");
+        processing.report_done(&meta());
+        assert!(processing.passport.is_none(), "READY drops it");
+
+        let mut failed = running();
+        failed.report_failed("broken", None, &meta());
+        assert!(failed.passport.is_none(), "a reported failure drops it");
+
+        for fact in [
+            Received::Cancelled,
+            Received::Failed {
+                failure_cause: "x".into(),
+                reason_code: "x".into(),
+                note: None,
+            },
+            Received::CreationRejected {
+                reason_code: "x".into(),
+                params: serde_json::json!({}),
+            },
+        ] {
+            let mut ended = running();
+            let job = ended.job_id;
+            assert_eq!(ended.receive(job, fact, &meta()), Applied::Ended);
+            assert!(ended.passport.is_none(), "an end from Jobs drops it");
+        }
+
+        let mut frozen = running();
+        frozen.cancel_on_freeze(&meta());
+        assert!(frozen.passport.is_none(), "a freeze drops it");
+
+        let mut skipped = running();
+        skipped.request_cancel(&meta());
+        skipped.report_done(&meta());
+        skipped.skip_step(1, "index".into(), &meta());
+        assert!(skipped.passport.is_none(), "a cancelled chain drops it");
+    }
+
+    #[test]
+    fn a_chain_without_a_readable_passport_ends_failed_before_its_next_step() {
+        let mut processing = running();
+        let ran = processing.job_id;
+        processing.take_passport();
+        processing.report_done(&meta());
+        processing.abandon_step(1, "index".into(), PASSPORT_UNREADABLE, &meta());
+        assert_eq!(processing.state, ProcessingState::Failed);
+        assert_eq!(processing.error_code.as_deref(), Some(PASSPORT_UNREADABLE));
+        assert_eq!(processing.job_id, ran, "no job is minted for the step");
+        assert!(processing.passport.is_none());
+        let Some(Stamped {
+            event:
+                ProcessingEvent::StepAbandoned {
+                    step_index,
+                    reason_code,
+                    after_job_id,
+                    ..
+                },
+            ..
+        }) = processing.pending().last()
+        else {
+            panic!("the abandoned step is a fact");
+        };
+        assert_eq!(
+            (*step_index, reason_code.as_str(), *after_job_id),
+            (1, PASSPORT_UNREADABLE, ran)
+        );
+        let facts = serde_json::to_string(
+            &processing
+                .pending()
+                .iter()
+                .map(|stamped| &stamped.event)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            !facts.contains("service_account_id") && !facts.contains("claims"),
+            "no fact carries the passport: {facts}"
+        );
     }
 }

@@ -67,6 +67,18 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
     .execute(&mut *conn)
     .await?;
     rows += done.rows_affected();
+    // The Passport a running chain of the person acts under goes too — the
+    // person's own, or one they borrowed as its impersonator (a human
+    // Passport's `impersonator`): the chain is not carried on as, nor on
+    // behalf of, someone erased — its next step ends FAILED
+    // `passport_missing`. The same rows as above, not counted twice.
+    sqlx::query(
+        "UPDATE drive.file_processing SET passport = NULL \
+         WHERE passport ->> 'user_id' = $1 OR passport ->> 'impersonator' = $1",
+    )
+    .bind(person.to_string())
+    .execute(&mut *conn)
+    .await?;
     let done = sqlx::query("UPDATE drive.file_page SET updated_by = $2 WHERE updated_by = $1")
         .bind(person)
         .bind(REDACTED_PERSON)
@@ -76,11 +88,17 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
     Ok(rows)
 }
 
+/// The files whose processing names the person: as its initiator, or as the
+/// impersonator in the Passport its chain acts under.
 async fn files_started_by(conn: &mut PgConnection, person: Uuid) -> Result<Vec<Uuid>, EngineError> {
-    let rows = sqlx::query("SELECT file_id FROM drive.file_processing WHERE triggered_by_id = $1")
-        .bind(person)
-        .fetch_all(conn)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT file_id FROM drive.file_processing \
+         WHERE triggered_by_id = $1 OR passport ->> 'impersonator' = $2",
+    )
+    .bind(person)
+    .bind(person.to_string())
+    .fetch_all(conn)
+    .await?;
     Ok(rows
         .iter()
         .map(|row| row.get::<Uuid, _>("file_id"))

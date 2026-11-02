@@ -2,9 +2,16 @@
 //! that violates Jobs' contract fails instead of passing. Checked against
 //! `svc-jobs` (`app/create.rs`) and `bc-jobs` (`commands/job/create.rs`,
 //! `domain/job/parenting.rs`, `commands/job/source.rs`) at `contract-jobs`
-//! 0.5.0.
+//! 0.5.0, and its passport rules (`app/create/declare.rs`, `resolve_passport`,
+//! `resolve_triggered_by`) at `contract-jobs` 0.7.0.
 
-use contract_jobs::command::{CreateJob, TriggeredBy};
+use std::time::Duration;
+
+use br_core_auth::{AuthMethod, Passport, PassportClaims};
+use contract_jobs::CMD_JOB_CREATE_V1;
+use contract_jobs::command::TriggeredBy;
+use contract_jobs::command_v3::CreateJobV3 as CreateJob;
+use futures_util::FutureExt;
 use uuid::Uuid;
 
 use crate::harness::runner::RENDER;
@@ -12,17 +19,39 @@ use crate::harness::{JobsStandIn, World};
 
 const PRODUCER: &str = "another-producer";
 
+fn user_passport(user: Uuid) -> serde_json::Value {
+    serde_json::to_value(Passport::human(
+        user,
+        false,
+        true,
+        AuthMethod::Jwt,
+        None,
+        PassportClaims::new(),
+    ))
+    .unwrap()
+}
+
 fn create(source_entity_id: Uuid, parent_job_id: Option<Uuid>) -> CreateJob {
     CreateJob {
         job_id: Uuid::now_v7(),
         runner_type: RENDER.to_string(),
         producer: PRODUCER.to_string(),
         config: None,
-        parent_job_id,
+        payload: None,
+        passport: Some(
+            serde_json::to_value(Passport::service(Uuid::now_v7(), PassportClaims::new())).unwrap(),
+        ),
         triggered_by: None,
+        parent_job_id,
+        initial_job_id: None,
+        mode: None,
+        caller_address: None,
+        acting_run_id: None,
+        acting_instance_key: None,
         source_bc: Some(PRODUCER.to_string()),
         source_entity_id: Some(source_entity_id),
         max_attempts: None,
+        priority: None,
     }
 }
 
@@ -130,6 +159,100 @@ async fn the_jobs_double_refuses_the_inputs_jobs_cannot_build_a_job_from() {
     let mut half = create(Uuid::now_v7(), None);
     half.source_bc = None;
     assert_eq!(refused(&jobs, &half).await, "blank_value");
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_jobs_double_refuses_a_root_job_without_a_passport_or_naming_someone_else() {
+    // Given: the double
+    let world = World::start("pod-jobs-double-passport").await;
+    let jobs = JobsStandIn::attach(&world).await;
+
+    // When / Then: a root job without a passport is refused
+    let mut bare = create(Uuid::now_v7(), None);
+    bare.passport = None;
+    assert_eq!(refused(&jobs, &bare).await, "passport_required");
+
+    // And: a passport that is not a Passport is refused
+    let mut garbled = create(Uuid::now_v7(), None);
+    garbled.passport = Some(serde_json::json!({ "kind": "robot" }));
+    assert_eq!(refused(&jobs, &garbled).await, "passport_malformed");
+
+    // And: a triggered_by that is not the passport's user is refused, and so
+    // is any one beside a service passport
+    let user = Uuid::now_v7();
+    let mut other = create(Uuid::now_v7(), None);
+    other.passport = Some(user_passport(user));
+    other.triggered_by = Some(TriggeredBy::Anonymous(Uuid::now_v7()));
+    assert_eq!(refused(&jobs, &other).await, "passport_user_mismatch");
+    let mut beside_service = create(Uuid::now_v7(), None);
+    beside_service.triggered_by = Some(TriggeredBy::Anonymous(user));
+    assert_eq!(
+        refused(&jobs, &beside_service).await,
+        "passport_user_mismatch"
+    );
+
+    // And: the passport's own user, named or not, is accepted
+    let mut own = create(Uuid::now_v7(), None);
+    own.passport = Some(user_passport(user));
+    own.triggered_by = Some(TriggeredBy::Identified {
+        id: user,
+        display_name: "Ada".into(),
+    });
+    jobs.submit_create(&own).await;
+    jobs.await_create(own.source_entity_id.unwrap()).await;
+
+    world.cleanup().await;
+}
+
+/// The message of a panic a read of the double raised.
+async fn panic_of(read: impl std::future::Future<Output = ()>) -> String {
+    let panic = std::panic::AssertUnwindSafe(read)
+        .catch_unwind()
+        .await
+        .expect_err("the read fails the scenario");
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_job_create_v1_fails_the_scenario_loudly_instead_of_passing_unseen() {
+    // Given: the double
+    let world = World::start("pod-jobs-double-v1").await;
+    let jobs = JobsStandIn::attach(&world).await;
+
+    // When: a producer still on v1 sends a root job — no passport on v1
+    let entity = Uuid::now_v7();
+    let mut legacy = serde_json::to_value(create(entity, None)).unwrap();
+    legacy.as_object_mut().unwrap().remove("passport");
+    jobs.submit_command(CMD_JOB_CREATE_V1, "job.create", 1, legacy)
+        .await;
+
+    // Then: proving that no command reached jobs fails, naming the v1 create
+    let refused = panic_of(jobs.expect_no_command(Duration::from_secs(5))).await;
+    assert!(refused.contains("job.create v1"), "{refused}");
+
+    // And: awaiting a create fails on the breach too, not on a timeout
+    let waited = panic_of(async {
+        jobs.await_create(entity).await;
+    })
+    .await;
+    assert!(waited.contains("job.create v1"), "{waited}");
+
+    // And: the breach is the one recorded (acknowledged here, or the double's
+    // drop would fail the scenario)
+    let violations = jobs.take_violations();
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    // The v1 create itself may still sit in the inbox: a check that panicked
+    // before its read left it there, one that panicked after consumed it.
+    if let Some((subject, _)) = jobs.next_command(Duration::from_millis(200)).await {
+        assert_eq!(subject, CMD_JOB_CREATE_V1);
+    }
+    jobs.expect_no_command(Duration::from_millis(200)).await;
 
     world.cleanup().await;
 }

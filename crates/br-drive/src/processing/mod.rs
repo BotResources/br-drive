@@ -22,8 +22,8 @@ pub use reactions::{
 pub use roots::{RootNames, declare_roots};
 pub(crate) use state::RunningFacts;
 pub use state::{
-    CANCELLED, FileJob, FileProcessing, FileProcessingNoun, FileProcessingStore,
-    PROCESSING_EVENT_VERSION, ProcessingEvent, RunProgress, kind as job_event,
+    CANCELLED, FileJob, FileProcessing, FileProcessingNoun, FileProcessingStore, PASSPORT_MISSING,
+    PASSPORT_UNREADABLE, PROCESSING_EVENT_VERSION, ProcessingEvent, RunProgress, kind as job_event,
     why as ignored_because,
 };
 

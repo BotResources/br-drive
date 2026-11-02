@@ -1,4 +1,6 @@
-use contract_jobs::command::{CancelJob, CreateJob, FailJob, FinishJob};
+use br_core_auth::Passport;
+use contract_jobs::command::{CancelJob, FailJob, FinishJob, TriggeredBy};
+use contract_jobs::command_v3::CreateJobV3;
 use service_engine::BlobRef;
 use service_engine::error::EngineError;
 use service_engine::impact::Dims;
@@ -7,7 +9,7 @@ use uuid::Uuid;
 
 use super::commands::{Initiator, JobCancel, JobCreate, JobFail, JobFinish};
 use super::roots::roots;
-use super::state::{CANCELLED, FileProcessing};
+use super::state::{CANCELLED, FileProcessing, PASSPORT_MISSING, PASSPORT_UNREADABLE};
 use crate::facts::{self, FactMeta};
 use crate::fault::{DriveFault, codes};
 use crate::file::images::drop_images;
@@ -82,8 +84,34 @@ async fn save_processing<H: DriveHost>(
     Ok(())
 }
 
+/// The Passport the chain acts under, read back from the file's processing
+/// for its next step: the `processingError` the chain ends with when it is
+/// not held ([`PASSPORT_MISSING`]) or no longer reads as a Passport
+/// ([`PASSPORT_UNREADABLE`]).
+pub(crate) fn chain_passport(stored: Option<serde_json::Value>) -> Result<Passport, &'static str> {
+    let stored = stored.ok_or(PASSPORT_MISSING)?;
+    serde_json::from_value::<Passport>(stored).map_err(|_| PASSPORT_UNREADABLE)
+}
+
+/// Who Jobs is told started the job: the Passport's own user — Jobs refuses a
+/// `triggered_by` that is not (`passport_user_mismatch`) — named as the
+/// initiator was when it is that user; nobody under a service Passport.
+fn triggered_by(passport: &Passport, initiator: Option<&Initiator>) -> Option<TriggeredBy> {
+    let user = passport.user_id()?;
+    let display_name = initiator
+        .filter(|initiator| initiator.id == user)
+        .and_then(|initiator| initiator.display_name.clone());
+    Initiator {
+        id: user,
+        display_name,
+    }
+    .triggered_by()
+}
+
 /// Starts step `index` of the file's snapshot: the file's running job and its
-/// `job.create`, staged through the outbox. `None` past the last step.
+/// `job.create` (v3, carrying the chain's `passport`), staged through the
+/// outbox. `None` past the last step.
+#[allow(clippy::too_many_arguments)]
 async fn launch_step<H: DriveHost>(
     cx: &mut Ops<'_>,
     meta: &FactMeta,
@@ -92,6 +120,7 @@ async fn launch_step<H: DriveHost>(
     index: usize,
     trigger: Option<Trigger>,
     initiator: Option<Initiator>,
+    passport: &Passport,
 ) -> Result<Option<Uuid>, DriveFault> {
     let steps = file.steps.clone().unwrap_or_default();
     let Some(step) = steps.get(index) else {
@@ -113,32 +142,43 @@ async fn launch_step<H: DriveHost>(
         "step": index,
         "options": step.options,
     });
-    let named = initiator.clone().unwrap_or(Initiator {
-        id: file.created_by,
-        display_name: None,
-    });
+    let document = serde_json::to_value(passport).map_err(|error| {
+        DriveFault::Engine(EngineError::Config(format!(
+            "a passport does not encode: {error}"
+        )))
+    })?;
+    let triggered_by = triggered_by(passport, initiator.as_ref());
     processing.create_job(
         job_id,
         step_index,
         step.runner_type.clone(),
         trigger,
         initiator,
+        document.clone(),
         meta,
     );
     // The chain is a host-side sequence correlated by the file id: no step names
     // a parent. Jobs refuses a terminal parent, and a live one would make the
     // step the parent runner's work instead of the host's.
     cx.command(JobCreate {
-        payload: CreateJob {
+        payload: CreateJobV3 {
             job_id,
             runner_type: step.runner_type.clone(),
             producer: H::SERVICE.to_string(),
             config: Some(config),
+            payload: None,
+            passport: Some(document),
+            triggered_by,
             parent_job_id: None,
-            triggered_by: named.triggered_by(),
+            initial_job_id: None,
+            mode: None,
+            caller_address: None,
+            acting_run_id: None,
+            acting_instance_key: None,
             source_bc: Some(H::SERVICE.to_string()),
             source_entity_id: Some(file.id),
             max_attempts: None,
+            priority: None,
         },
     })?;
     Ok(Some(job_id))
@@ -146,7 +186,9 @@ async fn launch_step<H: DriveHost>(
 
 /// Starts a chain on a READY or FAILED file: the plan becomes the file's
 /// snapshot and its first step a job. Nothing of the previous results is
-/// touched — they stay readable while the new run reports over them.
+/// touched — they stay readable while the new run reports over them. The
+/// chain acts under `passport`, the initiator's own: it is kept with the
+/// file's processing until the chain ends, and every step's job carries it.
 pub(crate) async fn start_chain<H: DriveHost>(
     cx: &mut Ops<'_>,
     meta: &FactMeta,
@@ -154,12 +196,18 @@ pub(crate) async fn start_chain<H: DriveHost>(
     plan: ChainPlan,
     trigger: Trigger,
     initiator: Initiator,
+    passport: &Passport,
 ) -> Result<(), DriveFault> {
     file.ruleset_id = plan.ruleset_id;
     file.steps = Some(plan.steps.clone());
     facts::save(cx, file).await?;
     let mut processing = load_processing(cx, file).await?;
-    processing.start_chain(trigger, plan.ruleset_id, plan.steps, meta);
+    let document = serde_json::to_value(passport).map_err(|error| {
+        DriveFault::Engine(EngineError::Config(format!(
+            "a passport does not encode: {error}"
+        )))
+    })?;
+    processing.start_chain(trigger, plan.ruleset_id, plan.steps, document, meta);
     let Some(job_id) = launch_step(
         cx,
         meta,
@@ -168,6 +216,7 @@ pub(crate) async fn start_chain<H: DriveHost>(
         0,
         Some(trigger),
         Some(initiator),
+        passport,
     )
     .await?
     else {
@@ -184,7 +233,10 @@ pub(crate) async fn start_chain<H: DriveHost>(
 /// `completed` then only confirms it. A user's cancel that crossed the report
 /// stops the chain there: the next step is skipped (`StepSkipped`), never
 /// launched, and the file is FAILED `cancelled`; on the last step there is nothing left to stop and the file
-/// is READY.
+/// is READY. The next step's job carries the chain's Passport, read back from
+/// the file's processing; held no more or unreadable, the chain stops there
+/// too (`StepAbandoned`) and the file is FAILED `passport_missing` or
+/// `passport_unreadable` — no job is ever sent without one.
 pub(crate) async fn report_done<H: DriveHost>(
     cx: &mut Ops<'_>,
     meta: &FactMeta,
@@ -196,6 +248,7 @@ pub(crate) async fn report_done<H: DriveHost>(
     let trigger = processing.trigger;
     let initiator = processing.triggered_by.clone();
     let cancel_requested = processing.cancel_requested();
+    let stored_passport = processing.take_passport();
     processing.report_done(meta);
     finish_job(cx, job_id)?;
     let next = usize::try_from(step_index).unwrap_or(0) + 1;
@@ -218,18 +271,56 @@ pub(crate) async fn report_done<H: DriveHost>(
         )?;
         return Ok(());
     }
-    let cause = match launch_step(cx, meta, file, processing, next, trigger, initiator).await? {
-        Some(job_id) => FileCause::ProcessingStarted {
-            job_id,
-            step: i32::try_from(next).unwrap_or(i32::MAX),
-        },
-        None => {
-            conclude::<H>(cx, meta, file).await?;
-            FileCause::ProcessingFinished
-        }
-    };
+    if has_next {
+        let passport = match chain_passport(stored_passport) {
+            Ok(passport) => passport,
+            Err(reason) => {
+                let runner_type = file
+                    .steps
+                    .as_ref()
+                    .and_then(|steps| steps.get(next))
+                    .map(|step| step.runner_type.clone())
+                    .unwrap_or_default();
+                processing.abandon_step(
+                    i32::try_from(next).unwrap_or(i32::MAX),
+                    runner_type,
+                    reason,
+                    meta,
+                );
+                save_processing(cx, file, processing).await?;
+                crate::file::file_changed::<H>(
+                    cx,
+                    file,
+                    FileCause::ProcessingFailed {
+                        reason: reason.to_string(),
+                    },
+                )?;
+                return Ok(());
+            }
+        };
+        let job_id = launch_step(
+            cx, meta, file, processing, next, trigger, initiator, &passport,
+        )
+        .await?
+        .ok_or_else(|| {
+            DriveFault::Engine(EngineError::Config(
+                "a chain's next step vanished under the file's lock".into(),
+            ))
+        })?;
+        save_processing(cx, file, processing).await?;
+        crate::file::file_changed::<H>(
+            cx,
+            file,
+            FileCause::ProcessingStarted {
+                job_id,
+                step: i32::try_from(next).unwrap_or(i32::MAX),
+            },
+        )?;
+        return Ok(());
+    }
+    conclude::<H>(cx, meta, file).await?;
     save_processing(cx, file, processing).await?;
-    crate::file::file_changed::<H>(cx, file, cause)?;
+    crate::file::file_changed::<H>(cx, file, FileCause::ProcessingFinished)?;
     Ok(())
 }
 
@@ -371,5 +462,77 @@ mod tests {
             "the gesture's keys win over the rule's"
         );
         assert_eq!(plan.steps[1].options, serde_json::json!({}));
+    }
+
+    fn human(user: Uuid, impersonator: Option<Uuid>) -> Passport {
+        Passport::human(
+            user,
+            true,
+            true,
+            br_core_auth::AuthMethod::Jwt,
+            impersonator,
+            br_core_auth::PassportClaims::new(),
+        )
+    }
+
+    #[test]
+    fn a_next_step_takes_the_stored_passport_only_when_it_reads_as_one() {
+        let passport = human(Uuid::now_v7(), None);
+        let stored = serde_json::to_value(&passport).unwrap();
+        assert_eq!(chain_passport(Some(stored)), Ok(passport));
+        assert_eq!(chain_passport(None), Err(PASSPORT_MISSING));
+        for unreadable in [
+            serde_json::json!({ "kind": "robot" }),
+            serde_json::json!("a passport"),
+            serde_json::json!({ "kind": "human", "user_id": "not-a-uuid" }),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                chain_passport(Some(unreadable.clone())),
+                Err(PASSPORT_UNREADABLE),
+                "{unreadable}"
+            );
+        }
+    }
+
+    #[test]
+    fn jobs_is_told_the_passports_own_user_and_nobody_under_a_service_passport() {
+        let user = Uuid::now_v7();
+        let named = Initiator {
+            id: user,
+            display_name: Some("Ada".into()),
+        };
+        assert_eq!(
+            triggered_by(&human(user, None), Some(&named)),
+            Some(TriggeredBy::Identified {
+                id: user,
+                display_name: "Ada".into()
+            })
+        );
+        assert_eq!(
+            triggered_by(&human(user, None), None),
+            Some(TriggeredBy::Anonymous(user)),
+            "a chain with no initiator on record still names the passport's user"
+        );
+        let impersonator = Uuid::now_v7();
+        assert_eq!(
+            triggered_by(&human(user, Some(impersonator)), Some(&named)),
+            Some(TriggeredBy::Identified {
+                id: user,
+                display_name: "Ada".into()
+            }),
+            "an impersonated user is the one acted as"
+        );
+        let someone_else = Initiator {
+            id: Uuid::now_v7(),
+            display_name: Some("Grace".into()),
+        };
+        assert_eq!(
+            triggered_by(&human(user, None), Some(&someone_else)),
+            Some(TriggeredBy::Anonymous(user)),
+            "never another person's name beside the passport"
+        );
+        let service = Passport::service(Uuid::now_v7(), br_core_auth::PassportClaims::new());
+        assert_eq!(triggered_by(&service, Some(&named)), None);
     }
 }
