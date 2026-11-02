@@ -20,6 +20,20 @@ pins it; no Rust signature of the host's moves. Its principal's
 `Principal::passport()` must answer the caller's own Passport, as the gateway
 forwarded it: the library now forwards it to Jobs.
 
+### Upgrading from 0.6
+
+- **Deploy a Jobs service ≥ 0.6 first.** An older one has no
+  `job.create.v3` consumer: the first step of every chain would never reach
+  it, and its files would stay `PROCESSING` until cancelled.
+- **Files processing at the upgrade need a reprocess.** Their chain has no
+  stored Passport: the running step's job, created without a Passport, fails
+  on the Jobs side (`passport_required`), and a step that ends anyway leaves
+  its next one `FAILED` `passport_missing`. Either way the file ends
+  `FAILED`; reprocess it once the upgrade is done.
+- The Passport is a snapshot taken at the chain's start (scopes, active and
+  super-user flags): deactivating a user or revoking a scope does not stop a
+  chain already running, unlike an erase.
+
 ### Changed
 
 - **Every step's job is created on `integration.cmd.jobs.job.create.v3`**
@@ -45,9 +59,15 @@ forwarded it: the library now forwards it to Jobs.
   `processing`. Written in the transaction that starts the chain, read back
   for each next step, and set back to `NULL` in the transaction of every end
   of the processing (`READY`, a runner's or Jobs' failure, a cancel, a
-  rejection, a drive frozen; the row goes with a deleted file or drive). It
-  is never written to a fact, a view, a published event or KV entry, nor a
-  log. Additive: a 0.6.x binary ignores the column.
+  rejection, a drive frozen; the row goes with a deleted file or drive). No
+  fact, view, published event or KV entry, nor log holds it; beside the
+  column it is written only in the engine's outbox row of each step's
+  `job.create.v3`, swept after the engine's message retention (published
+  rows about an hour after publication; pending and failed ones longer) and
+  not reached by the erase — Jobs keeps its own copy with the job. The check
+  is added `NOT VALID` (the column is new and `NULL` everywhere), so the
+  migration does not scan the table under its lock; it holds for every
+  write. Additive: a 0.6.x binary ignores the column.
 - **A chain whose Passport is gone stops visibly.** When a next step is due
   and the stored Passport is missing or no longer reads as a Passport, no job
   is sent: the chain stops with the new processing fact
@@ -60,7 +80,9 @@ forwarded it: the library now forwards it to Jobs.
   (`Anonymise` and `Delete`) — their own, and one they hold as its
   impersonator (the Passport's `impersonator`, an administrator who borrowed
   the initiator's session): the chain is not carried on as, nor on behalf of,
-  someone erased, and ends `FAILED` `passport_missing` at its next step. Through 0.6.x it ran
+  someone erased, and ends `FAILED` `passport_missing` at its **next** step;
+  the step running at the erase goes on until its runner reports (its job
+  already carries the Passport). Through 0.6.x it ran
   on, naming nobody.
 - The example host's Jobs double judges creates the way Jobs 0.6 does
   (`job.create.v3` only — a v1 create fails the scenario —,

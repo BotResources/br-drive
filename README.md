@@ -578,14 +578,24 @@ the Passport of its initiator:
   deleted. It exists only while the file is `PROCESSING` (a check constraint
   holds it). A retry by Jobs needs nothing from the library: Jobs keeps its
   own copy with the job;
+- it is a **snapshot** taken when the chain starts: its scopes, its active
+  flag and its super-user flag are frozen for every later step. Deactivating
+  the initiator or revoking a scope does not stop a running chain — its next
+  steps still act under the stored Passport; only an erase of the initiator
+  (or of the impersonator of their session) takes it off the chain;
 - when the next step is due and the stored Passport is missing — a chain
   started before 0.7.0, an initiator erased while it ran — or no longer
   reads as a Passport, the step is never sent: the chain stops there, recorded
   as `StepAbandoned { step_index, runner_type, after_job_id, reason_code }`,
   and the file lands `FAILED` `passport_missing` or `passport_unreadable`
   (`ProcessingFailed { reason }`), open to a reprocess;
-- it is never written anywhere else: not in a fact handed to the host, a
-  view, a published event or KV entry, nor a log.
+- no fact handed to the host, view, published event or KV entry, nor log
+  holds it. Beside the column, it is written only in the engine's outbox row
+  of each step's `job.create.v3` (`service_engine.integration_outbox`),
+  swept after the engine's message retention (a published row about an hour
+  after publication by default; a pending row stays until published, a
+  failed one until its retention passes) and not reached by the erase; Jobs
+  keeps its own copy with the job.
 
 The state is **stored**, one row per processed file (`drive.file_processing`,
 the `drive_file_processing` aggregate, soft-EDA like every library aggregate):
@@ -873,8 +883,10 @@ the engine's `PersonErased` fact. `DriveHost::erase_mode` picks the mode:
   (`drive.file_processing.passport`) is dropped when it is the person's own,
   and when the person is its impersonator (an administrator who borrowed the
   initiator's session — the Passport's `impersonator`): the chain is not
-  carried on as, nor on behalf of, someone erased, and its next step ends it
-  `FAILED` `passport_missing`. The facts naming the person live in the host's
+  carried on as, nor on behalf of, someone erased, and its **next** step ends
+  it `FAILED` `passport_missing`. The step running at the erase is not
+  stopped: its job already carries the Passport, and it runs until its
+  runner reports. The facts naming the person live in the host's
   fact table: their erasure is the host's.
 - `Delete`: every file the person created is deleted (its pages, images and
   label links cascade, its objects are purged through the manifest), then the
