@@ -19,6 +19,7 @@ mod labels;
 mod migration;
 mod migration_0_2;
 mod migration_0_4;
+mod migration_0_7;
 mod pages;
 mod passport;
 mod process_gesture;

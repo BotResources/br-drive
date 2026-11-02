@@ -57,16 +57,24 @@ forwarded it: the library now forwards it to Jobs.
   reprocess. A chain already running when the migration lands has no stored
   Passport: it ends this way at its next step.
 - **The erase drops a running chain's Passport** of the erased person
-  (`Anonymise` and `Delete`): the chain is not carried on as someone erased,
-  and ends `FAILED` `passport_missing` at its next step. Through 0.6.x it ran
+  (`Anonymise` and `Delete`) — their own, and one they hold as its
+  impersonator (the Passport's `impersonator`, an administrator who borrowed
+  the initiator's session): the chain is not carried on as, nor on behalf of,
+  someone erased, and ends `FAILED` `passport_missing` at its next step. Through 0.6.x it ran
   on, naming nobody.
 - The example host's Jobs double judges creates the way Jobs 0.6 does
   (`job.create.v3` only — a v1 create fails the scenario —,
   `passport_required`, `passport_malformed`, `passport_user_mismatch`), and
   the e2e prove that every step's job carries the initiator's Passport and
   names its user, that the column is filled while `PROCESSING` and `NULL`
-  after each kind of end, that no fact records it, and that a chain whose
-  initiator is erased ends `FAILED` `passport_missing` with no job sent.
+  after each kind of end, that no fact records it, that a chain whose
+  initiator — or the impersonator of its initiator's session — is erased ends
+  `FAILED` `passport_missing` with no job sent, that an impersonated session
+  and a service account each start a chain Jobs accepts, and that a chain
+  running on a 0.6 database at the upgrade ends `FAILED` `passport_missing`
+  at its next step. The double records a command Jobs refuses as a breach of
+  its contract (a v1 create, an undecodable command) and fails the scenario
+  on its next read, or at its drop, instead of dying silently.
 
 ## 0.6.5 — 2026-10-23
 

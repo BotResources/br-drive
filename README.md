@@ -869,10 +869,12 @@ the engine's `PersonErased` fact. `DriveHost::erase_mode` picks the mode:
   files, labels, label links and rules, the initiator of the chains they
   started (`drive.file_processing.triggered_by_*`) and the `updated_by` of the
   pages they wrote last is rewritten to `br_drive::REDACTED_PERSON` (the nil
-  UUID); nothing is deleted. The Passport a running chain holds for the
-  person (`drive.file_processing.passport`) is dropped: the chain is not
-  carried on as someone erased, and its next step ends it `FAILED`
-  `passport_missing`. The facts naming the person live in the host's
+  UUID); nothing is deleted. The Passport a running chain acts under
+  (`drive.file_processing.passport`) is dropped when it is the person's own,
+  and when the person is its impersonator (an administrator who borrowed the
+  initiator's session — the Passport's `impersonator`): the chain is not
+  carried on as, nor on behalf of, someone erased, and its next step ends it
+  `FAILED` `passport_missing`. The facts naming the person live in the host's
   fact table: their erasure is the host's.
 - `Delete`: every file the person created is deleted (its pages, images and
   label links cascade, its objects are purged through the manifest), then the
