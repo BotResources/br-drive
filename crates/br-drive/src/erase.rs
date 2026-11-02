@@ -67,6 +67,16 @@ async fn anonymise(conn: &mut PgConnection, person: Uuid) -> Result<u64, EngineE
     .execute(&mut *conn)
     .await?;
     rows += done.rows_affected();
+    // The Passport a running chain of the person acts under goes too: the
+    // chain is not carried on as someone erased — its next step ends FAILED
+    // `passport_missing`. The same row as above, not counted twice.
+    sqlx::query(
+        "UPDATE drive.file_processing SET passport = NULL \
+         WHERE passport ->> 'user_id' = $1",
+    )
+    .bind(person.to_string())
+    .execute(&mut *conn)
+    .await?;
     let done = sqlx::query("UPDATE drive.file_page SET updated_by = $2 WHERE updated_by = $1")
         .bind(person)
         .bind(REDACTED_PERSON)

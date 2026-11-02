@@ -279,8 +279,9 @@ pub fn process_file<'m, H: DriveHost>(
             (None, _) => return Err(DriveFault::Refused(codes::NO_RULESET_MATCHES)),
         };
         let initiator = processing::Initiator::of(cx.principal());
+        let passport = cx.principal().passport().clone();
         let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
-        processing::start_chain(cx, &meta, &mut file, plan, trigger, initiator).await?;
+        processing::start_chain(cx, &meta, &mut file, plan, trigger, initiator, &passport).await?;
         Ok(())
     })
 }
@@ -328,6 +329,7 @@ pub fn regenerate_page<'m, H: DriveHost>(
         }
         debug_assert_eq!(file.processing_state(), ProcessingState::Ready);
         let initiator = processing::Initiator::of(cx.principal());
+        let passport = cx.principal().passport().clone();
         let plan = processing::ChainPlan::from_ruleset(
             &ruleset,
             Some(&serde_json::Value::Object(options)),
@@ -340,6 +342,7 @@ pub fn regenerate_page<'m, H: DriveHost>(
             plan,
             Trigger::RegeneratePage,
             initiator,
+            &passport,
         )
         .await?;
         Ok(())

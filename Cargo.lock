@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "br-drive"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "async-graphql",
  "br-core-auth",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "br-drive-example"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "async-graphql",
  "async-nats",
@@ -613,8 +613,8 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "contract-jobs"
-version = "0.5.1"
-source = "git+https://github.com/BotResources/svc-jobs?tag=contract-jobs%2Fv0.5.1#5e4ff8fd283eaa32f5afbf5a37cb66be62268907"
+version = "0.7.0"
+source = "git+https://github.com/BotResources/svc-jobs?tag=contract-jobs%2Fv0.7.0#fdbc11cb313a175dabc83812b5d8edc9bed89765"
 dependencies = [
  "br-core-integration",
  "chrono",

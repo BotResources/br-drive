@@ -58,7 +58,16 @@ async fn a_commit_starts_the_matching_upload_rule_in_its_own_transaction() {
     ok(&commit(&world, &owner, file_id).await);
 
     // Then: the file is PROCESSING, its first job asked of Jobs — never READY
+    // — acting under the Passport the committer presented
     let create = jobs.await_create(file_id).await;
+    let carried: br_core_auth::Passport =
+        serde_json::from_value(create.passport.clone().expect("the job carries a passport"))
+            .expect("the carried passport decodes");
+    assert_eq!(
+        carried,
+        <br_core_auth::Passport as br_core_auth::PassportHeader>::from_header(&owner).unwrap()
+    );
+    assert!(world.held_passport(file_id).await.is_some());
     let file = world.file(&owner, file_id).await;
     assert_eq!(file["processingState"], "PROCESSING");
     assert_eq!(file["progress"]["stepIndex"], 0);

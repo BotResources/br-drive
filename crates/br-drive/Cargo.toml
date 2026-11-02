@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 async-graphql = { workspace = true }
+br-core-auth = { workspace = true }
 br-core-integration = { workspace = true }
 chrono = { workspace = true }
 contract-jobs = { workspace = true }
@@ -21,6 +22,3 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-
-[dev-dependencies]
-br-core-auth = { workspace = true }

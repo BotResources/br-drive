@@ -245,6 +245,32 @@ impl World {
         .expect("read the file's processing")
     }
 
+    /// The Passport the file's processing holds for its running chain, as
+    /// stored (`drive.file_processing.passport`); `None` without a row or
+    /// once the chain ended.
+    pub async fn held_passport(&self, file_id: Uuid) -> Option<serde_json::Value> {
+        sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT passport FROM drive.file_processing WHERE file_id = $1",
+        )
+        .bind(file_id)
+        .fetch_optional(&self.db.app)
+        .await
+        .expect("read the file's processing passport")
+        .flatten()
+    }
+
+    /// Whether any row the host's fact table holds mentions `needle` — a
+    /// value that must never be recorded (a Passport's claims, say).
+    pub async fn facts_mention(&self, needle: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM workspace_fact f WHERE f::text LIKE '%' || $1 || '%')",
+        )
+        .bind(needle)
+        .fetch_one(&self.db.app)
+        .await
+        .expect("search the host's facts")
+    }
+
     pub async fn await_job(&self, file_id: Uuid) -> Uuid {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {

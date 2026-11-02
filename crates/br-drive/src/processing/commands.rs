@@ -1,5 +1,6 @@
 use br_core_integration::CommandCoords;
-use contract_jobs::command::{CancelJob, CreateJob, FailJob, FinishJob, TriggeredBy};
+use contract_jobs::command::{CancelJob, FailJob, FinishJob, TriggeredBy};
+use contract_jobs::command_v3::CreateJobV3;
 use serde::{Deserialize, Serialize};
 use service_engine::pipeline::OutboundCommand;
 use uuid::Uuid;
@@ -26,10 +27,12 @@ macro_rules! outgoing {
     };
 }
 
+// A root job carries the Passport it acts under: Jobs refuses one without
+// (`passport_required`), and only `job.create` v3 has the field.
 outgoing!(
     JobCreate,
-    CreateJob,
-    contract_jobs::cmd_job_create_v1_coords
+    CreateJobV3,
+    contract_jobs::cmd_job_create_v3_coords
 );
 outgoing!(
     JobFinish,
@@ -43,8 +46,9 @@ outgoing!(
     contract_jobs::cmd_job_cancel_v2_coords
 );
 
-/// The principal whose gesture started a chain; every step of the chain names
-/// it as the job's `triggered_by`.
+/// The principal whose gesture started a chain, as the file's reads show it.
+/// Every step of the chain names the user of the chain's Passport as the job's
+/// `triggered_by`, with this display name when it is that user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Initiator {
     pub id: Uuid,

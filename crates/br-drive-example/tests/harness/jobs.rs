@@ -4,12 +4,14 @@ use std::time::Duration;
 
 use async_nats::jetstream::consumer::pull::Config as PullConfig;
 use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
+use br_core_auth::Passport;
 use br_core_integration::{
     Actor, EventCoords, EventMetadata, IntegrationCommand, IntegrationEvent, ServiceAccountId,
 };
 use chrono::Utc;
 use contract_jobs::catalog::{RunnerType, RunnerTypeLifecycle, runner_type_key};
-use contract_jobs::command::{CancelJob, CreateJob, FailJob, FinishJob};
+use contract_jobs::command::{CancelJob, FailJob, FinishJob};
+use contract_jobs::command_v3::CreateJobV3 as CreateJob;
 use contract_jobs::event::{
     EVENT_TYPE_CANCELLED, EVENT_TYPE_COMPLETED, EVENT_TYPE_CREATION_REJECTED, EVENT_TYPE_FAILED,
     EVENT_TYPE_PLAN_DECLARED, EVENT_TYPE_QUEUED, EVENT_TYPE_STARTED, EVENT_TYPE_STEP_STARTED,
@@ -17,7 +19,7 @@ use contract_jobs::event::{
     JobQueued, JobStarted, JobStepStarted, REASON_DUPLICATE_ACTIVE_ENTITY, REASON_ID_REUSE,
 };
 use contract_jobs::{
-    CMD_JOB_CANCEL_V2, CMD_JOB_CREATE_V1, CMD_JOB_FAIL_V2, CMD_JOB_FINISH_V2,
+    CMD_JOB_CANCEL_V2, CMD_JOB_CREATE_V1, CMD_JOB_CREATE_V3, CMD_JOB_FAIL_V2, CMD_JOB_FINISH_V2,
     evt_job_cancelled_v1_coords, evt_job_completed_v1_coords, evt_job_creation_rejected_v1_coords,
     evt_job_failed_v1_coords, evt_job_plan_declared_v1_coords, evt_job_queued_v1_coords,
     evt_job_started_v1_coords, evt_job_step_started_v1_coords,
@@ -57,9 +59,10 @@ struct Ledger {
     dropping_cancels: bool,
 }
 
-/// The input checks `svc-jobs` runs before the domain (`app/create.rs::build`
-/// and the value objects of `bc-jobs`): UUIDv7 ids, a source named whole and by
-/// its producer, a display name that is not blank and at most 512 characters.
+/// The input checks `svc-jobs` runs before the domain
+/// (`app/create/declare.rs::build` and the value objects of `bc-jobs`): UUIDv7
+/// ids, a source named whole and by its producer, a display name that is not
+/// blank and at most 512 characters, a passport that decodes as a Passport.
 fn malformed(create: &CreateJob) -> Option<(&'static str, &'static str)> {
     let v7 = |id: Uuid| id.get_version_num() == 7;
     if !v7(create.job_id) {
@@ -97,7 +100,31 @@ fn malformed(create: &CreateJob) -> Option<(&'static str, &'static str)> {
             return Some(("value_too_long", "display_name"));
         }
     }
+    if let Some(passport) = &create.passport
+        && serde_json::from_value::<Passport>(passport.clone()).is_err()
+    {
+        return Some(("passport_malformed", "passport"));
+    }
     None
+}
+
+/// The passport checks `bc-jobs` runs after the parent (`resolve_passport`,
+/// `resolve_triggered_by`): a root job without a passport is refused, and a
+/// `triggered_by` that is not the passport's own user — any one beside a
+/// service passport — too.
+fn passport_refusal(create: &CreateJob) -> Option<&'static str> {
+    let Some(document) = &create.passport else {
+        return create
+            .parent_job_id
+            .is_none()
+            .then_some(contract_jobs::event_v2::REASON_PASSPORT_REQUIRED);
+    };
+    let passport: Passport = serde_json::from_value(document.clone()).ok()?;
+    match (&create.triggered_by, passport.user_id()) {
+        (None, _) => None,
+        (Some(given), Some(user)) if given.id() == user => None,
+        _ => Some(contract_jobs::event_v2::REASON_PASSPORT_USER_MISMATCH),
+    }
 }
 
 impl Ledger {
@@ -161,6 +188,9 @@ impl Ledger {
                 }
                 Some(_) => {}
             }
+        }
+        if let Some(code) = passport_refusal(create) {
+            return reject(code, serde_json::Map::new());
         }
         None
     }
@@ -278,7 +308,10 @@ async fn drain(
             serde_json::from_slice(&message.payload).expect("an integration command envelope");
         let payload = envelope.payload;
         let rejection = match subject.as_str() {
-            CMD_JOB_CREATE_V1 => {
+            // A producer still on v1 is a test failure: Jobs ≥ 0.6 refuses
+            // every root job it sends (no passport on v1).
+            CMD_JOB_CREATE_V1 => panic!("a job.create v1 reached jobs: {payload}"),
+            CMD_JOB_CREATE_V3 => {
                 let create: CreateJob =
                     serde_json::from_value(payload.clone()).expect("a job.create decodes");
                 let mut ledger = ledger.lock().expect("the ledger lock");
@@ -332,7 +365,7 @@ async fn drain(
             _ => None,
         };
         // Jobs queues every job it accepts, and says so.
-        if subject == CMD_JOB_CREATE_V1 && rejection.is_none() {
+        if subject == CMD_JOB_CREATE_V3 && rejection.is_none() {
             let create: CreateJob =
                 serde_json::from_value(payload.clone()).expect("a job.create decodes");
             publish_fact(
@@ -551,7 +584,7 @@ impl JobsStandIn {
         let command = IntegrationCommand::new(
             Uuid::now_v7(),
             "job.create",
-            1,
+            3,
             Utc::now(),
             EventMetadata::new(
                 Actor::Service(ServiceAccountId::from(Uuid::now_v7())),
@@ -561,7 +594,7 @@ impl JobsStandIn {
         );
         self.js
             .publish(
-                CMD_JOB_CREATE_V1,
+                CMD_JOB_CREATE_V3,
                 serde_json::to_vec(&command).expect("encode").into(),
             )
             .await
@@ -820,7 +853,7 @@ impl JobsStandIn {
     }
 
     async fn next_create(&self, file_id: Uuid) -> CreateJob {
-        self.await_command::<CreateJob>(CMD_JOB_CREATE_V1, |create| {
+        self.await_command::<CreateJob>(CMD_JOB_CREATE_V3, |create| {
             create.source_entity_id == Some(file_id)
         })
         .await
