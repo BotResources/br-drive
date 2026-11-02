@@ -247,6 +247,11 @@ async fn a_job_create_v1_fails_the_scenario_loudly_instead_of_passing_unseen() {
     // drop would fail the scenario)
     let violations = jobs.take_violations();
     assert_eq!(violations.len(), 1, "{violations:?}");
+    // The v1 create itself may still sit in the inbox: a check that panicked
+    // before its read left it there, one that panicked after consumed it.
+    if let Some((subject, _)) = jobs.next_command(Duration::from_millis(200)).await {
+        assert_eq!(subject, CMD_JOB_CREATE_V1);
+    }
     jobs.expect_no_command(Duration::from_millis(200)).await;
 
     world.cleanup().await;
