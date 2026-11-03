@@ -105,6 +105,7 @@ impl DriveHost for ArchivePrincipal {
     const VISIBILITY_DEPS: Deps = Deps::ALL;
     const SOURCE_ORPHAN_AFTER: Duration = Duration::from_secs(8);
     const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(8);
+    const RENDITION_ORPHAN_AFTER: Duration = Duration::from_secs(8);
     type DriveOwner = br_drive::NoDriveOwner;
 
     fn drive_gate(&self, request: &DriveRequest<'_, Self>) -> Gate {
@@ -161,6 +162,8 @@ pub mod schema {
 
 pub struct ArchiveHost {
     pub db: TestDb,
+    /// The archive's own bucket on the world's object store.
+    pub bucket: String,
     pub base_url: String,
     stop: Arc<tokio::sync::Notify>,
     handle: tokio::task::JoinHandle<Result<(), EngineError>>,
@@ -260,6 +263,7 @@ impl ArchiveHost {
         }
         Self {
             db,
+            bucket,
             base_url: format!("http://{bound}"),
             stop,
             handle,

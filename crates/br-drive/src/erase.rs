@@ -147,6 +147,8 @@ impl<H: DriveHost> Erasable for DriveErasure<H> {
                         Vec::new()
                     };
                     let images = store::image_refs_of_files(cx.connection(), &files).await?;
+                    let renditions =
+                        store::rendition_refs_of_files(cx.connection(), &files).await?;
                     // The erase pipeline has no outbound identity either, so a
                     // running job cannot be cancelled from here: the deleted
                     // file refuses the runner's next call, and the job is
@@ -155,7 +157,7 @@ impl<H: DriveHost> Erasable for DriveErasure<H> {
                     // Jobs, the file being gone).
                     let deleted = store::delete_many::<H>(cx.connection(), &files, None).await?;
                     erased.rows(deleted);
-                    for reference in sources.into_iter().chain(images) {
+                    for reference in sources.into_iter().chain(images).chain(renditions) {
                         erased.purge_blob(BlobRef(reference));
                     }
                     // The erase context is a plain `Ops`: it cannot stage a

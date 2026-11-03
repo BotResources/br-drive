@@ -110,6 +110,10 @@ async fn two_hosts_on_one_broker_each_receive_every_jobs_fact_about_their_own_jo
         config["image_upload_root"],
         "archiveVaultRunnerRequestImageUpload"
     );
+    assert_eq!(
+        config["rendition_upload_root"],
+        "archiveVaultRunnerRequestRenditionUpload"
+    );
     assert_eq!(config["report_root"], "archiveVaultRunnerReport");
     assert_eq!(config["failure_root"], "archiveVaultRunnerReportFailure");
     assert_eq!(config["host"], "archive");

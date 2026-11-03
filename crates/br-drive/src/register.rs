@@ -4,6 +4,7 @@ use service_engine::error::EngineError;
 use crate::catalogue::DriveRunnerTypes;
 use crate::erase::DriveErasure;
 use crate::file::images::{IMAGE_LANDED_DURABLE, ImageLanded, image_landed};
+use crate::file::renditions::{RENDITION_LANDED_DURABLE, RenditionLanded, rendition_landed};
 use crate::file::{
     CancelProcessing, DeleteFile, DriveFiles, DrivePages, EditPage, ProcessFile, RegeneratePage,
     RetitleFile, UpdateFile, cancel_processing, delete_file, edit_page, process_file,
@@ -24,8 +25,9 @@ use crate::ruleset::{
     update_ruleset,
 };
 use crate::runner::{
-    RunnerReport, RunnerReportFailure, RunnerRequestImageUpload, RunnerSources, runner_report,
-    runner_report_failure, runner_request_image_upload,
+    RunnerRenditions, RunnerReport, RunnerReportFailure, RunnerRequestImageUpload,
+    RunnerRequestRenditionUpload, RunnerSources, runner_report, runner_report_failure,
+    runner_request_image_upload, runner_request_rendition_upload,
 };
 use crate::upload::{
     self, CommitUpload, RequestUpload, RequestUploadWithRuleset, UPLOAD_DEADLINE_DURABLE,
@@ -47,6 +49,7 @@ pub fn register<H: DriveHost>(
     engine.register_view(DriveFiles::<H>::default())?;
     engine.register_view(DrivePages::<H>::default())?;
     engine.register_view(RunnerSources::<H>::default())?;
+    engine.register_view(RunnerRenditions::<H>::default())?;
     engine.register_view(DriveRulesets::<H>::default())?;
     engine.register_view(DriveLabels::<H>::default())?;
     engine.register_view(DriveRunnerTypes::<H>::default())?;
@@ -73,6 +76,9 @@ pub fn register<H: DriveHost>(
     engine.register_mutation::<UpdateLabel, _>(update_label::<H>)?;
     engine.register_mutation::<SetFileLabels, _>(set_file_labels::<H>)?;
     engine.register_mutation::<RunnerRequestImageUpload, _>(runner_request_image_upload::<H>)?;
+    engine.register_mutation::<RunnerRequestRenditionUpload, _>(
+        runner_request_rendition_upload::<H>,
+    )?;
     engine.register_mutation::<RunnerReport, _>(runner_report::<H>)?;
     engine.register_mutation::<RunnerReportFailure, _>(runner_report_failure::<H>)?;
     engine.register_bulk::<MoveFolder, _>(folders::move_folder::<H>)?;
@@ -86,6 +92,10 @@ pub fn register<H: DriveHost>(
     engine.register_reaction::<ImageLanded<H>, _, _>(
         &durable(IMAGE_LANDED_DURABLE),
         image_landed::<H>,
+    )?;
+    engine.register_reaction::<RenditionLanded<H>, _, _>(
+        &durable(RENDITION_LANDED_DURABLE),
+        rendition_landed::<H>,
     )?;
     engine.register_reaction::<QueuedFact, _, _>(
         &durable(processing::DURABLE_QUEUED),

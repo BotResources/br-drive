@@ -27,6 +27,7 @@ type DriveFile {
 	pageCount: Int
 	estimatedTokens: Int
 	images: [DriveImage!]!
+	renditions: [DriveRendition!]!
 	labelIds: [UUID!]!
 	rulesetId: UUID
 	steps: [DriveStep!]
@@ -71,6 +72,7 @@ type DriveMutation {
 	workspaceDeleteFile(fileId: UUID!): MutationAck!
 	workspaceEditPage(fileId: UUID!, number: Int!, markdown: String!): MutationAck!
 	workspaceRunnerRequestImageUpload(fileId: UUID!, jobId: UUID!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
+	workspaceRunnerRequestRenditionUpload(fileId: UUID!, jobId: UUID!, name: String!, kind: String!, mediaType: String!, size: ByteCount!, sha256: String!): UploadTicket!
 	workspaceRunnerReport(fileId: UUID!, jobId: UUID!, pages: [ReportedPageInput!]! = [], origin: PageOrigin, summary: String, pageCount: Int, estimatedTokens: Int, done: Boolean! = false): MutationAck!
 	workspaceRunnerReportFailure(fileId: UUID!, jobId: UUID!, reasonCode: String!, message: String): MutationAck!
 	workspaceMoveFolder(driveId: UUID!, oldPrefix: String!, newPrefix: String!): MutationAck!
@@ -105,6 +107,7 @@ type DriveQuery {
 	workspaceRunnerTypes: [DriveRunnerType!]!
 	workspaceLabels: [DriveLabel!]!
 	workspaceFileAccess(fileId: UUID!, name: String): String
+	workspaceRenditionAccess(fileId: UUID!, name: String!): String
 	workspaceRunnerContext(fileId: UUID!, jobId: UUID!): RunnerContext!
 }
 
@@ -113,6 +116,18 @@ type DriveRemove {
 	projector: String!
 	key: JSON!
 	cause: JSON
+}
+
+"""
+A landed rendition of a file: what it is, never its bytes nor a URL
+(`<p>RenditionAccess` mints one).
+"""
+type DriveRendition {
+	name: String!
+	kind: String!
+	mediaType: String!
+	sizeBytes: ByteCount!
+	landedAt: DateTime!
 }
 
 type DriveReset {
@@ -236,6 +251,11 @@ type RunnerContext {
 	summary: String
 	pages: [RunnerPage!]!
 	images: [String!]!
+	"""
+	The file's landed renditions, each with a fresh presigned GET: a later
+	step of the chain reads what an earlier one produced.
+	"""
+	renditions: [RunnerRendition!]!
 	sourceUrl: String
 }
 
@@ -244,6 +264,21 @@ type RunnerPage {
 	markdown: String!
 	origin: PageOrigin!
 	updatedAt: DateTime!
+}
+
+"""
+A landed rendition as a runner reads it: what it is, and a presigned GET
+minted at this call.
+"""
+type RunnerRendition {
+	name: String!
+	kind: String!
+	mediaType: String!
+	sizeBytes: ByteCount!
+	"""
+	A presigned GET, minted at this call.
+	"""
+	url: String!
 }
 
 enum Trigger {

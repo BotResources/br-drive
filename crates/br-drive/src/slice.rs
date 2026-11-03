@@ -1,7 +1,7 @@
 // Every root asks the host's admission first (`DriveHost::admit`, through
 // `admitted_query` / `admitted_mutation` / `admitted_subscription`), before
 // any lookup: a caller the host does not admit gets the host's reason, the
-// same answer whether the id it named exists or not. The four runner roots
+// same answer whether the id it named exists or not. The five runner roots
 // do not ask it: the runner scope is required there before any lookup
 // (`RUNNER_SCOPE_REQUIRED`), and a host refusing service accounts on its
 // human surface must not refuse its own runners.
@@ -135,6 +135,45 @@ macro_rules! drive_slice {
                     )
                 }
 
+                async fn [<$prefix _rendition_access>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    name: ::std::string::String,
+                ) -> ::async_graphql::Result<::core::option::Option<::std::string::String>> {
+                    $crate::admitted_query::<$p>(ctx)?;
+                    let query = ::service_engine::Query::<$p>::new(ctx)?;
+                    let ::core::option::Option::Some(file) =
+                        query.fetch_view::<$crate::DriveFiles<$p>>(&file_id).await?
+                    else {
+                        return ::core::result::Result::Ok(::core::option::Option::None);
+                    };
+                    if let ::core::result::Result::Err(reason) = file
+                        .affordances
+                        .require(::service_engine::gate::ActionName::from_static(
+                            $crate::DOWNLOAD_ACTION,
+                        ))
+                    {
+                        return ::core::result::Result::Err(::service_engine::coded_error(
+                            reason.code(),
+                            "rendition access refused",
+                        ));
+                    }
+                    let ::core::option::Option::Some(rendition) = file.rendition(&name) else {
+                        return ::core::result::Result::Ok(::core::option::Option::None);
+                    };
+                    ::core::result::Result::Ok(
+                        query
+                            .download::<$crate::DriveFiles<$p>>(
+                                &file_id,
+                                ::service_engine::BlobRef(rendition.source),
+                                ::service_engine::blobs::Disposition::Attachment,
+                            )
+                            .await?
+                            .map(|url| url.into_string()),
+                    )
+                }
+
                 async fn [<$prefix _runner_context>](
                     &self,
                     ctx: &::async_graphql::Context<'_>,
@@ -162,6 +201,7 @@ macro_rules! drive_slice {
                         ));
                     };
                     context.source_url = ::core::option::Option::Some(url.into_string());
+                    $crate::presign_renditions::<$p>(&query, job_id, &mut context).await?;
                     ::core::result::Result::Ok(context)
                 }
             }
@@ -499,6 +539,36 @@ macro_rules! drive_slice {
                                 file_id,
                                 job_id,
                                 name,
+                                media_type,
+                                size: size.0,
+                                sha256_hex: sha256,
+                            },
+                        )
+                        .await?
+                        .into_inner(),
+                    )
+                }
+
+                #[allow(clippy::too_many_arguments)]
+                async fn [<$prefix _runner_request_rendition_upload>](
+                    &self,
+                    ctx: &::async_graphql::Context<'_>,
+                    file_id: ::uuid::Uuid,
+                    job_id: ::uuid::Uuid,
+                    name: ::std::string::String,
+                    kind: ::std::string::String,
+                    media_type: ::std::string::String,
+                    size: $crate::ByteCount,
+                    sha256: ::std::string::String,
+                ) -> ::async_graphql::Result<$crate::UploadTicket> {
+                    ::core::result::Result::Ok(
+                        ::service_engine::execute::<$p, $crate::RunnerRequestRenditionUpload>(
+                            ctx,
+                            $crate::RunnerRequestRenditionUpload {
+                                file_id,
+                                job_id,
+                                name,
+                                kind,
                                 media_type,
                                 size: size.0,
                                 sha256_hex: sha256,

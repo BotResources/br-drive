@@ -56,6 +56,10 @@ impl DriveHost for AppPrincipal {
 
     const IMAGE_MAX_BYTES: u64 = 1 << 20;
 
+    const RENDITION_ORPHAN_AFTER: Duration = Duration::from_secs(8);
+
+    const RENDITION_MAX_BYTES: u64 = 2 << 20;
+
     const BULK_RESET_THRESHOLD: usize = 3;
 
     #[cfg(feature = "workspace")]

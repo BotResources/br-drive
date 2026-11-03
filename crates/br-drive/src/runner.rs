@@ -3,18 +3,19 @@ use std::marker::PhantomData;
 
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use service_engine::blobs::{Sha256Digest, UploadExpectation};
+use service_engine::blobs::{Disposition, Sha256Digest, UploadExpectation};
 use service_engine::error::EngineError;
 use service_engine::name::ProjectorName;
-use service_engine::persistence::PersistenceExt;
+use service_engine::persistence::{Aggregate, Persistence, PersistenceExt, PersistenceStyle};
 use service_engine::pipeline::{Mutation, MutationInput, OneShot, Ops};
 use service_engine::population::Population;
 use service_engine::view::{Populate, Projector};
 use service_engine::visibility::Unrestricted;
 use service_engine::{BlobRef, Query};
+use sqlx::PgConnection;
 use uuid::Uuid;
 
-use crate::blob::DriveImage;
+use crate::blob::{DriveImage, DriveRendition};
 use crate::facts::{self, FactMeta};
 use crate::fault::{DriveFault, codes};
 use crate::file::images::{
@@ -23,12 +24,14 @@ use crate::file::images::{
 };
 use crate::file::pages::{Page, PageCause, PageKey, RunnerPage, read_pages};
 use crate::file::processed;
-use crate::file::rendition::{apply_indexing, validate_rendition};
+use crate::file::renditions::{RenditionBlob, RenditionKey, RenditionRecord, landed_renditions_of};
+use crate::file::report::{apply_indexing, validate_report};
 use crate::file::store::{self, FileStore, PageWrite};
-use crate::file::{File, FileCause, FileEvent, FileRow, PageEvent, PageOrigin};
+use crate::file::{ByteCount, File, FileCause, FileEvent, FileRow, PageEvent, PageOrigin};
 use crate::host::DriveHost;
 use crate::image::ImageName;
 use crate::media::MediaType;
+use crate::rendition::{RenditionKind, RenditionName};
 use crate::ruleset::Trigger;
 use crate::upload::UploadTicket;
 
@@ -47,7 +50,26 @@ pub struct RunnerContext {
     pub summary: Option<String>,
     pub pages: Vec<RunnerPage>,
     pub images: Vec<String>,
+    /// The file's landed renditions, each with a fresh presigned GET: a later
+    /// step of the chain reads what an earlier one produced.
+    pub renditions: Vec<RunnerRendition>,
     pub source_url: Option<String>,
+    #[graphql(skip)]
+    pub source: Uuid,
+}
+
+/// A landed rendition as a runner reads it: what it is, and a presigned GET
+/// minted at this call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject)]
+pub struct RunnerRendition {
+    pub name: String,
+    pub kind: String,
+    pub media_type: String,
+    pub size_bytes: ByteCount,
+    /// A presigned GET, minted at this call.
+    // Empty until the slice presigns it; a rendition it cannot presign is
+    // left out of the context.
+    pub url: String,
     #[graphql(skip)]
     pub source: Uuid,
 }
@@ -172,6 +194,171 @@ pub async fn scoped_to_job<F: std::future::Future>(
     RUNNER_JOB.scope(scope, presign).await
 }
 
+/// The file a runner's job names, with the objects of its landed
+/// renditions: the row the rendition presigns of `RunnerContext` are gated
+/// on (`Query::download` admits only a reference the row holds).
+pub struct RunnerFile<H> {
+    pub file: FileRow<H>,
+    pub renditions: Vec<Uuid>,
+}
+
+impl<H> Clone for RunnerFile<H> {
+    fn clone(&self) -> Self {
+        Self {
+            file: self.file.clone(),
+            renditions: self.renditions.clone(),
+        }
+    }
+}
+
+pub struct RunnerFileStore<H>(PhantomData<fn() -> H>);
+
+fn read_only() -> EngineError {
+    EngineError::Config("the runner file store is read-only; writes go through FileStore".into())
+}
+
+impl<H: DriveHost> Persistence for RunnerFileStore<H> {
+    type Aggregate = RunnerFile<H>;
+    type Key = Uuid;
+    type Event = ();
+
+    const STYLE: PersistenceStyle = PersistenceStyle::Crud;
+
+    fn read_many<'a>(
+        conn: &'a mut PgConnection,
+        keys: &'a [Uuid],
+    ) -> BoxFuture<'a, Result<Vec<(Uuid, RunnerFile<H>)>, EngineError>> {
+        Box::pin(async move {
+            let files = FileStore::<H>::read_many(&mut *conn, keys).await?;
+            let mut renditions = landed_renditions_of(&mut *conn, keys).await?;
+            Ok(files
+                .into_iter()
+                .map(|(id, file)| {
+                    let mut own = Vec::new();
+                    renditions.retain(|rendition| {
+                        let mine = rendition.file_id == id;
+                        if mine {
+                            own.push(rendition.blob_ref);
+                        }
+                        !mine
+                    });
+                    (
+                        id,
+                        RunnerFile {
+                            file,
+                            renditions: own,
+                        },
+                    )
+                })
+                .collect())
+        })
+    }
+
+    fn save<'a>(
+        _conn: &'a mut PgConnection,
+        _row: &'a RunnerFile<H>,
+        _events: &'a [()],
+    ) -> BoxFuture<'a, Result<(), EngineError>> {
+        Box::pin(async { Err(read_only()) })
+    }
+
+    fn create<'a>(
+        _conn: &'a mut PgConnection,
+        _row: &'a RunnerFile<H>,
+        _events: &'a [()],
+    ) -> BoxFuture<'a, Result<(), EngineError>> {
+        Box::pin(async { Err(read_only()) })
+    }
+}
+
+impl<H: DriveHost> Aggregate for RunnerFile<H> {
+    type Store = RunnerFileStore<H>;
+
+    fn key(&self) -> Uuid {
+        self.file.id
+    }
+
+    fn blob_refs(&self) -> Vec<BlobRef> {
+        self.renditions.iter().copied().map(BlobRef).collect()
+    }
+}
+
+/// The rendition presigns of a runner: the same gate as the source's
+/// ([`RunnerSources`]) — a runner, inside a runner scope, the job's own file
+/// while that job is its active one — over the file's landed renditions.
+pub struct RunnerRenditions<H>(PhantomData<fn() -> H>);
+
+impl<H> Default for RunnerRenditions<H> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<H> RunnerRenditions<H> {
+    pub const NAME: ProjectorName = ProjectorName::from_static("drive_runner_renditions");
+}
+
+impl<H: DriveHost> Projector for RunnerRenditions<H> {
+    type Principal = H;
+    type Noun = File;
+    type Store = RunnerFileStore<H>;
+    type Query = RunnerWindow;
+    type Out = RunnerSource;
+    type Visibility = Unrestricted<RunnerFile<H>, H, RunnerAccess>;
+
+    const NAME: ProjectorName = Self::NAME;
+
+    async fn populate(
+        cx: &Populate<'_, H>,
+        query: &RunnerWindow,
+    ) -> Result<Population<Uuid>, EngineError> {
+        RunnerSources::<H>::populate(cx, query).await
+    }
+
+    fn project(row: &RunnerFile<H>, _principal: &H) -> Result<RunnerSource, EngineError> {
+        Ok(RunnerSource {
+            file_id: row.file.id,
+        })
+    }
+
+    fn visible(row: &RunnerFile<H>, principal: &H) -> bool {
+        RunnerSources::<H>::visible(&row.file, principal)
+    }
+}
+
+/// Mints a fresh presigned GET on each landed rendition of `context`, behind
+/// the runner rendition gate scoped to `file_id` and `job_id`. A rendition
+/// replaced or gone between the context's read and its presign is left out.
+/// Not a host API: the `drive_slice!` expansion calls it.
+#[doc(hidden)]
+pub async fn presign_renditions<H: DriveHost>(
+    query: &Query<'_, H>,
+    job_id: Uuid,
+    context: &mut RunnerContext,
+) -> async_graphql::Result<()> {
+    let mut presigned = Vec::with_capacity(context.renditions.len());
+    for rendition in std::mem::take(&mut context.renditions) {
+        let url = scoped_to_job(
+            context.file_id,
+            job_id,
+            query.download::<RunnerRenditions<H>>(
+                &context.file_id,
+                BlobRef(rendition.source),
+                Disposition::Inline,
+            ),
+        )
+        .await?;
+        if let Some(url) = url {
+            presigned.push(RunnerRendition {
+                url: url.into_string(),
+                ..rendition
+            });
+        }
+    }
+    context.renditions = presigned;
+    Ok(())
+}
+
 fn runner_only<H: DriveHost>(principal: &H) -> Result<(), DriveFault> {
     if principal.is_runner() {
         Ok(())
@@ -207,6 +394,18 @@ pub async fn runner_context<H: DriveHost>(
                     }
                     let pages = read_pages(&mut *conn, file.id).await?;
                     let images = image_names_of(&mut *conn, file.id).await?;
+                    let renditions = landed_renditions_of(&mut *conn, &[file.id])
+                        .await?
+                        .iter()
+                        .map(|rendition| RunnerRendition {
+                            name: rendition.name.clone(),
+                            kind: rendition.kind.clone(),
+                            media_type: rendition.media_type.clone(),
+                            size_bytes: ByteCount(u64::try_from(rendition.size_bytes).unwrap_or(0)),
+                            url: String::new(),
+                            source: rendition.blob_ref,
+                        })
+                        .collect();
                     Ok(Ok(RunnerContext {
                         file_id: file.id,
                         media_type: file.media_type.as_str().to_string(),
@@ -215,6 +414,7 @@ pub async fn runner_context<H: DriveHost>(
                         summary: file.summary.clone(),
                         pages,
                         images,
+                        renditions,
                         source_url: None,
                         source: file.blob_ref,
                     }))
@@ -356,6 +556,108 @@ pub(crate) async fn stage_image<H: DriveHost>(
     Ok(UploadTicket::new(file.id, blob.upload_url()))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RunnerRequestRenditionUpload {
+    pub file_id: Uuid,
+    pub job_id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub media_type: String,
+    pub size: u64,
+    pub sha256_hex: String,
+}
+
+impl MutationInput for RunnerRequestRenditionUpload {
+    type Output = OneShot<UploadTicket>;
+    type Error = DriveFault;
+    const NAME: &'static str = "drive_runner_request_rendition_upload";
+}
+
+/// A runner hands back a rendition: a verified presigned POST for a
+/// `drive_rendition` blob, and the file's rendition row of that name — a new
+/// one, or the replacement of a landed one, swapped in only when the new
+/// object lands. Same checks as an image: the runner scope, then the file's
+/// running job.
+pub fn runner_request_rendition_upload<'m, H: DriveHost>(
+    cx: &'m mut Mutation<'m, H>,
+    input: RunnerRequestRenditionUpload,
+) -> BoxFuture<'m, Result<OneShot<UploadTicket>, DriveFault>> {
+    Box::pin(async move {
+        runner_only(cx.principal())?;
+        let name = RenditionName::parse(&input.name)
+            .map_err(|_| DriveFault::Refused(codes::INVALID_RENDITION_NAME))?;
+        let kind = RenditionKind::parse(&input.kind)
+            .map_err(|_| DriveFault::Refused(codes::INVALID_RENDITION_KIND))?;
+        let media_type = MediaType::parse(&input.media_type)
+            .map_err(|_| DriveFault::Refused(codes::INVALID_MEDIA_TYPE))?;
+        let digest = Sha256Digest::from_hex(&input.sha256_hex)
+            .map_err(|_| DriveFault::Refused(codes::INVALID_SHA256))?;
+        let size_bytes =
+            i64::try_from(input.size).map_err(|_| DriveFault::Refused(codes::FILE_TOO_LARGE))?;
+        let mut file = cx
+            .load::<FileRow<H>>(&input.file_id)
+            .await?
+            .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
+        file.require_active_job(input.job_id)?;
+        let window = cx.principal().upload_window();
+        let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        let key = RenditionKey {
+            file_id: file.id,
+            name: name.as_str().to_string(),
+        };
+        let now = cx.now().as_datetime();
+        let existing = cx.load::<RenditionRecord<H>>(&key).await?;
+        if existing
+            .as_ref()
+            .is_some_and(|rendition| rendition.is_landing(now, window))
+        {
+            return Err(DriveFault::Refused(codes::RENDITION_UPLOAD_PENDING));
+        }
+        let blob = cx.blob_verified::<DriveRendition>(
+            name.as_str().to_string(),
+            media_type.as_str().to_string(),
+            UploadExpectation::new(input.size, digest),
+        )?;
+        let requested = RenditionBlob {
+            kind: kind.clone(),
+            blob: BlobFacts {
+                blob_ref: blob.reference().as_uuid(),
+                media_type,
+                size_bytes,
+                sha256: *digest.as_bytes(),
+            },
+        };
+        match existing {
+            Some(mut rendition) => {
+                for reference in rendition.request_replacement(requested, now) {
+                    cx.release_blob(BlobRef(reference))?;
+                }
+                cx.save(&rendition).await?;
+            }
+            None => {
+                let rendition = RenditionRecord::<H>::new(file.id, name.clone(), requested, now);
+                cx.create(&rendition).await?;
+            }
+        }
+        file.record(
+            FileEvent::RenditionUploadTicketIssued {
+                name: name.as_str().to_string(),
+                rendition_kind: kind.as_str().to_string(),
+            },
+            &meta,
+        );
+        facts::save(cx, &mut file).await?;
+        crate::file::file_changed::<H>(
+            cx,
+            &file,
+            FileCause::RenditionRequested {
+                name: name.as_str().to_string(),
+            },
+        )?;
+        Ok(OneShot(UploadTicket::new(file.id, blob.upload_url())))
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReportedPage {
     pub number: i32,
@@ -400,7 +702,7 @@ fn validate(input: &RunnerReport) -> Result<(), DriveFault> {
         return Err(DriveFault::Refused(codes::INVALID_PAGE_ORIGIN));
     }
     let numbers: Vec<i32> = input.pages.iter().map(|page| page.number).collect();
-    let indexed = validate_rendition(
+    let indexed = validate_report(
         &numbers,
         input.summary.as_deref(),
         input.page_count,

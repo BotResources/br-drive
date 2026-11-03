@@ -9,6 +9,83 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.8.0 — 2026-11-03
+
+File renditions: a runner hands back a binary file derived from the source (a
+database dump converted into an analytic `.duckdb` file, later a Parquet export
+or a PDF), stored in the host's object storage beside the source, owned by the
+file, read later by a runner or a reader. The markdown pages are the file's
+markdown rendition; every other rendition is a file rendition, an object in
+storage. The library stays content-blind: it stores the bytes and their
+metadata, never reads them.
+
+### Upgrading from 0.7
+
+- Bump the br-drive pin; the engine (`br-service-engine/v0.4.2`) and
+  `contract-jobs` (`v0.7.0`) pins are unchanged.
+- The library registers a third blob kind, `drive_rendition`, and an eleventh
+  reaction, the `rendition-landed` self-command (durable
+  `{SERVICE}-drive-rendition-landed`), which arrives as a service actor like
+  `image-landed`.
+- A host that builds `DriveFile`, `RunnerContext` or `RootNames`
+  values by hand (a test, a mapping) adds the new `renditions` /
+  `rendition_upload_root` fields; a host matching `FileEvent` / `FileCause`
+  exhaustively cannot (both are `#[non_exhaustive]`).
+
+### Added
+
+- **Migration `9121000014_file_rendition`**: the table `drive.file_rendition`,
+  one row per `(file_id, name)` — shaped like `drive.file_image` without
+  `page`, plus `kind` (and `pending_kind`, the kind of a replacement in
+  flight). The row references `drive.file` `ON DELETE CASCADE`. Additive: no
+  existing table or row changes; a 0.7.x binary ignores it.
+- **`<p>RunnerRequestRenditionUpload(fileId, jobId, name, kind, mediaType,
+  size: ByteCount, sha256): UploadTicket!`**: the runner scope, then the file's
+  active job (`JOB_NOT_ACTIVE`), like `<p>RunnerRequestImageUpload`; a
+  verified presigned POST for a `drive_rendition` blob, `FILE_TOO_LARGE` past
+  the new `DriveHost::RENDITION_MAX_BYTES` (default 10 GiB). `name` is
+  `[a-z0-9][a-z0-9._-]*`, 1–64 bytes (`INVALID_RENDITION_NAME`); `kind` is
+  `[a-z][a-z0-9_]*`, up to 32 bytes (`INVALID_RENDITION_KIND`). A name is
+  replaced only when its new object lands — the old object and kind stay
+  current until then, a failed upload changes nothing, the old object is
+  released in the landing's transaction — and a re-request while an upload is
+  in flight is `RENDITION_UPLOAD_PENDING`.
+- **`RunnerContext.renditions[] { name, kind, mediaType, sizeBytes, url }`**:
+  the file's landed renditions, each with a fresh presigned GET at every call,
+  so a later step of the chain reads what an earlier step produced. Gated like
+  the source (`RunnerRenditions`, the runner's own file while its job is the
+  active one).
+- **`DriveFile.renditions[] { name, kind, mediaType, sizeBytes, landedAt }`**
+  (no bytes, no URL) and **`<p>RenditionAccess(fileId, name): String`**, a
+  short-lived presigned GET (attachment) behind the same gate as
+  `<p>FileAccess`: `null` when the caller cannot see the file, for an unknown
+  name and until the object landed; a coded refusal when the `download`
+  affordance is denied.
+- **`DriveHost::RENDITION_MAX_BYTES`** (10 GiB) and
+  **`DriveHost::RENDITION_ORPHAN_AFTER`** (24 h), the `BlobPolicy` of the new
+  kind.
+- **Facts** on the file (`drive_file`): `RenditionUploadTicketIssued { name,
+  rendition_kind }`, `RenditionAvailable { name, rendition_kind }` (first
+  landing), `RenditionReplaced { name, rendition_kind }` (a replacement
+  landed). The field is `rendition_kind` because `kind` is the event's tag.
+  File causes `RenditionRequested { name }` and `RenditionAvailable { name }`.
+- **Job config**: `rendition_upload_root` (`<p>RunnerRequestRenditionUpload`)
+  beside the other roots.
+- Reason codes `INVALID_RENDITION_NAME`, `INVALID_RENDITION_KIND`,
+  `RENDITION_UPLOAD_PENDING`.
+
+### Changed
+
+- **Every path that deletes a file releases its rendition objects
+  explicitly**, in its own transaction — `DeleteFile`, `DeleteFolder`,
+  `delete_drive`, `delete_drive_in_reaction` and the erase in `Delete` mode
+  (purged through the manifest) — as it releases the image objects: the row's
+  `ON DELETE CASCADE` is never seen by the engine's blob accounting. A
+  rendition is **never** dropped at a chain's conclusion: a file whose run
+  reports zero pages keeps its renditions.
+- `file/rendition.rs` is now `file/report.rs` (it validates a runner's page
+  reports; "rendition" now names the new concept). Internal, no API change.
+
 ## 0.7.0 — 2026-11-02
 
 Breaking: the library now needs a Jobs service serving `contract-jobs` 0.7

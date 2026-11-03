@@ -1,4 +1,4 @@
-//! The rules every rendition a runner reports obeys.
+//! The rules every report a runner sends obeys: its pages and its indexing.
 
 use std::collections::HashSet;
 
@@ -6,10 +6,10 @@ use crate::fault::{DriveFault, codes};
 use crate::file::FileRow;
 use crate::runner::MAX_REPORT_PAGES;
 
-/// The rules every rendition a runner reports obeys: at most `MAX_REPORT_PAGES` pages, numbered from 1 and distinct; the summary
+/// The rules every report a runner sends obeys: at most `MAX_REPORT_PAGES` pages, numbered from 1 and distinct; the summary
 /// and the page count together, the token estimate optional and only with
 /// them, none negative. Answers whether the write carries an indexing.
-pub(crate) fn validate_rendition(
+pub(crate) fn validate_report(
     numbers: &[i32],
     summary: Option<&str>,
     page_count: Option<i32>,
@@ -71,22 +71,19 @@ mod tests {
     }
 
     #[test]
-    fn a_rendition_write_is_bounded_numbered_and_indexed_as_a_pair() {
+    fn a_report_is_bounded_numbered_and_indexed_as_a_pair() {
         let many: Vec<i32> = (1..=513).collect();
         assert_eq!(
-            code(validate_rendition(&many, None, None, None)),
+            code(validate_report(&many, None, None, None)),
             "BATCH_TOO_LARGE"
         );
+        assert_eq!(code(validate_report(&many[..512], None, None, None)), "OK");
         assert_eq!(
-            code(validate_rendition(&many[..512], None, None, None)),
-            "OK"
-        );
-        assert_eq!(
-            code(validate_rendition(&[0], None, None, None)),
+            code(validate_report(&[0], None, None, None)),
             "INVALID_PAGE"
         );
         assert_eq!(
-            code(validate_rendition(&[2, 2], None, None, None)),
+            code(validate_report(&[2, 2], None, None, None)),
             "INVALID_PAGE"
         );
         for (summary, count, tokens) in [
@@ -95,27 +92,24 @@ mod tests {
             (None, None, Some(1)),
         ] {
             assert_eq!(
-                code(validate_rendition(&[], summary, count, tokens)),
+                code(validate_report(&[], summary, count, tokens)),
                 "INDEXER_FIELDS_TOGETHER",
                 "{summary:?} {count:?} {tokens:?}"
             );
         }
         assert_eq!(
-            code(validate_rendition(&[], Some("s"), Some(-1), None)),
+            code(validate_report(&[], Some("s"), Some(-1), None)),
             "INVALID_INDEXER_VALUE"
         );
         assert_eq!(
-            code(validate_rendition(&[], Some("s"), Some(1), Some(-1))),
+            code(validate_report(&[], Some("s"), Some(1), Some(-1))),
             "INVALID_INDEXER_VALUE"
         );
         assert!(matches!(
-            validate_rendition(&[1], Some("s"), Some(1), None),
+            validate_report(&[1], Some("s"), Some(1), None),
             Ok(true)
         ));
-        assert!(matches!(
-            validate_rendition(&[1], None, None, None),
-            Ok(false)
-        ));
+        assert!(matches!(validate_report(&[1], None, None, None), Ok(false)));
     }
 
     #[test]

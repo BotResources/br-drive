@@ -11,6 +11,7 @@ use crate::host::DriveHost;
 pub struct RootNames {
     pub context_root: String,
     pub image_upload_root: String,
+    pub rendition_upload_root: String,
     pub report_root: String,
     pub failure_root: String,
 }
@@ -22,6 +23,7 @@ impl RootNames {
         Ok(Self {
             context_root: format!("{camel}RunnerContext"),
             image_upload_root: format!("{camel}RunnerRequestImageUpload"),
+            rendition_upload_root: format!("{camel}RunnerRequestRenditionUpload"),
             report_root: format!("{camel}RunnerReport"),
             failure_root: format!("{camel}RunnerReportFailure"),
         })
@@ -75,6 +77,10 @@ mod tests {
         let roots = RootNames::for_prefix("my_host").unwrap();
         assert_eq!(roots.context_root, "myHostRunnerContext");
         assert_eq!(roots.image_upload_root, "myHostRunnerRequestImageUpload");
+        assert_eq!(
+            roots.rendition_upload_root,
+            "myHostRunnerRequestRenditionUpload"
+        );
         assert_eq!(roots.report_root, "myHostRunnerReport");
         assert_eq!(roots.failure_root, "myHostRunnerReportFailure");
         assert!(RootNames::for_prefix("Bad_Prefix").is_err());

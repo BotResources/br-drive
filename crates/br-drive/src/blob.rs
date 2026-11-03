@@ -7,6 +7,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::file::images::{ImageLanded, image_of_blob};
+use crate::file::renditions::{RenditionLanded, rendition_of_blob};
 use crate::file::{File, FileCause};
 use crate::host::DriveHost;
 
@@ -20,6 +21,25 @@ pub struct DriveImage;
 
 impl Blobs for DriveImage {
     const KIND: &'static str = "drive_image";
+}
+
+pub struct DriveRendition;
+
+impl Blobs for DriveRendition {
+    const KIND: &'static str = "drive_rendition";
+}
+
+pub fn rendition_available<'a, H: DriveHost>(
+    uploaded: Uploaded<'a>,
+    ps: &'a mut PostSave<'_, '_>,
+) -> BoxFuture<'a, Result<(), PostUpload>> {
+    Box::pin(async move {
+        let reference = uploaded.reference.as_uuid();
+        if let Some(key) = rendition_of_blob(ps.connection(), reference).await? {
+            ps.command(RenditionLanded::<H>::new(key, reference))?;
+        }
+        Ok(())
+    })
 }
 
 pub fn image_available<'a, H: DriveHost>(
@@ -71,5 +91,11 @@ pub fn register<P: DriveHost>(
     })?;
     engine.register_post_upload_policy::<DriveImage, _>(image_available::<P>)?;
     engine.require_post_upload_policy::<DriveImage>()?;
+    engine.register_blobs::<DriveRendition>(service_engine::BlobPolicy {
+        max_bytes: P::RENDITION_MAX_BYTES,
+        orphan_after: P::RENDITION_ORPHAN_AFTER,
+    })?;
+    engine.register_post_upload_policy::<DriveRendition, _>(rendition_available::<P>)?;
+    engine.require_post_upload_policy::<DriveRendition>()?;
     Ok(())
 }
