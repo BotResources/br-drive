@@ -133,7 +133,8 @@ pub trait DriveHost: Principal {
 
     /// The largest file rendition a runner may hand back
     /// (`<p>RunnerRequestRenditionUpload`, `FILE_TOO_LARGE` past it).
-    const RENDITION_MAX_BYTES: u64 = 10 << 30;
+    /// 5 GiB: a single presigned POST is capped at 5 GB on AWS S3.
+    const RENDITION_MAX_BYTES: u64 = 5 << 30;
 
     /// How long a released or never-landed rendition object waits before the
     /// engine's reaper deletes it from storage.

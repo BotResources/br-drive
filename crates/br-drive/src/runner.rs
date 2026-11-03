@@ -24,7 +24,9 @@ use crate::file::images::{
 };
 use crate::file::pages::{Page, PageCause, PageKey, RunnerPage, read_pages};
 use crate::file::processed;
-use crate::file::renditions::{RenditionBlob, RenditionKey, RenditionRecord, landed_renditions_of};
+use crate::file::renditions::{
+    LandedRendition, RenditionBlob, RenditionKey, RenditionRecord, landed_renditions_of,
+};
 use crate::file::report::{apply_indexing, validate_report};
 use crate::file::store::{self, FileStore, PageWrite};
 use crate::file::{ByteCount, File, FileCause, FileEvent, FileRow, PageEvent, PageOrigin};
@@ -67,12 +69,12 @@ pub struct RunnerRendition {
     pub media_type: String,
     pub size_bytes: ByteCount,
     /// A presigned GET, minted at this call.
-    // Empty until the slice presigns it; a rendition it cannot presign is
-    // left out of the context.
     pub url: String,
-    #[graphql(skip)]
-    pub source: Uuid,
 }
+
+/// How many times a presign is retried on a rendition replaced while it is
+/// signed: each retry follows a landing that swapped the name's object.
+const RENDITION_PRESIGN_ATTEMPTS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerSource {
@@ -199,7 +201,7 @@ pub async fn scoped_to_job<F: std::future::Future>(
 /// on (`Query::download` admits only a reference the row holds).
 pub struct RunnerFile<H> {
     pub file: FileRow<H>,
-    pub renditions: Vec<Uuid>,
+    pub renditions: Vec<LandedRendition>,
 }
 
 impl<H> Clone for RunnerFile<H> {
@@ -234,14 +236,10 @@ impl<H: DriveHost> Persistence for RunnerFileStore<H> {
             Ok(files
                 .into_iter()
                 .map(|(id, file)| {
-                    let mut own = Vec::new();
-                    renditions.retain(|rendition| {
-                        let mine = rendition.file_id == id;
-                        if mine {
-                            own.push(rendition.blob_ref);
-                        }
-                        !mine
-                    });
+                    let (own, others) = std::mem::take(&mut renditions)
+                        .into_iter()
+                        .partition(|rendition| rendition.file_id == id);
+                    renditions = others;
                     (
                         id,
                         RunnerFile {
@@ -279,7 +277,10 @@ impl<H: DriveHost> Aggregate for RunnerFile<H> {
     }
 
     fn blob_refs(&self) -> Vec<BlobRef> {
-        self.renditions.iter().copied().map(BlobRef).collect()
+        self.renditions
+            .iter()
+            .map(|rendition| BlobRef(rendition.blob_ref))
+            .collect()
     }
 }
 
@@ -326,33 +327,84 @@ impl<H: DriveHost> Projector for RunnerRenditions<H> {
     }
 }
 
-/// Mints a fresh presigned GET on each landed rendition of `context`, behind
-/// the runner rendition gate scoped to `file_id` and `job_id`. A rendition
-/// replaced or gone between the context's read and its presign is left out.
-/// Not a host API: the `drive_slice!` expansion calls it.
+/// The landed renditions of the runner's file, read behind the runner
+/// rendition gate; `None` once the job is no longer the file's active one or
+/// the file is gone.
+async fn gated_renditions<H: DriveHost>(
+    query: &Query<'_, H>,
+    file_id: Uuid,
+    job_id: Uuid,
+) -> async_graphql::Result<Option<Vec<LandedRendition>>> {
+    let row = scoped_to_job(
+        file_id,
+        job_id,
+        query.load_visible::<RunnerRenditions<H>>(&file_id),
+    )
+    .await?;
+    Ok(row.map(|row| row.renditions))
+}
+
+/// Fills `context.renditions` with every landed rendition of the file, each
+/// with a fresh presigned GET, behind the runner rendition gate scoped to the
+/// file and `job_id`. The list is read once from the gated row; a rendition
+/// replaced between that read and its presign (the gate then holds only the
+/// new object) is re-read and its current object signed, so a landed
+/// rendition is never left out. Not a host API: the `drive_slice!` expansion
+/// calls it.
 #[doc(hidden)]
 pub async fn presign_renditions<H: DriveHost>(
     query: &Query<'_, H>,
     job_id: Uuid,
     context: &mut RunnerContext,
 ) -> async_graphql::Result<()> {
-    let mut presigned = Vec::with_capacity(context.renditions.len());
-    for rendition in std::mem::take(&mut context.renditions) {
-        let url = scoped_to_job(
-            context.file_id,
-            job_id,
-            query.download::<RunnerRenditions<H>>(
-                &context.file_id,
-                BlobRef(rendition.source),
-                Disposition::Inline,
-            ),
-        )
-        .await?;
-        if let Some(url) = url {
-            presigned.push(RunnerRendition {
-                url: url.into_string(),
-                ..rendition
-            });
+    let file_id = context.file_id;
+    let not_active = || DriveFault::Refused(codes::JOB_NOT_ACTIVE).into_graphql();
+    let landed = gated_renditions(query, file_id, job_id)
+        .await?
+        .ok_or_else(not_active)?;
+    let mut presigned = Vec::with_capacity(landed.len());
+    for mut rendition in landed {
+        let mut attempts = 0;
+        loop {
+            let url = scoped_to_job(
+                file_id,
+                job_id,
+                query.download::<RunnerRenditions<H>>(
+                    &file_id,
+                    BlobRef(rendition.blob_ref),
+                    Disposition::Inline,
+                ),
+            )
+            .await?;
+            if let Some(url) = url {
+                presigned.push(RunnerRendition {
+                    name: rendition.name.clone(),
+                    kind: rendition.kind.clone(),
+                    media_type: rendition.media_type.clone(),
+                    size_bytes: ByteCount(u64::try_from(rendition.size_bytes).unwrap_or(0)),
+                    url: url.into_string(),
+                });
+                break;
+            }
+            attempts += 1;
+            if attempts >= RENDITION_PRESIGN_ATTEMPTS {
+                return Err(service_engine::coded_error(
+                    codes::SOURCE_NOT_AVAILABLE.code(),
+                    "a rendition kept changing while it was presigned; retry",
+                ));
+            }
+            // Replaced since the read: sign the name's current object.
+            let current = gated_renditions(query, file_id, job_id)
+                .await?
+                .ok_or_else(not_active)?;
+            match current
+                .into_iter()
+                .find(|fresh| fresh.name == rendition.name)
+            {
+                Some(fresh) => rendition = fresh,
+                // A rendition is only ever gone with its file.
+                None => break,
+            }
         }
     }
     context.renditions = presigned;
@@ -394,18 +446,6 @@ pub async fn runner_context<H: DriveHost>(
                     }
                     let pages = read_pages(&mut *conn, file.id).await?;
                     let images = image_names_of(&mut *conn, file.id).await?;
-                    let renditions = landed_renditions_of(&mut *conn, &[file.id])
-                        .await?
-                        .iter()
-                        .map(|rendition| RunnerRendition {
-                            name: rendition.name.clone(),
-                            kind: rendition.kind.clone(),
-                            media_type: rendition.media_type.clone(),
-                            size_bytes: ByteCount(u64::try_from(rendition.size_bytes).unwrap_or(0)),
-                            url: String::new(),
-                            source: rendition.blob_ref,
-                        })
-                        .collect();
                     Ok(Ok(RunnerContext {
                         file_id: file.id,
                         media_type: file.media_type.as_str().to_string(),
@@ -414,7 +454,9 @@ pub async fn runner_context<H: DriveHost>(
                         summary: file.summary.clone(),
                         pages,
                         images,
-                        renditions,
+                        // Read and presigned behind their own gate by
+                        // `presign_renditions`.
+                        renditions: Vec::new(),
                         source_url: None,
                         source: file.blob_ref,
                     }))

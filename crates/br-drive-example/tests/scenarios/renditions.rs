@@ -16,8 +16,8 @@ use crate::harness::runner::{
 };
 use crate::harness::upload::{Ticket, UploadRequest, post_bytes, sha256_hex, upload_processed};
 use crate::harness::{
-    Fact, JobsStandIn, World, drive_subscription, error_code, manager_passport, next_drive_delta,
-    ok, passport, service_passport,
+    Fact, JobsStandIn, World, WorldOptions, drive_subscription, error_code, manager_passport,
+    next_drive_delta, ok, passport, service_passport,
 };
 use crate::poll_until;
 
@@ -762,4 +762,93 @@ async fn archive_upload(world: &World, archive: &ArchiveHost, owner: &str, drive
             .await);
     }
     file_id
+}
+
+#[tokio::test]
+async fn a_first_upload_that_never_lands_stays_unlisted_and_its_reaped_object_is_released_harmlessly()
+ {
+    // Given: a short upload window, and a runner that asks for a rendition
+    // and never posts its bytes
+    let world = World::start_with(
+        "pod-rendition-never-landed",
+        WorldOptions {
+            upload_window: Duration::from_secs(2),
+            ..WorldOptions::default()
+        },
+    )
+    .await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let owner = passport(Uuid::now_v7());
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    install_render_rule(&world, &manager_passport(Uuid::now_v7(), "Ada")).await;
+    let drive = world.create_workspace(&owner, "library").await;
+    let (file_id, job_id) = file_with_job(&world, &jobs, &owner, drive, "", "dump.txt").await;
+    ok(&request_rendition(&world, &runner, file_id, job_id, NAME, "duckdb", DUCKDB).await);
+    ok(&request_rendition(
+        &world,
+        &runner,
+        file_id,
+        job_id,
+        "never.duckdb",
+        "duckdb",
+        DUCKDB,
+    )
+    .await);
+    let (abandoned, _, _, _) = world.rendition_row(file_id, NAME).await.unwrap();
+    let (never, _, _, _) = world.rendition_row(file_id, "never.duckdb").await.unwrap();
+
+    // When: the engine reaper drops the blobs nobody uploaded, past
+    // RENDITION_ORPHAN_AFTER
+    for reference in [abandoned, never] {
+        poll_until!(Duration::from_secs(30), {
+            world.blob_state(reference).await.is_none().then_some(())
+        });
+    }
+
+    // Then: the renditions are listed nowhere and readable by nobody, as an
+    // image that never landed
+    assert_eq!(
+        world.file(&owner, file_id).await["renditions"],
+        serde_json::json!([])
+    );
+    assert!(access_url(&world.rendition_access(&owner, file_id, NAME).await).is_none());
+    let context_renditions = ok(&context(&world, &runner, file_id, job_id).await)
+        ["workspaceRunnerContext"]["renditions"]
+        .clone();
+    assert_eq!(context_renditions, serde_json::json!([]));
+
+    // When: the runner asks again for the first name past the upload window,
+    // and this time posts the bytes
+    let key = upload_rendition(&world, &runner, file_id, job_id, NAME, "duckdb", DUCKDB).await;
+    let (landed, _, _, _) = poll_until!(Duration::from_secs(15), {
+        world
+            .rendition_row(file_id, NAME)
+            .await
+            .filter(|(_, _, _, landed)| *landed)
+    });
+
+    // Then: the new object replaced the reaped one and serves the bytes —
+    // releasing a blob the reaper already dropped changed nothing
+    assert_ne!(landed, abandoned);
+    assert!(world.blob_state(abandoned).await.is_none());
+    let url = access_url(&world.rendition_access(&owner, file_id, NAME).await)
+        .expect("the re-requested rendition is readable");
+    assert_eq!(get(&world, &url).await, DUCKDB);
+
+    // When: the file is deleted with its never-landed rendition row
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!){workspaceDeleteFile(fileId:$f){success}}",
+            serde_json::json!({ "f": file_id }),
+        )
+        .await);
+
+    // Then: the delete succeeds, the reaped blob stays gone, and the landed
+    // object leaves storage
+    assert!(world.file(&owner, file_id).await.is_null());
+    assert!(world.blob_state(never).await.is_none());
+    world.await_object_gone(landed, &key).await;
+
+    world.cleanup().await;
 }

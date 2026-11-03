@@ -103,6 +103,13 @@ impl<H> RenditionRecord<H> {
     /// Stages `blob` for this name; answers the blob references it drops: an
     /// abandoned pending upload, or a first object that never landed. A
     /// landed object stays current until `blob` lands.
+    ///
+    /// As for an image, a first upload that never lands keeps its row (never
+    /// listed, never readable) until a re-request replaces it or its file
+    /// goes; the engine reaper drops its blob past `RENDITION_ORPHAN_AFTER`.
+    /// Releasing such a reference afterwards is harmless: the engine's
+    /// release is an `UPDATE … WHERE id = $1`, which matches no row once the
+    /// reaper deleted it.
     pub fn request_replacement(&mut self, blob: RenditionBlob, at: DateTime<Utc>) -> Vec<Uuid> {
         let mut released = Vec::new();
         if let Some(stale) = self.pending.take() {

@@ -136,7 +136,19 @@ impl<H: DriveHost> Erasable for DriveErasure<H> {
             let mut erased = Erased::new();
             let person = person.as_uuid();
             if H::erase_mode() == EraseMode::Delete {
-                let files = files_created_by(cx.connection(), person).await?;
+                let candidates = files_created_by(cx.connection(), person).await?;
+                // Lock the files first, as every writer of a file's images and
+                // renditions does (a runner's upload request, a landing swap):
+                // a writer committing between the read of the object refs below
+                // and the DELETE would otherwise add a ref the cascade drops
+                // without it ever reaching the purge — an object leaked in
+                // storage. Under the locks, the refs read are all there are.
+                let files: Vec<Uuid> = cx
+                    .load_many::<FileRow<H>>(&candidates)
+                    .await?
+                    .iter()
+                    .map(|file| file.id)
+                    .collect();
                 if !files.is_empty() {
                     // The erase pipeline runs without the blob handle, so the
                     // objects go through the manifest's purge, not a release.

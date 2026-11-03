@@ -43,7 +43,7 @@ metadata, never reads them.
   size: ByteCount, sha256): UploadTicket!`**: the runner scope, then the file's
   active job (`JOB_NOT_ACTIVE`), like `<p>RunnerRequestImageUpload`; a
   verified presigned POST for a `drive_rendition` blob, `FILE_TOO_LARGE` past
-  the new `DriveHost::RENDITION_MAX_BYTES` (default 10 GiB). `name` is
+  the new `DriveHost::RENDITION_MAX_BYTES` (default 5 GiB, the AWS S3 cap on a single presigned POST). `name` is
   `[a-z0-9][a-z0-9._-]*`, 1–64 bytes (`INVALID_RENDITION_NAME`); `kind` is
   `[a-z][a-z0-9_]*`, up to 32 bytes (`INVALID_RENDITION_KIND`). A name is
   replaced only when its new object lands — the old object and kind stay
@@ -52,7 +52,9 @@ metadata, never reads them.
   in flight is `RENDITION_UPLOAD_PENDING`.
 - **`RunnerContext.renditions[] { name, kind, mediaType, sizeBytes, url }`**:
   the file's landed renditions, each with a fresh presigned GET at every call,
-  so a later step of the chain reads what an earlier step produced. Gated like
+  so a later step of the chain reads what an earlier step produced; a
+  rendition replaced while it is presigned is re-read and its current object
+  signed, never left out. Gated like
   the source (`RunnerRenditions`, the runner's own file while its job is the
   active one).
 - **`DriveFile.renditions[] { name, kind, mediaType, sizeBytes, landedAt }`**
@@ -61,7 +63,7 @@ metadata, never reads them.
   `<p>FileAccess`: `null` when the caller cannot see the file, for an unknown
   name and until the object landed; a coded refusal when the `download`
   affordance is denied.
-- **`DriveHost::RENDITION_MAX_BYTES`** (10 GiB) and
+- **`DriveHost::RENDITION_MAX_BYTES`** (5 GiB, the AWS S3 cap on a single presigned POST) and
   **`DriveHost::RENDITION_ORPHAN_AFTER`** (24 h), the `BlobPolicy` of the new
   kind.
 - **Facts** on the file (`drive_file`): `RenditionUploadTicketIssued { name,
@@ -79,7 +81,10 @@ metadata, never reads them.
 - **Every path that deletes a file releases its rendition objects
   explicitly**, in its own transaction — `DeleteFile`, `DeleteFolder`,
   `delete_drive`, `delete_drive_in_reaction` and the erase in `Delete` mode
-  (purged through the manifest) — as it releases the image objects: the row's
+  (purged through the manifest; the erase now locks the person's files
+  before reading their object refs, as every other delete path already does,
+  so a concurrent upload request or landing cannot slip a ref past the
+  purge) — as it releases the image objects: the row's
   `ON DELETE CASCADE` is never seen by the engine's blob accounting. A
   rendition is **never** dropped at a chain's conclusion: a file whose run
   reports zero pages keeps its renditions.
