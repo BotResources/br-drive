@@ -36,6 +36,9 @@ pub mod codes {
     pub const INVALID_INDEXER_VALUE: Reason = Reason::new("INVALID_INDEXER_VALUE");
     pub const BATCH_TOO_LARGE: Reason = Reason::new("BATCH_TOO_LARGE");
     pub const IMAGE_UPLOAD_PENDING: Reason = Reason::new("IMAGE_UPLOAD_PENDING");
+    pub const INVALID_RENDITION_NAME: Reason = Reason::new("INVALID_RENDITION_NAME");
+    pub const INVALID_RENDITION_KIND: Reason = Reason::new("INVALID_RENDITION_KIND");
+    pub const RENDITION_UPLOAD_PENDING: Reason = Reason::new("RENDITION_UPLOAD_PENDING");
     pub const KEY_REUSED: Reason = Reason::new("KEY_REUSED");
     pub const RULESET_NOT_FOUND: Reason = Reason::new("RULESET_NOT_FOUND");
     pub const RULESET_NAME_TAKEN: Reason = Reason::new("RULESET_NAME_TAKEN");

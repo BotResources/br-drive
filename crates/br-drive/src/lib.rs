@@ -16,6 +16,7 @@ mod owner;
 mod path;
 mod processing;
 mod register;
+mod rendition;
 mod ruleset;
 mod runner;
 mod slice;
@@ -28,7 +29,7 @@ use service_engine::LibraryMigrations;
 
 #[doc(hidden)]
 pub use admission::{admitted_mutation, admitted_query, admitted_subscription};
-pub use blob::{DriveImage as DriveImageBlob, DriveSource};
+pub use blob::{DriveImage as DriveImageBlob, DriveRendition as DriveRenditionBlob, DriveSource};
 pub use catalogue::{
     CatalogueWatch, DriveRunnerType, DriveRunnerTypeLifecycle, DriveRunnerTypes, KnownRunnerType,
     RunnerTypeAccess, RunnerTypeStore, known_runner_types, watch_runner_types,
@@ -51,6 +52,10 @@ pub use file::{
     REGENERATE_PAGE_ACTION, RegeneratePage, RetitleFile, RunnerPage, UnknownDbValue, UpdateFile,
     drive_of, references_image, set_metadata,
 };
+pub use file::{
+    DriveRendition, LandedRendition, RENDITION_LANDED_AGGREGATE, RENDITION_LANDED_DURABLE,
+    RENDITION_LANDED_VERB, RenditionBlob, RenditionKey, RenditionLanded, RenditionRecord,
+};
 pub use folders::{DeleteFolder, MoveFolder};
 pub use host::{DRIVE_DIM, DriveHost, DriveRequest, SCOPES_CLAIM};
 pub use image::{ImageName, InvalidImageName, MAX_IMAGE_NAME_BYTES};
@@ -71,6 +76,10 @@ pub use processing::{
     RootNames, RunProgress, durable, ignored_because, job_event,
 };
 pub use register::register;
+pub use rendition::{
+    InvalidRenditionKind, InvalidRenditionName, MAX_RENDITION_KIND_BYTES, MAX_RENDITION_NAME_BYTES,
+    RenditionKind, RenditionName,
+};
 pub use ruleset::{
     ANY_MEDIA_TYPE, CreateRuleset, DeleteRuleset, DriveRuleset, DriveRulesets, DriveStep,
     MAX_RULESET_NAME_BYTES, MAX_RULESET_STEPS, MAX_RUNNER_TYPE_BYTES, RULESET_EVENT_VERSION,
@@ -79,8 +88,10 @@ pub use ruleset::{
 };
 pub use runner::{
     MAX_FAILURE_MESSAGE_BYTES, MAX_FAILURE_REASON_BYTES, MAX_REPORT_PAGES, ReportedPage,
-    ReportedPageInput, RunnerContext, RunnerReport, RunnerReportFailure, RunnerRequestImageUpload,
-    RunnerSource, RunnerSources, RunnerWindow, runner_context, scoped_to_job,
+    ReportedPageInput, RunnerContext, RunnerFile, RunnerFileStore, RunnerRendition,
+    RunnerRenditions, RunnerReport, RunnerReportFailure, RunnerRequestImageUpload,
+    RunnerRequestRenditionUpload, RunnerSource, RunnerSources, RunnerWindow, presign_renditions,
+    runner_context, scoped_to_job,
 };
 pub use title::{FileTitle, InvalidTitle, MAX_TITLE_CHARS};
 pub use upload::{CommitUpload, RequestUpload, RequestUploadWithRuleset, UploadTicket};

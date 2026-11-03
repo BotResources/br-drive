@@ -113,6 +113,14 @@ pub enum FileCause {
     ImagesDropped {
         names: Vec<String>,
     },
+    /// A runner was issued an upload ticket for a rendition.
+    RenditionRequested {
+        name: String,
+    },
+    /// A rendition's object landed, first or as a replacement.
+    RenditionAvailable {
+        name: String,
+    },
     ReportStored {
         job_id: Uuid,
         done: bool,
@@ -219,6 +227,24 @@ pub enum FileEvent {
     ImagesDropped {
         names: Vec<String>,
     },
+    /// A runner was issued a presigned upload ticket for a rendition (since
+    /// 0.8.0). A rendition already landed under that name stays current
+    /// until the new object lands.
+    RenditionUploadTicketIssued {
+        name: String,
+        rendition_kind: String,
+    },
+    /// A rendition's first object landed: it is readable (since 0.8.0).
+    RenditionAvailable {
+        name: String,
+        rendition_kind: String,
+    },
+    /// A rendition's replacement landed: it is current, and the object it
+    /// replaces is released (since 0.8.0).
+    RenditionReplaced {
+        name: String,
+        rendition_kind: String,
+    },
     /// A runner's report stored an indexing.
     ReportStored {
         job_id: Uuid,
@@ -256,6 +282,9 @@ impl crate::facts::DriveEvent for FileEvent {
             Self::ImageUploadTicketIssued { .. } => "ImageUploadTicketIssued",
             Self::ImageAvailable { .. } => "ImageAvailable",
             Self::ImagesDropped { .. } => "ImagesDropped",
+            Self::RenditionUploadTicketIssued { .. } => "RenditionUploadTicketIssued",
+            Self::RenditionAvailable { .. } => "RenditionAvailable",
+            Self::RenditionReplaced { .. } => "RenditionReplaced",
             Self::ReportStored { .. } => "ReportStored",
             Self::Deleted => "Deleted",
             Self::FolderDeleted { .. } => "FolderDeleted",

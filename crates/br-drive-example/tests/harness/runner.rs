@@ -104,7 +104,8 @@ pub async fn context(
         .gql(
             runner,
             "query($f:UUID!,$j:UUID!){workspaceRunnerContext(fileId:$f,jobId:$j){fileId mediaType \
-             name pageCount summary sourceUrl images pages{number markdown origin}}}",
+             name pageCount summary sourceUrl images pages{number markdown origin} \
+             renditions{name kind mediaType sizeBytes url}}}",
             serde_json::json!({ "f": file_id, "j": job_id }),
         )
         .await
@@ -148,6 +149,56 @@ pub async fn request_image(
             }),
         )
         .await
+}
+
+pub async fn request_rendition(
+    world: &World,
+    runner: &str,
+    file_id: Uuid,
+    job_id: Uuid,
+    name: &str,
+    kind: &str,
+    bytes: &[u8],
+) -> serde_json::Value {
+    world
+        .gql(
+            runner,
+            "mutation($f:UUID!,$j:UUID!,$n:String!,$k:String!,$m:String!,$s:ByteCount!,$h:String!){\
+             workspaceRunnerRequestRenditionUpload(fileId:$f,jobId:$j,name:$n,kind:$k,mediaType:$m,size:$s,sha256:$h)\
+             {fileId url fields}}",
+            serde_json::json!({
+                "f": file_id,
+                "j": job_id,
+                "n": name,
+                "k": kind,
+                "m": "application/octet-stream",
+                "s": bytes.len(),
+                "h": sha256_hex(bytes),
+            }),
+        )
+        .await
+}
+
+pub fn rendition_ticket(response: &serde_json::Value) -> Ticket {
+    image_ticket_of(response, "workspaceRunnerRequestRenditionUpload")
+}
+
+/// Requests a rendition and posts its bytes; answers the ticket's object key.
+pub async fn upload_rendition(
+    world: &World,
+    runner: &str,
+    file_id: Uuid,
+    job_id: Uuid,
+    name: &str,
+    kind: &str,
+    bytes: &[u8],
+) -> String {
+    let ticket = rendition_ticket(
+        &request_rendition(world, runner, file_id, job_id, name, kind, bytes).await,
+    );
+    let status = super::upload::post_bytes(world, &ticket, bytes, name).await;
+    assert!((200..300).contains(&status), "{name} lands: {status}");
+    ticket.fields["key"].as_str().unwrap().to_string()
 }
 
 pub fn image_ticket(response: &serde_json::Value) -> Ticket {

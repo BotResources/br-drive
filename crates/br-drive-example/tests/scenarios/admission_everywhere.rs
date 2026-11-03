@@ -89,6 +89,10 @@ const ROOTS: &[(&str, &str)] = &[
         "query($f:UUID!){workspaceFileAccess(fileId:$f)}",
     ),
     (
+        "workspaceRenditionAccess",
+        "query($f:UUID!){workspaceRenditionAccess(fileId:$f,name:\"base.duckdb\")}",
+    ),
+    (
         "workspaceRequestUpload",
         "mutation($f:UUID!,$d:UUID!){workspaceRequestUpload(fileId:$f,driveId:$d,path:\"\",\
          name:\"late.txt\",mediaType:\"text/plain\",size:3,\
@@ -175,6 +179,12 @@ const RUNNER_ROOTS: &[(&str, &str)] = &[
         "workspaceRunnerRequestImageUpload",
         "mutation($f:UUID!,$j:UUID!){workspaceRunnerRequestImageUpload(fileId:$f,jobId:$j,\
          name:\"p1.png\",mediaType:\"image/png\",size:3,\
+         sha256:\"0000000000000000000000000000000000000000000000000000000000000000\"){fileId}}",
+    ),
+    (
+        "workspaceRunnerRequestRenditionUpload",
+        "mutation($f:UUID!,$j:UUID!){workspaceRunnerRequestRenditionUpload(fileId:$f,jobId:$j,\
+         name:\"base.duckdb\",kind:\"duckdb\",mediaType:\"application/octet-stream\",size:3,\
          sha256:\"0000000000000000000000000000000000000000000000000000000000000000\"){fileId}}",
     ),
     (

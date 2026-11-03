@@ -136,7 +136,19 @@ impl<H: DriveHost> Erasable for DriveErasure<H> {
             let mut erased = Erased::new();
             let person = person.as_uuid();
             if H::erase_mode() == EraseMode::Delete {
-                let files = files_created_by(cx.connection(), person).await?;
+                let candidates = files_created_by(cx.connection(), person).await?;
+                // Lock the files first, as every writer of a file's images and
+                // renditions does (a runner's upload request, a landing swap):
+                // a writer committing between the read of the object refs below
+                // and the DELETE would otherwise add a ref the cascade drops
+                // without it ever reaching the purge — an object leaked in
+                // storage. Under the locks, the refs read are all there are.
+                let files: Vec<Uuid> = cx
+                    .load_many::<FileRow<H>>(&candidates)
+                    .await?
+                    .iter()
+                    .map(|file| file.id)
+                    .collect();
                 if !files.is_empty() {
                     // The erase pipeline runs without the blob handle, so the
                     // objects go through the manifest's purge, not a release.
@@ -147,6 +159,8 @@ impl<H: DriveHost> Erasable for DriveErasure<H> {
                         Vec::new()
                     };
                     let images = store::image_refs_of_files(cx.connection(), &files).await?;
+                    let renditions =
+                        store::rendition_refs_of_files(cx.connection(), &files).await?;
                     // The erase pipeline has no outbound identity either, so a
                     // running job cannot be cancelled from here: the deleted
                     // file refuses the runner's next call, and the job is
@@ -155,7 +169,7 @@ impl<H: DriveHost> Erasable for DriveErasure<H> {
                     // Jobs, the file being gone).
                     let deleted = store::delete_many::<H>(cx.connection(), &files, None).await?;
                     erased.rows(deleted);
-                    for reference in sources.into_iter().chain(images) {
+                    for reference in sources.into_iter().chain(images).chain(renditions) {
                         erased.purge_blob(BlobRef(reference));
                     }
                     // The erase context is a plain `Ops`: it cannot stage a

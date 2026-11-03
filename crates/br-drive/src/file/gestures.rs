@@ -224,10 +224,11 @@ pub fn delete_file<'m, H: DriveHost>(
         file.delete_gate(cx.principal()).require()?;
         processing::cancel_active_job(cx, &file)?;
         let images = store::image_refs_of_files(cx.connection(), &[file.id]).await?;
+        let renditions = store::rendition_refs_of_files(cx.connection(), &[file.id]).await?;
         let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
         store::hand_gone::<H>(cx.connection(), &meta, &file, FileEvent::Deleted).await?;
         cx.delete(&file).await?;
-        for reference in images {
+        for reference in images.into_iter().chain(renditions) {
             cx.release_blob(BlobRef(reference))?;
         }
         crate::file::file_changed::<H>(cx, &file, FileCause::Deleted)?;

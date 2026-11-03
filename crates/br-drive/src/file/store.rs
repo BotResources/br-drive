@@ -453,6 +453,31 @@ pub async fn image_refs_of_files(
         .collect())
 }
 
+/// The objects of the renditions of `files`, landed or in flight: every
+/// path deleting a file releases them, as the row's cascade never reaches
+/// the engine's blob accounting.
+pub async fn rendition_refs_of_files(
+    conn: &mut PgConnection,
+    ids: &[Uuid],
+) -> Result<Vec<Uuid>, EngineError> {
+    let rows = sqlx::query(
+        "SELECT blob_ref, pending_blob_ref FROM drive.file_rendition WHERE file_id = ANY($1)",
+    )
+    .bind(ids)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .iter()
+        .flat_map(|row| {
+            [
+                Some(row.get::<Uuid, _>("blob_ref")),
+                row.get::<Option<Uuid>, _>("pending_blob_ref"),
+            ]
+        })
+        .flatten()
+        .collect())
+}
+
 /// The files of `drives`, at most `limit` of them: a window binds its
 /// populate's ceiling, a gesture over a whole drive binds `i64::MAX`.
 pub async fn ids_in_drives(

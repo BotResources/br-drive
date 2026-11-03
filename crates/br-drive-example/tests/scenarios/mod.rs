@@ -25,6 +25,7 @@ mod passport;
 mod process_gesture;
 mod processing;
 mod processing_counts;
+mod renditions;
 mod replay;
 mod reprocessing;
 mod retract;

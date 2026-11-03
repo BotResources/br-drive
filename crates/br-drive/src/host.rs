@@ -131,6 +131,15 @@ pub trait DriveHost: Principal {
 
     const IMAGE_ORPHAN_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
+    /// The largest file rendition a runner may hand back
+    /// (`<p>RunnerRequestRenditionUpload`, `FILE_TOO_LARGE` past it).
+    /// 5 GiB: a single presigned POST is capped at 5 GB on AWS S3.
+    const RENDITION_MAX_BYTES: u64 = 5 << 30;
+
+    /// How long a released or never-landed rendition object waits before the
+    /// engine's reaper deletes it from storage.
+    const RENDITION_ORPHAN_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
     /// The host's own noun whose objects are keyed by the drive's id (a drive
     /// is created from its `DriveOwnerNoun::Object` and takes its key), or
     /// `br_drive::NoDriveOwner`. Every file change the library stages also
@@ -169,7 +178,8 @@ pub trait DriveHost: Principal {
     /// hook existed.
     ///
     /// The runner operations (`<p>RunnerContext`, `<p>RunnerReport`,
-    /// `<p>RunnerReportFailure`, `<p>RunnerRequestImageUpload`) do not ask it:
+    /// `<p>RunnerReportFailure`, `<p>RunnerRequestImageUpload`,
+    /// `<p>RunnerRequestRenditionUpload`) do not ask it:
     /// they are the runner's surface, refused to any caller without the host's
     /// [`DriveHost::RUNNER_SCOPE`] (`RUNNER_SCOPE_REQUIRED`) before any lookup,
     /// so a host that refuses service accounts here keeps its runners working.

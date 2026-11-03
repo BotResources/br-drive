@@ -139,6 +139,10 @@ async fn the_ruleset_chain_runs_step_by_step_over_jobs_facts_and_lands_ready() {
         config["image_upload_root"],
         "workspaceRunnerRequestImageUpload"
     );
+    assert_eq!(
+        config["rendition_upload_root"],
+        "workspaceRunnerRequestRenditionUpload"
+    );
     assert_eq!(config["report_root"], "workspaceRunnerReport");
     assert_eq!(config["failure_root"], "workspaceRunnerReportFailure");
     assert_eq!(config["step"], 0);

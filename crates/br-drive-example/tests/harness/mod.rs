@@ -154,7 +154,8 @@ impl World {
                 passport,
                 "query($id:UUID!){workspaceFile(fileId:$id){id driveId path name title metadata \
                  mediaType sizeBytes sha256 processingState processingError summary pageCount \
-                 estimatedTokens images{name mediaType sizeBytes page} labelIds rulesetId \
+                 estimatedTokens images{name mediaType sizeBytes page} \
+                 renditions{name kind mediaType sizeBytes landedAt} labelIds rulesetId \
                  steps{runnerType options} progress{stepIndex stepCount runnerType plan \
                  currentIndex currentLabel at} affordances createdBy updatedAt}}",
                 serde_json::json!({ "id": file_id }),
@@ -187,6 +188,49 @@ impl World {
         .fetch_optional(&self.db.app)
         .await
         .expect("read the image row")
+    }
+
+    /// A rendition's row: its current blob, its pending one, its kind, and
+    /// whether the current one landed.
+    pub async fn rendition_row(
+        &self,
+        file_id: Uuid,
+        name: &str,
+    ) -> Option<(Uuid, Option<Uuid>, String, bool)> {
+        sqlx::query_as(
+            "SELECT blob_ref, pending_blob_ref, kind, landed_at IS NOT NULL \
+             FROM drive.file_rendition WHERE file_id = $1 AND name = $2",
+        )
+        .bind(file_id)
+        .bind(name)
+        .fetch_optional(&self.db.app)
+        .await
+        .expect("read the rendition row")
+    }
+
+    pub async fn rendition_access(
+        &self,
+        passport: &str,
+        file_id: Uuid,
+        name: &str,
+    ) -> serde_json::Value {
+        self.gql(
+            passport,
+            "query($id:UUID!,$n:String!){workspaceRenditionAccess(fileId:$id,name:$n)}",
+            serde_json::json!({ "id": file_id, "n": name }),
+        )
+        .await
+    }
+
+    /// Waits until the reaper deleted the object of `reference` from storage
+    /// and dropped its blob row.
+    pub async fn await_object_gone(&self, reference: Uuid, object_key: &str) {
+        crate::poll_until!(Duration::from_secs(30), {
+            (!self.object_exists(object_key).await).then_some(())
+        });
+        crate::poll_until!(Duration::from_secs(10), {
+            self.blob_state(reference).await.is_none().then_some(())
+        });
     }
 
     pub async fn drive_files(&self, passport: &str, drive: Uuid) -> Vec<serde_json::Value> {
@@ -789,7 +833,7 @@ pub fn error_code(response: &serde_json::Value) -> String {
 pub const DRIVE_DELTAS: &str = "subscription($d:UUID!){workspaceDriveChanged(driveId:$d){\
     __typename \
     ... on DriveReset{revision views{... on DriveFile{id path name title processingState labelIds}}} \
-    ... on DriveUpsert{revision cause view{... on DriveFile{id path name title metadata processingState processingError affordances summary pageCount estimatedTokens images{name page} labelIds rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
+    ... on DriveUpsert{revision cause view{... on DriveFile{id path name title metadata processingState processingError affordances summary pageCount estimatedTokens images{name page} renditions{name kind sizeBytes} labelIds rulesetId progress{stepIndex stepCount runnerType plan currentIndex currentLabel}}}} \
     ... on DriveRemove{revision projector key cause}}}";
 
 pub const LABEL_DELTAS: &str = "subscription{workspaceLabelsChanged{\

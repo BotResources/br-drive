@@ -5,7 +5,8 @@ mod gestures;
 pub(crate) mod images;
 pub(crate) mod pages;
 pub(crate) mod processed;
-pub(crate) mod rendition;
+pub(crate) mod renditions;
+pub(crate) mod report;
 pub(crate) mod store;
 mod view;
 
@@ -29,7 +30,13 @@ pub use pages::{
     DrivePage, DrivePages, EDIT_PAGE_ACTION, PAGE_EVENT_VERSION, Page, PageCause, PageEvent,
     PageKey, PageWindow, REGENERATE_PAGE_ACTION, RunnerPage,
 };
-pub use view::{ByteCount, DriveFile, DriveFiles, DriveImage, DriveProgress, DriveWindow};
+pub use renditions::{
+    LandedRendition, RENDITION_LANDED_AGGREGATE, RENDITION_LANDED_DURABLE, RENDITION_LANDED_VERB,
+    RenditionBlob, RenditionKey, RenditionLanded, RenditionRecord,
+};
+pub use view::{
+    ByteCount, DriveFile, DriveFiles, DriveImage, DriveProgress, DriveRendition, DriveWindow,
+};
 
 #[cfg(test)]
 pub(crate) mod tests_support {

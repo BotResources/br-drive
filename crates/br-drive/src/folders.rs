@@ -81,7 +81,7 @@ pub(crate) async fn delete_rows<H: DriveHost>(
 
 /// Deletes `files` in any pipeline, each one's last fact `gone` handed to the
 /// host under `meta`: one set-based statement, the running job of each file
-/// cancelled, every source and image object released.
+/// cancelled, every source, image and rendition object released.
 pub(crate) async fn delete_rows_as<H: DriveHost>(
     cx: &mut Ops<'_>,
     meta: &FactMeta,
@@ -90,6 +90,7 @@ pub(crate) async fn delete_rows_as<H: DriveHost>(
 ) -> Result<(), DriveFault> {
     let ids: Vec<Uuid> = files.iter().map(|file| file.id).collect();
     let images = store::image_refs_of_files(cx.connection(), &ids).await?;
+    let renditions = store::rendition_refs_of_files(cx.connection(), &ids).await?;
     store::delete_many::<H>(cx.connection(), &ids, Some((meta, gone))).await?;
     for file in files {
         crate::processing::cancel_active_job(cx, file)?;
@@ -97,7 +98,7 @@ pub(crate) async fn delete_rows_as<H: DriveHost>(
             cx.release_blob(reference)?;
         }
     }
-    for reference in images {
+    for reference in images.into_iter().chain(renditions) {
         cx.release_blob(BlobRef(reference))?;
     }
     Ok(())

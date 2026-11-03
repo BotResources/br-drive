@@ -19,6 +19,7 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use super::aggregate::{File, FileRow, ProcessingState, drive_memberships};
+use super::renditions::{LandedRendition, landed_renditions_of};
 use super::store::{self, FILE_FROM, file_select, row_to_file};
 use crate::host::{DRIVE_DIM, DriveHost};
 use crate::ruleset::DriveStep;
@@ -116,6 +117,8 @@ pub struct ImageSummary {
 pub struct FileView<H> {
     pub file: FileRow<H>,
     pub images: Vec<ImageSummary>,
+    /// The file's landed renditions, by name.
+    pub renditions: Vec<LandedRendition>,
     pub label_ids: Vec<Uuid>,
 }
 
@@ -124,6 +127,7 @@ impl<H> Clone for FileView<H> {
         Self {
             file: self.file.clone(),
             images: self.images.clone(),
+            renditions: self.renditions.clone(),
             label_ids: self.label_ids.clone(),
         }
     }
@@ -148,6 +152,7 @@ async fn load_views<H: DriveHost>(
             row_to_file(row).map(|file| FileView {
                 file,
                 images: Vec::new(),
+                renditions: Vec::new(),
                 label_ids: Vec::new(),
             })
         })
@@ -162,6 +167,7 @@ async fn load_views<H: DriveHost>(
     .bind(keys)
     .fetch_all(&mut *conn)
     .await?;
+    let renditions = landed_renditions_of(&mut *conn, keys).await?;
     let mut labels = crate::label::label_ids_of_files(&mut *conn, keys).await?;
     for view in &mut views {
         if let Some(ids) = labels.remove(&view.file.id) {
@@ -178,6 +184,14 @@ async fn load_views<H: DriveHost>(
                 page: row.get("page"),
                 blob_ref: row.get("blob_ref"),
             });
+        }
+    }
+    for rendition in renditions {
+        if let Some(view) = views
+            .iter_mut()
+            .find(|view| view.file.id == rendition.file_id)
+        {
+            view.renditions.push(rendition);
         }
     }
     Ok(views)
@@ -234,6 +248,11 @@ impl<H: DriveHost> Aggregate for FileView<H> {
     fn blob_refs(&self) -> Vec<BlobRef> {
         std::iter::once(BlobRef(self.file.blob_ref))
             .chain(self.images.iter().map(|image| BlobRef(image.blob_ref)))
+            .chain(
+                self.renditions
+                    .iter()
+                    .map(|rendition| BlobRef(rendition.blob_ref)),
+            )
             .collect()
     }
 }
@@ -265,6 +284,32 @@ pub struct DriveImage {
     pub source: Uuid,
 }
 
+/// A landed rendition of a file: what it is, never its bytes nor a URL
+/// (`<p>RenditionAccess` mints one).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject)]
+pub struct DriveRendition {
+    pub name: String,
+    pub kind: String,
+    pub media_type: String,
+    pub size_bytes: ByteCount,
+    pub landed_at: DateTime<Utc>,
+    #[graphql(skip)]
+    pub source: Uuid,
+}
+
+impl From<&LandedRendition> for DriveRendition {
+    fn from(rendition: &LandedRendition) -> Self {
+        Self {
+            name: rendition.name.clone(),
+            kind: rendition.kind.clone(),
+            media_type: rendition.media_type.clone(),
+            size_bytes: ByteCount(u64::try_from(rendition.size_bytes).unwrap_or(0)),
+            landed_at: rendition.landed_at,
+            source: rendition.blob_ref,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject)]
 pub struct DriveProgress {
     pub step_index: i32,
@@ -293,6 +338,7 @@ pub struct DriveFile {
     pub page_count: Option<i32>,
     pub estimated_tokens: Option<i64>,
     pub images: Vec<DriveImage>,
+    pub renditions: Vec<DriveRendition>,
     pub label_ids: Vec<Uuid>,
     pub ruleset_id: Option<Uuid>,
     pub steps: Option<Vec<DriveStep>>,
@@ -312,6 +358,12 @@ impl DriveFile {
 
     pub fn image(&self, name: &str) -> Option<&DriveImage> {
         self.images.iter().find(|image| image.name == name)
+    }
+
+    pub fn rendition(&self, name: &str) -> Option<&DriveRendition> {
+        self.renditions
+            .iter()
+            .find(|rendition| rendition.name == name)
     }
 }
 
@@ -432,6 +484,7 @@ impl<H: DriveHost> Projector for DriveFiles<H> {
                     source: image.blob_ref,
                 })
                 .collect(),
+            renditions: view.renditions.iter().map(DriveRendition::from).collect(),
             label_ids: view.label_ids.clone(),
             ruleset_id: row.ruleset_id,
             steps: row
