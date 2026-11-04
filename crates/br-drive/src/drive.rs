@@ -260,11 +260,20 @@ pub async fn freeze_drive<H: DriveHost>(
             frozen.abandoned += 1;
             continue;
         }
-        let Some(job_id) = file.active_job().map(|job| job.job_id) else {
+        let Some(job_id) = file.processing_job().map(|job| job.job_id) else {
             // It settled between the read and the lock.
             continue;
         };
         let mut processing = crate::processing::load_processing(ops, &file).await?;
+        if processing.held_job_id().is_some() {
+            // The last job was reported done and the next step waits for
+            // Jobs to end it: nothing runs to cancel, the held step is
+            // skipped and never created.
+            let next = usize::try_from(processing.step_index).unwrap_or(0) + 1;
+            crate::processing::skip_next_step(ops, meta, &mut file, &mut processing, next).await?;
+            frozen.cancelled += 1;
+            continue;
+        }
         processing.cancel_on_freeze(meta);
         ops.command(crate::processing::JobCancel {
             payload: CancelJob { job_id },

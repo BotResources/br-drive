@@ -417,15 +417,22 @@ pub(crate) async fn visible_file_keys<H: DriveHost>(
 }
 
 /// Where the running chain is, while the file is PROCESSING: the step of
-/// the file's active job, and what that job's runner said of its run.
+/// the file's active job, and what that job's runner said of its run — or,
+/// while the next step is held until Jobs ends the job reported done, that
+/// next step, nothing run yet.
 fn progress_of<H>(row: &FileRow<H>) -> Option<DriveProgress> {
-    let job = row.active_job()?;
+    let job = row.processing_job()?;
     let steps = row.steps.as_deref().unwrap_or_default();
     let run = job.progress();
+    let step_index = if job.reported_done() {
+        job.step_index.saturating_add(1)
+    } else {
+        job.step_index
+    };
     Some(DriveProgress {
-        step_index: job.step_index,
+        step_index,
         step_count: i32::try_from(steps.len()).unwrap_or(i32::MAX),
-        runner_type: usize::try_from(job.step_index)
+        runner_type: usize::try_from(step_index)
             .ok()
             .and_then(|index| steps.get(index))
             .map(|step| step.runner_type.clone())

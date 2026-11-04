@@ -376,7 +376,9 @@ pub fn cancel_processing<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.cancel_processing_gate(cx.principal()).require()?;
-        let Some(job_id) = file.active_job().map(|job| job.job_id) else {
+        // The job reported done whose next step is held is still the one a
+        // cancel is about: Jobs settles it, and its end skips the held step.
+        let Some(job_id) = file.processing_job().map(|job| job.job_id) else {
             return Err(DriveFault::Refused(codes::FILE_NOT_PROCESSING));
         };
         let mut processing = processing::load_processing(cx, &file).await?;

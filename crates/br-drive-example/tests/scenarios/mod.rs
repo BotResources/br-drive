@@ -5,6 +5,7 @@ mod bulk;
 mod cancellation;
 mod capacity;
 mod cascade;
+mod chain_handoff;
 mod commit_processing;
 mod concurrency;
 mod erase;

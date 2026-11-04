@@ -866,9 +866,10 @@ pub fn runner_report<'m, H: DriveHost>(
         for cause in causes {
             crate::file::file_changed::<H>(cx, &file, cause)?;
         }
-        // The final report ends the job, here: the chain moves on in this
-        // transaction and Jobs is told (`job.finish`); its `completed` then
-        // only confirms it.
+        // The final report ends the job, here, and Jobs is told
+        // (`job.finish`): past the last step the chain ends in this
+        // transaction; before it, the next step is held and Jobs' own end of
+        // this job creates it.
         if input.done {
             let mut processing = crate::processing::load_processing(cx, &file).await?;
             crate::processing::report_done(cx, &meta, &mut file, &mut processing).await?;

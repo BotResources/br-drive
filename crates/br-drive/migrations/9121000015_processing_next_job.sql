@@ -1,0 +1,17 @@
+-- The next step of a chain, held until Jobs ends the previous one (0.8.1).
+-- Jobs enforces one live job per source entity (the file) and consumes
+-- `job.finish` and `job.create` on separate, unordered durables: a next
+-- step's `job.create` staged in the transaction of the previous step's final
+-- report could be judged before that report's `job.finish` was applied, and
+-- refused `duplicate_active_entity`. So the final report of a step that has a
+-- next one mints the next job's id and holds it here, and the `job.create`
+-- is staged only when Jobs' own end of the previous job (`completed`, or a
+-- `failed` / `cancelled` it settled first) reaches the library.
+--   next_job_id  the minted id of the next step's job, not yet asked of Jobs;
+--                set only while the file is `processing` and its last job
+--                (`job_id`) was reported done; NULL otherwise
+-- Additive: no existing row changes (NULL everywhere). A 0.8.0 binary ignores
+-- the column: a file holding a next step when such a binary takes over never
+-- gets it created. Let the held steps drain (none is held longer than Jobs
+-- takes to answer a `job.finish`) before going back.
+ALTER TABLE drive.file_processing ADD COLUMN next_job_id uuid;

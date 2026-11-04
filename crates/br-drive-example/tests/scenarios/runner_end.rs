@@ -299,7 +299,7 @@ async fn a_runners_declared_failure_fails_the_file_with_its_code_and_tells_jobs(
 #[tokio::test]
 async fn a_jobs_failure_after_the_runners_final_report_changes_nothing() {
     // Given: a two-step rule, and a file whose first step's runner sent its
-    // final report — the second step runs
+    // final report — Jobs completed it and the second step runs
     let world = World::start("pod-runner-done-then-failed").await;
     let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");
@@ -342,6 +342,7 @@ async fn a_jobs_failure_after_the_runners_final_report_changes_nothing() {
     )
     .await);
     jobs.await_finish(first).await;
+    jobs.complete(first).await;
     let second = jobs.await_create(file_id).await.job_id;
     let running = world.await_state(&owner, file_id, "PROCESSING").await;
     assert_eq!(running["progress"]["stepIndex"], 1);
@@ -349,7 +350,7 @@ async fn a_jobs_failure_after_the_runners_final_report_changes_nothing() {
     quiet(&mut files).await;
 
     // When: Jobs says the first job failed (a finish it refused, a late
-    // backstop) — and cancelled, and completed
+    // backstop) — and cancelled, and completed again
     let late = [
         jobs.fail(first, "RUN_TIMED_OUT", Some("too_slow")).await,
         jobs.cancel(first).await,
