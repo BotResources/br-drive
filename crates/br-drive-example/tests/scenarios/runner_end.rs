@@ -297,9 +297,11 @@ async fn a_runners_declared_failure_fails_the_file_with_its_code_and_tells_jobs(
 }
 
 #[tokio::test]
-async fn a_jobs_failure_after_the_runners_final_report_changes_nothing() {
+async fn a_jobs_failure_after_the_hand_off_to_the_next_step_changes_nothing() {
     // Given: a two-step rule, and a file whose first step's runner sent its
-    // final report — Jobs completed it and the second step runs
+    // final report — Jobs completed it and the second step runs. (A Jobs
+    // `failed` arriving instead of `completed`, while the next step is held,
+    // releases that step: `chain_handoff::a_jobs_failure_of_the_job_reported_done_still_hands_off_to_the_next_step`.)
     let world = World::start("pod-runner-done-then-failed").await;
     let jobs = JobsStandIn::attach(&world).await;
     let manager = manager_passport(Uuid::now_v7(), "Ada");

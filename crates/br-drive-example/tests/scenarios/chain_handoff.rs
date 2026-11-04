@@ -5,6 +5,11 @@
 //! So the final report of a step that has a next one only decides that step —
 //! its job id minted and held (`NextStepHeld`) — and the `job.create` is sent
 //! once Jobs itself ended the previous job (since 0.8.1).
+//!
+//! The Jobs stand-in settles the commands it reads in order, so it never
+//! refuses that create: these scenarios prove instead that no `job.create`
+//! is sent before Jobs' end of the previous job, rather than replaying the
+//! race itself.
 
 use std::time::Duration;
 
@@ -13,7 +18,7 @@ use uuid::Uuid;
 use crate::harness::runner::{
     INDEX, RENDER, RUNNER_SCOPE, Report, RuleSpec, context, create_ruleset, report,
 };
-use crate::harness::upload::{UploadRequest, upload_processed};
+use crate::harness::upload::{UploadRequest, process, upload_processed};
 use crate::harness::{
     Fact, JobsStandIn, World, drive_subscription, error_code, manager_passport, next_drive_delta,
     ok, passport, refute_delta, service_passport,
@@ -280,7 +285,7 @@ async fn a_replayed_completed_creates_the_next_step_once() {
 }
 
 #[tokio::test]
-async fn a_cancel_between_the_final_report_and_jobs_completed_skips_the_next_step() {
+async fn a_cancel_between_the_final_report_and_jobs_completed_skips_the_next_step_at_once() {
     // Given: a two-step chain whose first step was reported done, its next
     // step held until Jobs completes the first job
     let Chain {
@@ -301,25 +306,17 @@ async fn a_cancel_between_the_final_report_and_jobs_completed_skips_the_next_ste
         .gql(&owner, CANCEL, serde_json::json!({ "f": file_id }))
         .await);
 
-    // Then: the cancel is about the job reported done — Jobs, which settled
-    // it, changes nothing — and the file still waits for Jobs
-    jobs.await_cancel(first).await;
-    assert_eq!(
-        world.file(&owner, file_id).await["processingState"],
-        "PROCESSING"
-    );
-
-    // When: Jobs completes the first job
-    jobs.complete(first).await;
-
-    // Then: the next step is skipped, never asked of Jobs, and the file is
-    // FAILED `cancelled` with the first job as its last
+    // Then: nothing runs, so the held step is skipped at once — not on a
+    // Jobs end that may never come: the file is FAILED `cancelled`, the
+    // harmless cancel of the settled job is the only command
     let failed = next_drive_delta(&mut files, |node| {
         node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingFailed"
     })
     .await;
     assert_eq!(failed["cause"]["reason"], "cancelled");
     assert_eq!(failed["view"]["processingError"], "cancelled");
+    assert_eq!(failed["view"]["affordances"]["process"]["allowed"], true);
+    jobs.await_cancel(first).await;
     jobs.expect_no_command(Duration::from_secs(1)).await;
     assert_eq!(
         world.job_log(file_id).await,
@@ -343,7 +340,8 @@ async fn a_cancel_between_the_final_report_and_jobs_completed_skips_the_next_ste
     );
     assert_eq!(world.held_passport(file_id).await, None);
 
-    // And: a `completed` delivered again changes nothing
+    // And: Jobs' `completed` of the first job, arriving after, changes
+    // nothing — no step is created
     let again = jobs.complete(first).await;
     world.await_consumed(again).await;
     refute_delta(
@@ -399,6 +397,143 @@ async fn a_jobs_failure_of_the_job_reported_done_still_hands_off_to_the_next_ste
     let file = world.file(&owner, file_id).await;
     assert_eq!(file["processingState"], "PROCESSING");
     assert!(file["processingError"].is_null());
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_failed_after_the_completed_that_released_the_step_creates_nothing_more() {
+    // Given: a two-step chain handed on to its second step by Jobs' `completed`
+    let Chain {
+        world,
+        jobs,
+        owner,
+        runner,
+        file_id,
+        first,
+        ..
+    } = a_running_two_step_chain("pod-handoff-late-failed").await;
+    report_done(&world, &runner, file_id, first).await;
+    jobs.await_finish(first).await;
+    jobs.complete(first).await;
+    let second = jobs.await_create(file_id).await.job_id;
+
+    // When: a `failed` of the first job arrives after
+    let late = jobs.fail(first, "lease_expired", None).await;
+    world.await_consumed(late).await;
+
+    // Then: no second create, and the second step still runs
+    jobs.expect_no_command(Duration::from_secs(1)).await;
+    assert_eq!(world.job_of(file_id).await, Some(second));
+    let file = world.file(&owner, file_id).await;
+    assert_eq!(file["processingState"], "PROCESSING");
+    assert_eq!(file["progress"]["stepIndex"], 1);
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_freeze_while_the_next_step_is_held_skips_it_and_a_later_completed_creates_nothing() {
+    // Given: a two-step chain whose next step is held
+    let Chain {
+        world,
+        jobs,
+        owner,
+        runner,
+        drive,
+        file_id,
+        first,
+    } = a_running_two_step_chain("pod-handoff-freeze").await;
+    report_done(&world, &runner, file_id, first).await;
+    jobs.await_finish(first).await;
+
+    // When: the owner freezes the drive
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($id:UUID!){workspaceFreeze(id:$id){success}}",
+            serde_json::json!({ "id": drive }),
+        )
+        .await);
+
+    // Then: nothing ran, so no cancel is sent; the held step is skipped and
+    // the file is FAILED `cancelled`
+    let failed = world.await_state(&owner, file_id, "FAILED").await;
+    assert_eq!(failed["processingError"], "cancelled");
+    jobs.expect_no_command(Duration::from_millis(800)).await;
+    let facts = world.processing_facts(file_id).await;
+    assert_eq!(
+        facts.last().map(|fact| fact.event_type.as_str()),
+        Some("StepSkipped"),
+        "{facts:?}"
+    );
+
+    // And: Jobs' `completed` of the first job, arriving after, creates nothing
+    let late = jobs.complete(first).await;
+    world.await_consumed(late).await;
+    jobs.expect_no_command(Duration::from_secs(1)).await;
+    assert_eq!(
+        world.file(&owner, file_id).await["processingState"],
+        "FAILED"
+    );
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_file_deleted_while_its_next_step_is_held_gets_no_step_from_a_later_completed() {
+    // Given: a two-step chain whose next step is held
+    let Chain {
+        world,
+        jobs,
+        owner,
+        runner,
+        file_id,
+        first,
+        ..
+    } = a_running_two_step_chain("pod-handoff-delete").await;
+    report_done(&world, &runner, file_id, first).await;
+    jobs.await_finish(first).await;
+
+    // When: the owner deletes the file, then Jobs completes the first job
+    ok(&world
+        .gql(
+            &owner,
+            "mutation($f:UUID!){workspaceDeleteFile(fileId:$f){success}}",
+            serde_json::json!({ "f": file_id }),
+        )
+        .await);
+    let late = jobs.complete(first).await;
+    world.await_consumed(late).await;
+
+    // Then: no job is asked for a file that is gone
+    jobs.expect_no_command(Duration::from_secs(1)).await;
+    assert!(world.file(&owner, file_id).await.is_null());
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_process_gesture_while_the_next_step_is_held_is_refused_file_processing() {
+    // Given: a two-step chain whose next step is held
+    let Chain {
+        world,
+        jobs,
+        owner,
+        runner,
+        file_id,
+        first,
+        ..
+    } = a_running_two_step_chain("pod-handoff-process").await;
+    report_done(&world, &runner, file_id, first).await;
+    jobs.await_finish(first).await;
+
+    // When: the owner asks to process the file again
+    let refused = process(&world, &owner, file_id).await;
+
+    // Then: the file still processes: refused, nothing sent
+    assert_eq!(error_code(&refused), "FILE_PROCESSING");
+    jobs.expect_no_command(Duration::from_millis(800)).await;
 
     world.cleanup().await;
 }

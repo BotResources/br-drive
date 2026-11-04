@@ -366,6 +366,14 @@ impl MutationInput for CancelProcessing {
 /// Jobs confirms with `cancelled`, which lands it FAILED `cancelled`, open to
 /// a reprocess. Asking again sends the cancel again — Jobs may not have
 /// consumed the job's creation yet when the first one reaches it.
+///
+/// A file whose last job was reported done and whose next step is held
+/// (waiting for Jobs' end of that job) has nothing running: the held step is
+/// skipped at once (`StepSkipped`) and the file is FAILED `cancelled`, so a
+/// lost Jobs end can never strand it. `job.cancel` is still staged for the
+/// job reported done — harmless on a settled job, and it frees the file in
+/// Jobs if the `job.finish` never landed; a later Jobs end of that job only
+/// confirms.
 pub fn cancel_processing<'m, H: DriveHost>(
     cx: &'m mut Mutation<'m, H>,
     input: CancelProcessing,
@@ -376,8 +384,6 @@ pub fn cancel_processing<'m, H: DriveHost>(
             .await?
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.cancel_processing_gate(cx.principal()).require()?;
-        // The job reported done whose next step is held is still the one a
-        // cancel is about: Jobs settles it, and its end skips the held step.
         let Some(job_id) = file.processing_job().map(|job| job.job_id) else {
             return Err(DriveFault::Refused(codes::FILE_NOT_PROCESSING));
         };
@@ -387,6 +393,13 @@ pub fn cancel_processing<'m, H: DriveHost>(
         cx.command(processing::JobCancel {
             payload: CancelJob { job_id },
         })?;
+        if processing.held_job_id().is_some() {
+            // Nothing runs: the held step stops here, not on a Jobs end that
+            // may never come.
+            let next = usize::try_from(processing.step_index).unwrap_or(0) + 1;
+            processing::skip_next_step(cx, &meta, &mut file, &mut processing, next).await?;
+            return Ok(());
+        }
         facts::save(cx, &mut processing).await?;
         file.status = processing.status();
         file.updated_at = file.updated_at.max(processing.updated_at);

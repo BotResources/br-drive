@@ -297,10 +297,10 @@ pub(crate) async fn report_done<H: DriveHost>(
 /// for it — so the file is free in Jobs: the held step's `job.create` is
 /// staged with the id minted at the report (a redelivered end finds the step
 /// already created, and Jobs is idempotent on the id), and the file's running
-/// job becomes that one (`JobCreated`, `ProcessingStarted`). A user's cancel
-/// received meanwhile skips the step instead (`StepSkipped`, FAILED
-/// `cancelled`), and a Passport no longer held or readable abandons it
-/// (`StepAbandoned`).
+/// job becomes that one (`JobCreated`, `ProcessingStarted`). A Passport no
+/// longer held or readable abandons it (`StepAbandoned`). A user's cancel
+/// skips a held step at once (`cancel_processing`), so none is pending here;
+/// one found pending all the same skips the step (`StepSkipped`).
 pub(crate) async fn release_next_step<H: DriveHost>(
     cx: &mut Ops<'_>,
     meta: &FactMeta,

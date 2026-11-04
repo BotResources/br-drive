@@ -123,9 +123,9 @@ pub enum ProcessingEvent {
     JobCancelSent { job_id: Uuid },
     /// The chain stopped before step `step_index`: a user's cancel was
     /// pending when `after_job_id`, the previous step's job, was reported
-    /// done or when Jobs ended it while the step was held (`NextStepHeld`),
-    /// or the host froze the drive while it was held, so the step's job was
-    /// never created nor asked of Jobs.
+    /// done, or arrived while the step was held (`NextStepHeld`), or the host
+    /// froze the drive while it was held, so the step's job was never created
+    /// nor asked of Jobs.
     StepSkipped {
         step_index: i32,
         runner_type: String,

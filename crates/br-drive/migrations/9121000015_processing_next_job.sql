@@ -11,7 +11,10 @@
 --                set only while the file is `processing` and its last job
 --                (`job_id`) was reported done; NULL otherwise
 -- Additive: no existing row changes (NULL everywhere). A 0.8.0 binary ignores
--- the column: a file holding a next step when such a binary takes over never
--- gets it created. Let the held steps drain (none is held longer than Jobs
--- takes to answer a `job.finish`) before going back.
+-- the column and acks Jobs' `completed` as information: a held next step it
+-- meets is never created. So upgrade with no mixed 0.8.0 / 0.8.1 consumers
+-- (a Recreate rollout, or one replica during the upgrade), and let the held
+-- steps drain (none is held longer than Jobs takes to answer a `job.finish`)
+-- before going back. A file stranded all the same is released by the user's
+-- cancel, which skips a held step at once.
 ALTER TABLE drive.file_processing ADD COLUMN next_job_id uuid;

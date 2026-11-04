@@ -224,6 +224,11 @@ pub struct DriveFrozen {
 ///   job meets `JOB_NOT_ACTIVE`, the next step of its chain is never
 ///   launched, and Jobs' own `cancelled` (or any later end) is recorded as
 ///   `JobFactIgnored` and changes nothing — even when Jobs drops the cancel.
+///   A file whose next step is held (its last job reported done, Jobs' end
+///   not in yet) has nothing running: no `job.cancel` is staged, the held
+///   step is skipped (`StepSkipped`) and the file is `FAILED` `cancelled`;
+///   Jobs' later end of the job reported done is recorded as itself and
+///   changes nothing.
 /// - Every pending upload of the drive (`committed_at` unset) is abandoned
 ///   as its upload deadline would: `UploadAbandoned`, the row deleted, its
 ///   blob released; a later commit meets `FILE_NOT_FOUND`.

@@ -16,15 +16,16 @@ use crate::file::{FileCause, FileRow};
 use crate::host::DriveHost;
 
 /// Records a Jobs fact about `job_id` on the processing of the file that job
-/// belongs to — and, when it is Jobs' end of a job reported done whose next
-/// step is held, moves the chain on to that step ([`super::chain::release_next_step`]) — — the file loaded first, so locked: a concurrent fact of the
+/// belongs to — the file loaded first, so locked: a concurrent fact of the
 /// same file waits — and stages what it moved: the file's status when it
 /// ended the running job (`updatedAt` moves), its progress when it moved what
 /// the runner says (`ProgressChanged`, never on the host object: progress
 /// changes no count), nothing otherwise. A fact that changes nothing any more
 /// is still recorded, as `JobFactIgnored`. A job no file holds (a deleted
 /// file, a job the library never created) is acknowledged and not recorded:
-/// there is no processing to record it on. Answers the file when the fact
+/// there is no processing to record it on. Jobs' end of a job reported done
+/// whose next step is held moves the chain on to that step instead
+/// ([`super::chain::release_next_step`]). Answers the file when the fact
 /// ended its running job.
 async fn receive<H: DriveHost>(
     cx: &mut Reaction<'_>,

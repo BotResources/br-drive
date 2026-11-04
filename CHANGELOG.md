@@ -42,19 +42,32 @@ upgrades by bumping the pin and applying the new migration (the library's
   progress facts are ignored; `progress` names the next step with nothing
   run yet (`FileJob::reported_done()` tells the held state; the job's
   `events` carry a `reported_done` entry). A user's `<p>CancelProcessing`
-  still sends `job.cancel.v2` for that job and is decided when Jobs' end of
-  it arrives: the held step is skipped (`StepSkipped`), the file `FAILED`
-  `cancelled`. A Passport erased meanwhile abandons it (`StepAbandoned`
-  `passport_missing`). `freeze_drive` skips a held step at once (no
+  skips a held step at once (`StepSkipped`, the file `FAILED` `cancelled`;
+  `job.cancel.v2` is still staged for the job reported done, harmless on a
+  settled job), so a Jobs end lost on its way can never strand the file in
+  `PROCESSING`; Jobs' later end of that job only confirms. A Passport
+  erased meanwhile abandons the step at release (`StepAbandoned`
+  `passport_missing`). `freeze_drive` skips a held step at once too (no
   `job.cancel`: nothing runs).
+
+### Changed
+
+- **`FileRow::active_job()` answers `None` while a next step is held**: the
+  job reported done no longer runs, though the file is `PROCESSING`. A host
+  that reads "is the file processing" from `active_job()` reads
+  `processing_state()` instead, or `last_job()` with
+  `FileJob::reported_done()`.
 
 ### Added
 
 - **Migration `9121000015_processing_next_job`**: a nullable
   `drive.file_processing.next_job_id` (uuid), the held next step's job id.
-  Additive; a 0.8.0 binary ignores it — a step it finds held is never
-  created, so let held steps drain (they last as long as Jobs takes to
-  answer a `job.finish`) before rolling back.
+  Additive; a 0.8.0 binary ignores it, and acks Jobs' `completed` of a job
+  reported done as information: a step it finds held is never created.
+  **Upgrade with no mixed 0.8.0 / 0.8.1 consumers** — a `Recreate` rollout,
+  or one replica during the upgrade — and let held steps drain (they last as
+  long as Jobs takes to answer a `job.finish`) before rolling back. A file
+  stranded all the same is released by the user's `<p>CancelProcessing`.
 - **Fact** `NextStepHeld { step_index, runner_type, job_id, after_job_id }`
   on `drive_file_processing`, between `JobReportedDone` and the next
   `JobCreated` (or `StepSkipped` / `StepAbandoned`). `ProcessingEvent` is
@@ -62,8 +75,11 @@ upgrades by bumping the pin and applying the new migration (the library's
 - **`FileJob::reported_done()`**.
 - e2e `chain_handoff`: no `job.create` before Jobs' `completed` and the chain
   lands `READY`; a replayed `completed` creates the step once; a cancel
-  between the report and `completed` skips the step; a Jobs `failed` of the
-  job reported done still hands off. `runner_end` and `renditions` complete
+  between the report and `completed` skips the step at once; a Jobs
+  `failed` of the job reported done still hands off, and a `failed` after
+  the `completed` that released the step creates nothing more; a freeze or
+  a delete while the step is held, then `completed`, creates nothing; a
+  `ProcessFile` while it is held is refused `FILE_PROCESSING`. `runner_end` and `renditions` complete
   the first job before awaiting the second step's create.
 
 ## 0.8.0 — 2026-11-03
