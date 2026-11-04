@@ -9,7 +9,7 @@ mod roots;
 mod state;
 
 pub use chain::{ChainPlan, cancel_active_job};
-pub(crate) use chain::{load_processing, report_done, report_failed, start_chain};
+pub(crate) use chain::{load_processing, report_done, report_failed, skip_next_step, start_chain};
 pub use commands::Initiator;
 pub(crate) use commands::JobCancel;
 pub use reactions::{

@@ -108,9 +108,22 @@ fn triggered_by(passport: &Passport, initiator: Option<&Initiator>) -> Option<Tr
     .triggered_by()
 }
 
-/// Starts step `index` of the file's snapshot: the file's running job and its
-/// `job.create` (v3, carrying the chain's `passport`), staged through the
-/// outbox. `None` past the last step.
+/// The runner type of step `index` of the file's snapshot; blank past its end.
+fn runner_type_of<H>(file: &FileRow<H>, index: usize) -> String {
+    file.steps
+        .as_ref()
+        .and_then(|steps| steps.get(index))
+        .map(|step| step.runner_type.clone())
+        .unwrap_or_default()
+}
+
+fn step_number(index: usize) -> i32 {
+    i32::try_from(index).unwrap_or(i32::MAX)
+}
+
+/// Starts step `index` of the file's snapshot as job `job_id`: the file's
+/// running job and its `job.create` (v3, carrying the chain's `passport`),
+/// staged through the outbox. `None` past the last step.
 #[allow(clippy::too_many_arguments)]
 async fn launch_step<H: DriveHost>(
     cx: &mut Ops<'_>,
@@ -118,6 +131,7 @@ async fn launch_step<H: DriveHost>(
     file: &FileRow<H>,
     processing: &mut FileProcessing<H>,
     index: usize,
+    job_id: Uuid,
     trigger: Option<Trigger>,
     initiator: Option<Initiator>,
     passport: &Passport,
@@ -130,7 +144,6 @@ async fn launch_step<H: DriveHost>(
         DriveFault::Engine(EngineError::Config("a chain step index overflows".into()))
     })?;
     let roots = roots::<H>()?;
-    let job_id = Uuid::now_v7();
     let config = serde_json::json!({
         "host": H::SERVICE,
         "file_id": file.id,
@@ -215,6 +228,7 @@ pub(crate) async fn start_chain<H: DriveHost>(
         file,
         &mut processing,
         0,
+        Uuid::now_v7(),
         Some(trigger),
         Some(initiator),
         passport,
@@ -229,11 +243,16 @@ pub(crate) async fn start_chain<H: DriveHost>(
 }
 
 /// The runner's final report ended the file's running job, in the report's
-/// transaction: the job settles, Jobs is told (`job.finish`), and the chain
-/// moves on — the next step's job, or the end of the chain (READY). Jobs' own
-/// `completed` then only confirms it. A user's cancel that crossed the report
-/// stops the chain there: the next step is skipped (`StepSkipped`), never
-/// launched, and the file is FAILED `cancelled`; on the last step there is nothing left to stop and the file
+/// transaction: the job settles and Jobs is told (`job.finish`). Past the last
+/// step the chain ends there (READY). Otherwise the next step is decided now —
+/// its job id minted and held on the file's processing (`NextStepHeld`), the
+/// file still PROCESSING — and its `job.create` waits for Jobs' own end of
+/// this job ([`release_next_step`]): Jobs holds one live job per file and
+/// judges a create and a finish on separate consumers, in no order, so a
+/// create staged beside the finish could be refused `duplicate_active_entity`.
+/// A user's cancel that crossed the report stops the chain there: the next
+/// step is skipped (`StepSkipped`), never launched, and the file is FAILED
+/// `cancelled`; on the last step there is nothing left to stop and the file
 /// is READY. The next step's job carries the chain's Passport, read back from
 /// the file's processing; held no more or unreadable, the chain stops there
 /// too (`StepAbandoned`) and the file is FAILED `passport_missing` or
@@ -245,83 +264,124 @@ pub(crate) async fn report_done<H: DriveHost>(
     processing: &mut FileProcessing<H>,
 ) -> Result<(), DriveFault> {
     let job_id = processing.job_id;
-    let step_index = processing.step_index;
+    let next = usize::try_from(processing.step_index).unwrap_or(0) + 1;
+    let has_next = file.steps.as_ref().is_some_and(|steps| next < steps.len());
+    finish_job(cx, job_id)?;
+    if !has_next {
+        processing.report_done(meta);
+        conclude::<H>(cx, meta, file).await?;
+        save_processing(cx, file, processing).await?;
+        crate::file::file_changed::<H>(cx, file, FileCause::ProcessingFinished)?;
+        return Ok(());
+    }
+    if processing.cancel_requested() {
+        processing.report_done(meta);
+        return skip_next_step(cx, meta, file, processing, next).await;
+    }
+    if let Err(reason) = chain_passport(processing.passport.clone()) {
+        processing.report_done(meta);
+        return abandon_next_step(cx, meta, file, processing, next, reason).await;
+    }
+    processing.report_done_holding(
+        step_number(next),
+        runner_type_of(file, next),
+        Uuid::now_v7(),
+        meta,
+    );
+    save_processing(cx, file, processing).await?;
+    crate::file::file_progressed::<H>(cx, file)?;
+    Ok(())
+}
+
+/// Jobs ended the file's last job — reported done, the chain's next step held
+/// for it — so the file is free in Jobs: the held step's `job.create` is
+/// staged with the id minted at the report (a redelivered end finds the step
+/// already created, and Jobs is idempotent on the id), and the file's running
+/// job becomes that one (`JobCreated`, `ProcessingStarted`). A Passport no
+/// longer held or readable abandons it (`StepAbandoned`). A user's cancel
+/// skips a held step at once (`cancel_processing`), so none is pending here;
+/// one found pending all the same skips the step (`StepSkipped`).
+pub(crate) async fn release_next_step<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    meta: &FactMeta,
+    file: &mut FileRow<H>,
+    processing: &mut FileProcessing<H>,
+) -> Result<(), DriveFault> {
+    let Some(job_id) = processing.held_job_id() else {
+        return Err(DriveFault::Engine(EngineError::Config(
+            "a chain's next step was released without being held".into(),
+        )));
+    };
+    let next = usize::try_from(processing.step_index).unwrap_or(0) + 1;
+    if processing.cancel_requested() {
+        return skip_next_step(cx, meta, file, processing, next).await;
+    }
+    let passport = match chain_passport(processing.take_passport()) {
+        Ok(passport) => passport,
+        Err(reason) => return abandon_next_step(cx, meta, file, processing, next, reason).await,
+    };
     let trigger = processing.trigger;
     let initiator = processing.triggered_by.clone();
-    let cancel_requested = processing.cancel_requested();
-    let stored_passport = processing.take_passport();
-    processing.report_done(meta);
-    finish_job(cx, job_id)?;
-    let next = usize::try_from(step_index).unwrap_or(0) + 1;
-    let has_next = file.steps.as_ref().is_some_and(|steps| next < steps.len());
-    if cancel_requested && has_next {
-        let runner_type = file
-            .steps
-            .as_ref()
-            .and_then(|steps| steps.get(next))
-            .map(|step| step.runner_type.clone())
-            .unwrap_or_default();
-        processing.skip_step(i32::try_from(next).unwrap_or(i32::MAX), runner_type, meta);
-        save_processing(cx, file, processing).await?;
-        crate::file::file_changed::<H>(
-            cx,
-            file,
-            FileCause::ProcessingFailed {
-                reason: CANCELLED.to_string(),
-            },
-        )?;
-        return Ok(());
-    }
-    if has_next {
-        let passport = match chain_passport(stored_passport) {
-            Ok(passport) => passport,
-            Err(reason) => {
-                let runner_type = file
-                    .steps
-                    .as_ref()
-                    .and_then(|steps| steps.get(next))
-                    .map(|step| step.runner_type.clone())
-                    .unwrap_or_default();
-                processing.abandon_step(
-                    i32::try_from(next).unwrap_or(i32::MAX),
-                    runner_type,
-                    reason,
-                    meta,
-                );
-                save_processing(cx, file, processing).await?;
-                crate::file::file_changed::<H>(
-                    cx,
-                    file,
-                    FileCause::ProcessingFailed {
-                        reason: reason.to_string(),
-                    },
-                )?;
-                return Ok(());
-            }
-        };
-        let job_id = launch_step(
-            cx, meta, file, processing, next, trigger, initiator, &passport,
-        )
-        .await?
-        .ok_or_else(|| {
-            DriveFault::Engine(EngineError::Config(
-                "a chain's next step vanished under the file's lock".into(),
-            ))
-        })?;
-        save_processing(cx, file, processing).await?;
-        crate::file::file_changed::<H>(
-            cx,
-            file,
-            FileCause::ProcessingStarted {
-                job_id,
-                step: i32::try_from(next).unwrap_or(i32::MAX),
-            },
-        )?;
-        return Ok(());
-    }
-    conclude::<H>(cx, meta, file).await?;
+    launch_step(
+        cx, meta, file, processing, next, job_id, trigger, initiator, &passport,
+    )
+    .await?
+    .ok_or_else(|| {
+        DriveFault::Engine(EngineError::Config(
+            "a chain's next step vanished under the file's lock".into(),
+        ))
+    })?;
     save_processing(cx, file, processing).await?;
-    crate::file::file_changed::<H>(cx, file, FileCause::ProcessingFinished)?;
+    crate::file::file_changed::<H>(
+        cx,
+        file,
+        FileCause::ProcessingStarted {
+            job_id,
+            step: step_number(next),
+        },
+    )?;
+    Ok(())
+}
+
+/// The chain stops before step `next` on a user's cancel (or a freeze): the
+/// step is skipped and the file is FAILED `cancelled`.
+pub(crate) async fn skip_next_step<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    meta: &FactMeta,
+    file: &mut FileRow<H>,
+    processing: &mut FileProcessing<H>,
+    next: usize,
+) -> Result<(), DriveFault> {
+    processing.skip_step(step_number(next), runner_type_of(file, next), meta);
+    save_processing(cx, file, processing).await?;
+    crate::file::file_changed::<H>(
+        cx,
+        file,
+        FileCause::ProcessingFailed {
+            reason: CANCELLED.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+/// The chain stops before step `next`: its Passport is missing or unreadable.
+async fn abandon_next_step<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    meta: &FactMeta,
+    file: &mut FileRow<H>,
+    processing: &mut FileProcessing<H>,
+    next: usize,
+    reason: &'static str,
+) -> Result<(), DriveFault> {
+    processing.abandon_step(step_number(next), runner_type_of(file, next), reason, meta);
+    save_processing(cx, file, processing).await?;
+    crate::file::file_changed::<H>(
+        cx,
+        file,
+        FileCause::ProcessingFailed {
+            reason: reason.to_string(),
+        },
+    )?;
     Ok(())
 }
 

@@ -23,7 +23,9 @@ use crate::host::DriveHost;
 /// changes no count), nothing otherwise. A fact that changes nothing any more
 /// is still recorded, as `JobFactIgnored`. A job no file holds (a deleted
 /// file, a job the library never created) is acknowledged and not recorded:
-/// there is no processing to record it on. Answers the file when the fact
+/// there is no processing to record it on. Jobs' end of a job reported done
+/// whose next step is held moves the chain on to that step instead
+/// ([`super::chain::release_next_step`]). Answers the file when the fact
 /// ended its running job.
 async fn receive<H: DriveHost>(
     cx: &mut Reaction<'_>,
@@ -42,6 +44,12 @@ async fn receive<H: DriveHost>(
     };
     let meta = FactMeta::of_reaction(cx);
     let applied = processing.receive(job_id, fact, &meta);
+    if applied == Applied::Released {
+        // Jobs ended the job the chain's held next step waited for: the step
+        // starts (or stops) in this transaction.
+        super::chain::release_next_step(cx, &meta, &mut file, &mut processing).await?;
+        return Ok(None);
+    }
     facts::save(cx, &mut processing).await?;
     file.status = processing.status();
     file.updated_at = file.updated_at.max(processing.updated_at);
@@ -55,7 +63,7 @@ async fn receive<H: DriveHost>(
             crate::file::file_progressed::<H>(cx, &file)?;
             Ok(None)
         }
-        Applied::Noted | Applied::Ignored => Ok(None),
+        Applied::Noted | Applied::Ignored | Applied::Released => Ok(None),
     }
 }
 
@@ -162,7 +170,9 @@ pub fn on_started<'r, H: DriveHost>(
 
 /// Jobs completed the job — only ever after the library's own `job.finish`,
 /// sent in the transaction of the runner's final report, which already ended
-/// the job and moved the chain on: recorded, it moves nothing.
+/// the job. Past the chain's last step it only confirms; before it, it frees
+/// the file in Jobs and the held next step's `job.create` is staged (once: a
+/// redelivery finds the job an earlier one of the file).
 pub fn on_completed<'r, H: DriveHost>(
     cx: &'r mut Reaction<'r>,
     fact: CompletedFact,

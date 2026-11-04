@@ -27,7 +27,7 @@ is created on `job.create.v3`, with a Passport.
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.8.0", version = "0.8.0" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.8.1", version = "0.8.1" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -288,7 +288,7 @@ renders it, is committed at
 | `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256, title?, rulesetId?): UploadTicket!` | `title` trimmed, 1–255 characters, one line, no control or bidirectional-override character (`INVALID_TITLE`); absent, it is the requested `name` without its extension (`report.pdf` → `report`; a name with no stem is kept whole; a collision renames the file, never its title); gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). `rulesetId` (since 0.5.1) chooses the `upload` rule the commit runs, for a front that lets its user pick a processing per upload: validated as `ProcessFile` validates a named rule — after the gate and the drive — `RULESET_NOT_FOUND`, `RULESET_MISMATCH` (another trigger, or no pattern matching the media type); pinned on the pending file (`UploadRulesetChosen`, the fact after `UploadTicketIssued`). Without it nothing is pinned and the commit runs the default, as before. |
 | `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then, on a host that processes on commit (`DriveHost::process_on_commit`, default `true`) and whose `Process { file }` gate allows it, the `upload` rule the uploader chose — else the default `upload` rule matching the file's media type — starts its chain **in the commit's transaction**: the file goes `PENDING` → `PROCESSING`, never `READY` first, and the facts `UploadCommitted`, `ChainStarted`, `JobCreated` share the commit's correlation (a failure rolls all of it back). No matching rule, or the gate refusing: the file is `READY` — stored only — and the commit is not refused. A chosen rule deleted since the request, or changed so it no longer carries the `upload` trigger or matches the file, stores the file `READY` too: the default never runs in the place of the rule the uploader chose. With the switch off, the file is `READY` and `ProcessFile` starts its chain. A second commit is `FILE_NOT_PENDING`. |
 | `<p>ProcessFile(fileId, rulesetId?): MutationAck!` | starts processing on a host that does not process on commit — right after the commit, later, or never — and reprocesses on any host: gate `Process { file }`, then a `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload, `FILE_PROCESSING` while a chain runs). A file that never had a job runs its `upload` rule, any other its `reprocess` rule (see "Processing rules": `RULESET_NOT_FOUND`, `RULESET_MISMATCH`, `NO_RULESET_MATCHES`). Nothing is wiped: the previous results stay readable while the new run reports over them. Affordance `process`. |
-| `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; records `JobCancelSent` on the file's processing and stages `job.cancel.v2` for the running job (the live cause stays `CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). Affordance `cancelProcessing`. |
+| `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; records `JobCancelSent` on the file's processing and stages `job.cancel.v2` for the running job (the live cause stays `CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). While the chain's next step is held (its last job reported done, Jobs' end not in yet — since 0.8.1) nothing runs: the held step is skipped at once (`StepSkipped`, `FAILED` `cancelled`, cause `ProcessingFailed`), the `job.cancel.v2` of the job reported done still staged. Affordance `cancelProcessing`. |
 | `<p>RegeneratePage(fileId, number, comment?, rulesetId?): MutationAck!` | run the `regenerate_page` rule on one page of a `READY` file: `page` and `comment` are merged into the first step's options; `PAGE_NOT_FOUND`, `NO_RULESET_MATCHES`. Affordance `regeneratePage` on the page. |
 | `<p>UpdateFile(fileId, name?, path?, driveId?): MutationAck!` | rename, move, or move to another drive of the same host; both drives are locked before the sibling check, so a concurrent collision answers `NAME_TAKEN`, never a database error; `NOTHING_TO_CHANGE` when nothing differs. |
 | `<p>RetitleFile(fileId, title): MutationAck!` | gate `RetitleFile { file }` (affordance `retitle`); changes the title and nothing else — never the name, the path, the drive or the state, and `UpdateFile` never touches the title; `INVALID_TITLE`, `NOTHING_TO_CHANGE` for the same title; the host's rule sees the row (a host may allow a retitle where it refuses a rename). |
@@ -408,13 +408,17 @@ runner reports and never interprets a media type.
 | `<p>RunnerReportFailure(fileId, jobId, reasonCode, message?): MutationAck!` | the runner declares its job failed: the same runner-scope and running-job checks as a report; `reasonCode` is a code, `[a-z][a-z0-9_]*` up to 128 bytes, `message` free text up to 4 KiB (`INVALID_FAILURE_REASON` otherwise). The job ends there: the file is `FAILED` with `reasonCode` as its `processingError` (`ProcessingFailed { reason }`), `job.fail.v2` is staged with `"{reasonCode}: {message}"` as its note, and what the run reported so far stays readable. |
 
 The job. Every runner root validates `jobId` against the file's running job —
-the file's last job while the file is `PROCESSING` (`JOB_NOT_ACTIVE` for
-any other job, for a file that never landed, and for a file that is not
-`PROCESSING`). The runner declares the end of its job through the host, never
-only to Jobs: `done: true` on the report ends it (the chain moves on at once,
-and `integration.cmd.jobs.job.finish.v2 { job_id }` is staged in the same
-transaction), `<p>RunnerReportFailure` fails it (`job.fail.v2 { job_id,
-note }`). Jobs' `completed` then only confirms a job the runner already ended.
+the file's last job while the file is `PROCESSING`, unless that job was
+reported done and the chain's next step waits for Jobs to end it
+(`JOB_NOT_ACTIVE` for any other job, for a file that never landed, and for a
+file that is not `PROCESSING`). The runner declares the end of its job
+through the host, never only to Jobs: `done: true` on the report ends it
+(`integration.cmd.jobs.job.finish.v2 { job_id }` is staged in the same
+transaction; the chain ends there past its last step, and its next step is
+created once Jobs ended the job — see the chain below),
+`<p>RunnerReportFailure` fails it (`job.fail.v2 { job_id, note }`). Jobs'
+`completed` then confirms a job the runner already ended — and hands the
+chain on to its next step.
 A job ends once: any call about it afterwards — a replayed final report, a
 failure declared after the end — answers `JOB_NOT_ACTIVE` and changes
 nothing. **A runner that retries its final report after a lost ack must take
@@ -562,9 +566,10 @@ The chain, one step at a time, in the library's own transactions:
    owned by the host (Jobs refuses a terminal parent, and a live one would
    make the step the parent runner's work);
 2. **the runner ends the job**, through the host: its final report
-   (`done: true`) records the job's end, `reported_done`, and, in the same
-   transaction, creates the next step's job or — past the last step — ends
-   the chain (`READY`, `ProcessingFinished`), and stages `job.finish.v2`; its
+   (`done: true`) records the job's end, `reported_done`, stages
+   `job.finish.v2` and, in the same transaction, past the last step ends the
+   chain (`READY`, `ProcessingFinished`); before it, it **holds** the next
+   step (4, below); its
    declared failure (`<p>RunnerReportFailure`) records the end
    `reported_failed` with its reason, lands the file `FAILED` with that code (`ProcessingFailed {
    reason }`) and stages `job.fail.v2`. A refusal of that `job.finish` by Jobs
@@ -598,14 +603,42 @@ The chain, one step at a time, in the library's own transactions:
    nothing. Jobs' `queued`, `started` and `completed` of the file's last job
    are recorded as themselves (`JobQueued`, `JobStarted`, `JobCompleted`) and
    move nothing a reader sees — `completed` only confirms the library's own
-   `job.finish`;
-4. a user's cancel that crossed a step's final report (the cancel was still
+   `job.finish` — except the hand-off below;
+4. **the hand-off to the next step waits for Jobs** (since 0.8.1). Jobs
+   holds one live job per file and consumes `job.finish` and `job.create` on
+   separate durables, in no order: a next step's `job.create` staged beside
+   the previous step's `job.finish` could be judged first and refused
+   `duplicate_active_entity`, failing a chain that did nothing wrong. So the
+   final report of a step that has a next one only **decides** it: the step,
+   its runner type and the chain's Passport (below) are settled, the next
+   job's id is minted and held on the file's processing
+   (`drive.file_processing.next_job_id`; `JobReportedDone` then
+   `NextStepHeld { step_index, runner_type, job_id, after_job_id }`), and the
+   file stays `PROCESSING` — `progress` names the next step, nothing run yet;
+   the job reported done answers `JOB_NOT_ACTIVE` to its runner, and its
+   late progress facts are ignored (`job_already_ended`). Jobs' end of that
+   job — its `completed`, or a `failed` / `cancelled` / `creation_rejected` it
+   settled before the `job.finish` reached it, recorded as `JobFactIgnored`
+   (`job_already_ended`): the report was the job's end — frees the file in
+   Jobs, and **in that fact's transaction** the held step's `job.create.v3`
+   is staged with the minted id and the step becomes the file's running job,
+   exactly as at a chain's start (`JobCreated`, `ProcessingStarted`). A
+   redelivered end finds the step already created — the fact is about an
+   earlier job of the file (`not_the_current_job`) — and Jobs is idempotent
+   on a job id: the step is created once. A file waits there only as long as
+   Jobs takes to answer a `job.finish`;
+5. a user's cancel that crossed a step's final report (the cancel was still
    on its way to Jobs when the report landed) stops the chain there: the next
    step is skipped — never launched, no job created for it — and recorded as
    `StepSkipped { step_index, runner_type, after_job_id }`; the file lands
-   `FAILED` `cancelled` with the ended job as its last one. A cancel that crossed the **last** step's final report has
-   nothing left to stop: the work is done and the file is `READY`; Jobs'
-   `cancelled`, if it comes, changes nothing.
+   `FAILED` `cancelled` with the ended job as its last one. A cancel that
+   arrives while the next step is held skips it **at once** the same way —
+   nothing runs, and a Jobs end lost on its way must not strand the file;
+   `<p>CancelProcessing` still stages `job.cancel.v2` for the job reported
+   done (harmless on a settled job) and Jobs' later end of it only
+   confirms. A cancel that crossed the
+   **last** step's final report has nothing left to stop: the work is done
+   and the file is `READY`; Jobs' `cancelled`, if it comes, changes nothing.
 
 ### The chain's Passport
 
@@ -627,8 +660,9 @@ the Passport of its initiator:
   own, so it never falls back to the host service's Passport;
 - it is kept with the running processing (`drive.file_processing.passport`,
   JSONB), written in the transaction that starts the chain, and every step's
-  `job.create.v3` carries it — the first one, and each next one created in
-  the transaction of the previous step's final report;
+  `job.create.v3` carries it — the first one, and each next one, read back
+  when the previous step's final report holds it (above) and again when
+  Jobs' end of that step's job creates it;
 - it is set back to `NULL` in the transaction of **every end** of the
   processing — `READY`, a runner's declared failure, Jobs' `failed`,
   `cancelled` or `creation_rejected`, a cancel crossing a final report, a
@@ -641,9 +675,10 @@ the Passport of its initiator:
   the initiator or revoking a scope does not stop a running chain — its next
   steps still act under the stored Passport; only an erase of the initiator
   (or of the impersonator of their session) takes it off the chain;
-- when the next step is due and the stored Passport is missing — a chain
-  started before 0.7.0, an initiator erased while it ran — or no longer
-  reads as a Passport, the step is never sent: the chain stops there, recorded
+- when the next step is due — at the previous step's final report, and
+  again when Jobs' end of that step's job releases it — and the stored
+  Passport is missing — a chain started before 0.7.0, an initiator erased
+  while it ran — or no longer reads as a Passport, the step is never sent: the chain stops there, recorded
   as `StepAbandoned { step_index, runner_type, after_job_id, reason_code }`,
   and the file lands `FAILED` `passport_missing` or `passport_unreadable`
   (`ProcessingFailed { reason }`), open to a reprocess;
@@ -671,6 +706,7 @@ the `drive_file_processing` aggregate, soft-EDA like every library aggregate):
 | `past_job_ids` | the file's earlier jobs, so a late fact about one is recognised and recorded as ignored |
 | `updated_at` | the processing's last change: every status change (a chain started, a job created or ended, a cancel request), never a progress fact nor Jobs' information |
 | `passport` | the Passport the running chain acts under ([The chain's Passport](#the-chains-passport)); `NULL` unless `processing` (0.7.0) |
+| `next_job_id` | the minted id of the chain's next step's job, held from the previous step's final report until Jobs ends that step's job (`job_id`); `NULL` otherwise, and always outside `processing` (0.8.1) |
 
 No row: `PENDING` without `committed_at`, `READY` with it (a stored,
 unprocessed file is ready). A row: its `state`; `processingError` its
@@ -680,8 +716,9 @@ unprocessed file is ready). A row: its `state`; `processingError` its
 `file_counts` helper read it. Every writer of a file's processing locks the
 file row first, then the processing row — a gesture locks the file before
 reading its status, so two gestures never both see the same last job — and a
-new job is only ever created once the file's last job ended, or in the
-transaction that ends it: at most one job runs per file. `ruleset_id` and
+new job is only ever created once the file's last job ended — a chain's
+first step on a settled file, a next step once Jobs itself ended the
+previous one: at most one job runs per file, for the library and for Jobs. `ruleset_id` and
 `steps` stay on the File for replay; `progress` is `null` outside
 `PROCESSING`. A file's `updatedAt` is the latest of its own row's `updated_at`
 (every event of the file) and its processing's.
@@ -751,7 +788,11 @@ so no work lands on it afterwards:
   `cancelled` at once, the runner's next call about the job meets
   `JOB_NOT_ACTIVE`, the next step of its chain is never launched, and Jobs'
   own `cancelled` — or any later end — is recorded as `JobFactIgnored`
-  (`job_already_ended`) and changes nothing, even when Jobs drops the cancel;
+  (`job_already_ended`) and changes nothing, even when Jobs drops the cancel.
+  A file whose next step is held (its last job reported done, Jobs' end not
+  in yet) has nothing running to cancel: the held step is skipped
+  (`StepSkipped`), the file is `FAILED` `cancelled`, and no `job.cancel` is
+  staged;
 - every pending upload of the drive (`committed_at` unset, landed or not) is
   abandoned as its upload deadline would abandon it: `UploadAbandoned`, the
   row deleted, its blob released; a later commit meets `FILE_NOT_FOUND`.
@@ -889,7 +930,7 @@ writers of one aggregate would hand the same `seq`.
 | `drive_page` (`PageEvent`) | `Reported { job_id, origin }`, `Edited`, `Trimmed` |
 | `drive_label` (`LabelEvent`) | `Created { name, color, description }`, `Updated { name, color, description }`, `Deleted` |
 | `drive_ruleset` (`RulesetEvent`) | `Created { name, trigger, media_types, steps, is_default }`, `Saved { name, media_types, steps, is_default }`, `Deleted` |
-| `drive_file_processing` (`ProcessingEvent`) | `ChainStarted { trigger, ruleset_id, steps }`, `JobCreated { job_id, step_index, runner_type }`, `JobReportedDone { job_id }`, `JobReportedFailed { job_id, reason_code, message }`, `JobFailed { job_id, failure_cause, reason_code, note }`, `JobCancelled { job_id }`, `JobCancelledOnFreeze { job_id }` (0.5.1), `JobCreationRejected { job_id, reason_code, params }`, `JobCancelSent { job_id }`, `StepSkipped { step_index, runner_type, after_job_id }`, `StepAbandoned { step_index, runner_type, after_job_id, reason_code }` (0.7.0), `JobPlanDeclared { job_id, run_id, labels }`, `JobStepStarted { job_id, run_id, index, label, started_at }`, `JobQueued { job_id, runner_type }`, `JobStarted { job_id, run_id }`, `JobCompleted { job_id }`, `JobFactIgnored { job_id, received, why }` |
+| `drive_file_processing` (`ProcessingEvent`) | `ChainStarted { trigger, ruleset_id, steps }`, `JobCreated { job_id, step_index, runner_type }`, `JobReportedDone { job_id }`, `JobReportedFailed { job_id, reason_code, message }`, `JobFailed { job_id, failure_cause, reason_code, note }`, `JobCancelled { job_id }`, `JobCancelledOnFreeze { job_id }` (0.5.1), `JobCreationRejected { job_id, reason_code, params }`, `JobCancelSent { job_id }`, `StepSkipped { step_index, runner_type, after_job_id }`, `StepAbandoned { step_index, runner_type, after_job_id, reason_code }` (0.7.0), `NextStepHeld { step_index, runner_type, job_id, after_job_id }` (0.8.1), `JobPlanDeclared { job_id, run_id, labels }`, `JobStepStarted { job_id, run_id, index, label, started_at }`, `JobQueued { job_id, runner_type }`, `JobStarted { job_id, run_id }`, `JobCompleted { job_id }`, `JobFactIgnored { job_id, received, why }` |
 
 Every payload is at schema version 1 (`FILE_EVENT_VERSION`,
 `PAGE_EVENT_VERSION`, `LABEL_EVENT_VERSION`, `RULESET_EVENT_VERSION`,
@@ -1076,10 +1117,12 @@ found `PROCESSING` without a job; a file that was `FAILED` before migration
   runner may then declare its failure (`<p>RunnerReportFailure`).
 - The Jobs double serializes the commands it reads, so the crossing of a
   `job.cancel` and a `job.create` on Jobs' separate durables is modelled by
-  dropping cancels (`drop_cancels`), not reproduced as a race; nor does it
-  publish `completed` / `failed` on its own after a `job.finish` /
-  `job.fail` — the scenarios publish them afterwards, to prove they change
-  nothing.
+  dropping cancels (`drop_cancels`), not reproduced as a race — nor is the
+  crossing of a `job.finish` and the next step's `job.create`: the scenarios
+  prove instead that no `job.create` is sent before Jobs' `completed`
+  (`chain_handoff`). Nor does it publish `completed` / `failed` on its own
+  after a `job.finish` / `job.fail` — the scenarios publish them afterwards,
+  to hand a chain on or to prove they change nothing.
 - Engine 0.4.0's `Query::download` gates on the row's visibility, never on
   a window, but a view's `visible` sees the row and the principal only, not
   the job the runner names. The runner context resolver therefore still

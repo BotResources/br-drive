@@ -6,8 +6,10 @@
 //!
 //! The processing rules, as 0.4.0 held them:
 //! - a file has at most one live job: a chain is started only on a settled
-//!   file, the next step's job only in the transaction that ends the previous
-//!   one, both under the file's row lock;
+//!   file, the next step's job only once Jobs ended the previous one — the
+//!   previous step's final report mints its id and holds it
+//!   (`NextStepHeld`), Jobs' end of the previous job creates it (0.8.1) —
+//!   both under the file's row lock;
 //! - the first end of a job wins (the runner's final report or declared
 //!   failure, Jobs' failed, cancelled or creation_rejected); every later fact
 //!   about it — and any fact about an earlier job of the file — is kept as
@@ -121,7 +123,9 @@ pub enum ProcessingEvent {
     JobCancelSent { job_id: Uuid },
     /// The chain stopped before step `step_index`: a user's cancel was
     /// pending when `after_job_id`, the previous step's job, was reported
-    /// done, so the step's job was never created nor asked of Jobs.
+    /// done, or arrived while the step was held (`NextStepHeld`), or the host
+    /// froze the drive while it was held, so the step's job was never created
+    /// nor asked of Jobs.
     StepSkipped {
         step_index: i32,
         runner_type: String,
@@ -146,7 +150,8 @@ pub enum ProcessingEvent {
     /// A run of the job started.
     JobStarted { job_id: Uuid, run_id: Uuid },
     /// Jobs completed the job — only ever after the library's own
-    /// `job.finish`: information.
+    /// `job.finish`: information, and, when the chain's next step was held
+    /// for it, what creates that step (`JobCreated` follows).
     JobCompleted { job_id: Uuid },
     /// The chain stopped before step `step_index`: when `after_job_id`, the
     /// previous step's job, was reported done, the Passport the chain acts
@@ -173,6 +178,19 @@ pub enum ProcessingEvent {
     /// (`JobCancelSent`); Jobs' own `cancelled`, when it comes, changes
     /// nothing. Since 0.5.1.
     JobCancelledOnFreeze { job_id: Uuid },
+    /// The previous step's job, `after_job_id`, was reported done and Jobs
+    /// told (`job.finish`): the chain's next step, `step_index`, is decided
+    /// and its job id minted, `job_id`, but its `job.create` waits for Jobs'
+    /// own end of `after_job_id` — Jobs holds one live job per file and
+    /// judges a create and a finish on separate consumers, in no order. The
+    /// file stays PROCESSING; `JobCreated` with that id follows when Jobs'
+    /// end arrives, or `StepSkipped` / `StepAbandoned` instead. Since 0.8.1.
+    NextStepHeld {
+        step_index: i32,
+        runner_type: String,
+        job_id: Uuid,
+        after_job_id: Uuid,
+    },
 }
 
 impl DriveEvent for ProcessingEvent {
@@ -192,6 +210,7 @@ impl DriveEvent for ProcessingEvent {
             Self::JobCancelSent { .. } => "JobCancelSent",
             Self::StepSkipped { .. } => "StepSkipped",
             Self::StepAbandoned { .. } => "StepAbandoned",
+            Self::NextStepHeld { .. } => "NextStepHeld",
             Self::JobPlanDeclared { .. } => "JobPlanDeclared",
             Self::JobStepStarted { .. } => "JobStepStarted",
             Self::JobQueued { .. } => "JobQueued",
@@ -227,7 +246,9 @@ pub struct FileJob {
     /// What the job's reads need while it runs, as entries `{kind, ...}`: the
     /// current plan (`plan_declared`, `steps`), the latest step started
     /// (`step_started`, `index`, `label`, `started_at`) and a cancel request
-    /// (`cancel_requested`). Empty once the job ended.
+    /// (`cancel_requested`); once the job was reported done while the chain's
+    /// next step is held, `reported_done` (and a cancel request) instead.
+    /// Empty once the processing ended.
     pub events: Vec<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
@@ -251,6 +272,15 @@ fn entries_of<'a>(
 }
 
 impl FileJob {
+    /// Whether the job was reported done while its file still processes:
+    /// the chain's next step is held until Jobs ends this job, so it runs no
+    /// more and is not the file's active job. Since 0.8.1.
+    pub fn reported_done(&self) -> bool {
+        entries_of(&self.events, kind::REPORTED_DONE)
+            .next()
+            .is_some()
+    }
+
     /// Whether a user asked to cancel this job.
     pub fn cancel_requested(&self) -> bool {
         entries_of(&self.events, kind::CANCEL_REQUESTED)
@@ -298,16 +328,22 @@ pub(crate) struct RunningFacts {
     pub plan: Option<Vec<String>>,
     pub step: Option<(i32, String, DateTime<Utc>)>,
     pub cancel_requested_at: Option<DateTime<Utc>>,
+    /// The job was reported done and the chain's next step is held until
+    /// Jobs ends it: the job no longer runs, its plan and step are gone.
+    pub reported_done: bool,
 }
 
 impl RunningFacts {
     /// The facts as [`FileJob::events`] entries.
     pub(crate) fn entries(self) -> Vec<serde_json::Value> {
+        let reported_done = self.reported_done;
         let mut entries = Vec::new();
-        if let Some(plan) = self.plan {
+        if reported_done {
+            entries.push(serde_json::json!({ "kind": kind::REPORTED_DONE }));
+        } else if let Some(plan) = self.plan {
             entries.push(serde_json::json!({ "kind": kind::PLAN_DECLARED, "steps": plan }));
         }
-        if let Some((index, label, started_at)) = self.step {
+        if let Some((index, label, started_at)) = self.step.filter(|_| !reported_done) {
             entries.push(serde_json::json!({
                 "kind": kind::STEP_STARTED,
                 "index": index,
@@ -435,6 +471,10 @@ pub(crate) enum Applied {
     Noted,
     /// It changes nothing any more: recorded as `JobFactIgnored`.
     Ignored,
+    /// Jobs ended the job the chain's held next step waits for: the caller
+    /// moves the chain on (`create_job` with the held id, `skip_step` or
+    /// `abandon_step`), in the same transaction.
+    Released,
 }
 
 /// A file's processing: its last job and where the chain stands.
@@ -460,6 +500,10 @@ pub struct FileProcessing<H> {
     /// it: set when a chain starts, `None` from any end on. Never in a fact, a
     /// view or a log (the `Debug` of the state leaves it out).
     pub(crate) passport: Option<serde_json::Value>,
+    /// The minted id of the chain's next step's job, held from the previous
+    /// step's final report until Jobs ends that step's job; `None` otherwise.
+    /// Set only while PROCESSING, with `job_id` reported done. Since 0.8.1.
+    pub(crate) next_job_id: Option<Uuid>,
     pending: Pending<ProcessingEvent>,
     host: PhantomData<fn() -> H>,
 }
@@ -485,6 +529,7 @@ impl<H> Clone for FileProcessing<H> {
             past_job_ids: self.past_job_ids.clone(),
             updated_at: self.updated_at,
             passport: self.passport.clone(),
+            next_job_id: self.next_job_id,
             pending: self.pending.clone(),
             host: PhantomData,
         }
@@ -499,6 +544,7 @@ impl<H> std::fmt::Debug for FileProcessing<H> {
             .field("state", &self.state)
             .field("job_id", &self.job_id)
             .field("step_index", &self.step_index)
+            .field("next_job_id", &self.next_job_id)
             .finish_non_exhaustive()
     }
 }
@@ -526,6 +572,7 @@ impl<H> FileProcessing<H> {
             past_job_ids: Vec::new(),
             updated_at: at,
             passport: None,
+            next_job_id: None,
             pending: Pending::default(),
             host: PhantomData,
         }
@@ -547,15 +594,21 @@ impl<H> FileProcessing<H> {
         self.pending.push(&mut self.version, event, meta);
     }
 
-    /// Whether the file's last job is still running.
+    /// Whether the file's last job is still running: PROCESSING, and not
+    /// reported done with the chain's next step held.
     pub(crate) fn is_running(&self) -> bool {
-        self.state == ProcessingState::Processing
+        self.state == ProcessingState::Processing && self.next_job_id.is_none()
+    }
+
+    /// The id of the chain's next step's job, held until Jobs ends the
+    /// file's last job.
+    pub(crate) fn held_job_id(&self) -> Option<Uuid> {
+        self.next_job_id
     }
 
     /// The file's status as its reads see it.
     pub(crate) fn status(&self) -> FileStatus {
-        let running = self.is_running();
-        let facts = if running {
+        let facts = if self.state == ProcessingState::Processing {
             RunningFacts {
                 plan: self.plan.clone(),
                 step: self.plan_at.map(|at| {
@@ -566,6 +619,7 @@ impl<H> FileProcessing<H> {
                     )
                 }),
                 cancel_requested_at: self.cancel_requested_at,
+                reported_done: self.next_job_id.is_some(),
             }
         } else {
             RunningFacts::default()
@@ -622,6 +676,7 @@ impl<H> FileProcessing<H> {
     ) {
         self.retire_current_job();
         self.passport = Some(passport);
+        self.next_job_id = None;
         self.state = ProcessingState::Processing;
         self.job_id = job_id;
         self.step_index = step_index;
@@ -655,10 +710,11 @@ impl<H> FileProcessing<H> {
     }
 
     /// The running job ended: READY on success, else FAILED with `error`. The
-    /// chain's Passport goes with it: a next step gets it back from the
-    /// caller (`create_job`), in the same transaction.
+    /// chain's Passport goes with it, and a held next step: the chain is
+    /// over.
     fn end(&mut self, error: Option<(String, Option<String>)>, meta: &FactMeta) {
         self.passport = None;
+        self.next_job_id = None;
         match error {
             Some((code, message)) => {
                 self.state = ProcessingState::Failed;
@@ -675,11 +731,39 @@ impl<H> FileProcessing<H> {
     }
 
     /// The runner's final report ended the running job. The chain moves on
-    /// from the caller: `create_job`, `skip_step`, or nothing (READY).
+    /// from the caller: `skip_step`, `abandon_step`, or nothing (READY); a
+    /// next step to run is [`Self::report_done_holding`].
     pub(crate) fn report_done(&mut self, meta: &FactMeta) {
         let job_id = self.job_id;
         self.end(None, meta);
         self.push(ProcessingEvent::JobReportedDone { job_id }, meta);
+    }
+
+    /// The runner's final report ended the running job and the chain has a
+    /// next step, `step_index`: its job id, `next_job_id`, is minted and
+    /// held until Jobs ends this job (`Applied::Released`). The file stays
+    /// PROCESSING, the chain's Passport stays held, a cancel request stays
+    /// pending — the job is just no longer the running one.
+    pub(crate) fn report_done_holding(
+        &mut self,
+        step_index: i32,
+        runner_type: String,
+        next_job_id: Uuid,
+        meta: &FactMeta,
+    ) {
+        let job_id = self.job_id;
+        self.next_job_id = Some(next_job_id);
+        self.updated_at = meta.occurred_at;
+        self.push(ProcessingEvent::JobReportedDone { job_id }, meta);
+        self.push(
+            ProcessingEvent::NextStepHeld {
+                step_index,
+                runner_type,
+                job_id: next_job_id,
+                after_job_id: job_id,
+            },
+            meta,
+        );
     }
 
     /// The runner declared the running job failed.
@@ -786,6 +870,26 @@ impl<H> FileProcessing<H> {
         if job_id != self.job_id {
             return self.ignore(job_id, &event, why::NOT_THE_CURRENT_JOB, meta);
         }
+        if self.next_job_id.is_some() {
+            // The job was reported done and the chain's next step waits for
+            // Jobs to end it: any end Jobs settles — its `completed`, or a
+            // `failed` / `cancelled` it settled before the `job.finish` — frees
+            // the file in Jobs. The report was the job's end: a Jobs end other
+            // than `completed` is kept as ignored, as it always was.
+            match fact {
+                Received::Completed => {
+                    self.push(event, meta);
+                    return Applied::Released;
+                }
+                Received::Failed { .. }
+                | Received::Cancelled
+                | Received::CreationRejected { .. } => {
+                    self.ignore(job_id, &event, why::JOB_ALREADY_ENDED, meta);
+                    return Applied::Released;
+                }
+                _ => {}
+            }
+        }
         let running = self.is_running();
         match fact {
             Received::Queued { .. } | Received::Started { .. } | Received::Completed => {
@@ -886,7 +990,7 @@ impl<H> FileProcessing<H> {
 /// The columns of `drive.file_processing`.
 const COLUMNS: &str = "file_id, version, state, job_id, step_index, trigger, triggered_by_id, \
      triggered_by_name, job_created_at, error_code, error_message, plan, plan_index, plan_label, \
-     plan_at, cancel_requested_at, past_job_ids, updated_at, passport";
+     plan_at, cancel_requested_at, past_job_ids, updated_at, passport, next_job_id";
 
 fn config_error(error: impl std::fmt::Display) -> EngineError {
     EngineError::Config(error.to_string())
@@ -922,6 +1026,7 @@ fn row_to_processing<H>(row: &sqlx::postgres::PgRow) -> Result<FileProcessing<H>
         past_job_ids: row.get("past_job_ids"),
         updated_at: row.get("updated_at"),
         passport: row.get("passport"),
+        next_job_id: row.get("next_job_id"),
         pending: Pending::default(),
         host: PhantomData,
     })
@@ -1012,7 +1117,7 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
     };
     sqlx::query(&format!(
         "INSERT INTO drive.file_processing ({COLUMNS}) VALUES \
-         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
+         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
          ON CONFLICT (file_id) DO UPDATE SET version = EXCLUDED.version, state = EXCLUDED.state, \
            job_id = EXCLUDED.job_id, step_index = EXCLUDED.step_index, \
            trigger = EXCLUDED.trigger, triggered_by_id = EXCLUDED.triggered_by_id, \
@@ -1022,7 +1127,7 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
            plan_index = EXCLUDED.plan_index, plan_label = EXCLUDED.plan_label, \
            plan_at = EXCLUDED.plan_at, cancel_requested_at = EXCLUDED.cancel_requested_at, \
            past_job_ids = EXCLUDED.past_job_ids, updated_at = EXCLUDED.updated_at, \
-           passport = EXCLUDED.passport"
+           passport = EXCLUDED.passport, next_job_id = EXCLUDED.next_job_id"
     ))
     .bind(state.file_id)
     .bind(state.version)
@@ -1043,6 +1148,7 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
     .bind(&state.past_job_ids)
     .bind(state.updated_at)
     .bind(&state.passport)
+    .bind(state.next_job_id)
     .execute(conn)
     .await?;
     Ok(())
@@ -1272,6 +1378,108 @@ mod tests {
             processing.receive(ran, Received::Cancelled, &meta()),
             Applied::Ignored,
             "Jobs' late cancel of the ended job moves nothing"
+        );
+    }
+
+    #[test]
+    fn a_final_report_with_a_next_step_holds_it_until_jobs_ends_the_job() {
+        let mut processing = running();
+        let ran = processing.job_id;
+        let held = Uuid::now_v7();
+        processing.report_done_holding(1, "index".into(), held, &meta());
+        assert_eq!(processing.state, ProcessingState::Processing);
+        assert!(!processing.is_running(), "the reported job runs no more");
+        assert_eq!(processing.held_job_id(), Some(held));
+        assert!(processing.passport.is_some(), "the chain still holds it");
+        assert_eq!(kinds(&processing)[2..], ["JobReportedDone", "NextStepHeld"]);
+        let status = processing.status();
+        assert_eq!(status.state, ProcessingState::Processing);
+        let last = status.last_job.unwrap();
+        assert_eq!(last.job_id, ran, "no job runs the held step yet");
+        assert!(last.reported_done());
+        assert!(last.progress().plan.is_empty());
+
+        let run_id = Uuid::now_v7();
+        assert_eq!(
+            processing.receive(
+                ran,
+                Received::PlanDeclared {
+                    run_id,
+                    labels: vec!["late".into()]
+                },
+                &meta()
+            ),
+            Applied::Ignored,
+            "a late progress fact of the reported job moves nothing"
+        );
+        assert_eq!(
+            processing.receive(ran, Received::Completed, &meta()),
+            Applied::Released
+        );
+        assert_eq!(processing.held_job_id(), Some(held), "the caller moves on");
+        processing.create_job(held, 1, "index".into(), None, None, passport(), &meta());
+        assert_eq!(processing.held_job_id(), None);
+        assert!(processing.is_running());
+        assert_eq!(processing.past_job_ids, vec![ran]);
+        assert_eq!(
+            processing.receive(ran, Received::Completed, &meta()),
+            Applied::Ignored,
+            "a redelivered completed finds the step already created"
+        );
+    }
+
+    #[test]
+    fn any_end_jobs_settles_releases_a_held_step_and_only_completed_is_recorded_as_itself() {
+        for fact in [
+            Received::Cancelled,
+            Received::Failed {
+                failure_cause: "x".into(),
+                reason_code: "x".into(),
+                note: None,
+            },
+            Received::CreationRejected {
+                reason_code: "x".into(),
+                params: serde_json::json!({}),
+            },
+        ] {
+            let mut processing = running();
+            let ran = processing.job_id;
+            processing.report_done_holding(1, "index".into(), Uuid::now_v7(), &meta());
+            assert_eq!(processing.receive(ran, fact, &meta()), Applied::Released);
+            assert_eq!(processing.state, ProcessingState::Processing);
+            assert!(processing.error_code.is_none(), "the report was the end");
+            assert_eq!(kinds(&processing).last(), Some(&"JobFactIgnored"));
+        }
+        let mut processing = running();
+        processing.report_done_holding(1, "index".into(), Uuid::now_v7(), &meta());
+        assert_eq!(
+            processing.receive(Uuid::now_v7(), Received::Completed, &meta()),
+            Applied::Ignored,
+            "another job's end releases nothing"
+        );
+        assert!(processing.held_job_id().is_some());
+    }
+
+    #[test]
+    fn a_held_step_skipped_on_a_cancel_ends_the_chain_on_the_reported_job() {
+        let mut processing = running();
+        let ran = processing.job_id;
+        processing.report_done_holding(1, "index".into(), Uuid::now_v7(), &meta());
+        processing.request_cancel(&meta());
+        assert_eq!(
+            processing.receive(ran, Received::Completed, &meta()),
+            Applied::Released
+        );
+        processing.skip_step(1, "index".into(), &meta());
+        assert_eq!(processing.state, ProcessingState::Failed);
+        assert_eq!(processing.error_code.as_deref(), Some(CANCELLED));
+        assert_eq!(processing.job_id, ran);
+        assert_eq!(processing.held_job_id(), None);
+        assert!(processing.passport.is_none());
+        assert_eq!(
+            processing.receive(ran, Received::Completed, &meta()),
+            Applied::Noted,
+            "a redelivered completed after the skip only confirms"
         );
     }
 

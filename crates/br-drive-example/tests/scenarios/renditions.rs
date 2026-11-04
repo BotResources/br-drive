@@ -259,6 +259,7 @@ async fn a_later_step_reads_the_rendition_and_a_final_report_with_no_pages_keeps
     )
     .await);
     jobs.await_finish(first).await;
+    jobs.complete(first).await;
     let second = jobs.await_create(file_id).await.job_id;
     assert_ne!(second, first);
 
