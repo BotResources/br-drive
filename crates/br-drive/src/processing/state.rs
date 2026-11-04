@@ -164,19 +164,6 @@ pub enum ProcessingEvent {
         after_job_id: Uuid,
         reason_code: String,
     },
-    /// The previous step's job, `after_job_id`, was reported done and Jobs
-    /// told (`job.finish`): the chain's next step, `step_index`, is decided
-    /// and its job id minted, `job_id`, but its `job.create` waits for Jobs'
-    /// own end of `after_job_id` — Jobs holds one live job per file and
-    /// judges a create and a finish on separate consumers, in no order. The
-    /// file stays PROCESSING; `JobCreated` with that id follows when Jobs'
-    /// end arrives, or `StepSkipped` / `StepAbandoned` instead. Since 0.8.1.
-    NextStepHeld {
-        step_index: i32,
-        runner_type: String,
-        job_id: Uuid,
-        after_job_id: Uuid,
-    },
     /// A fact received about a job that changes nothing any more: an end
     /// after the job's first end, a progress fact of an ended job or one
     /// already known, any fact about an earlier job of the file. `received`
@@ -191,6 +178,19 @@ pub enum ProcessingEvent {
     /// (`JobCancelSent`); Jobs' own `cancelled`, when it comes, changes
     /// nothing. Since 0.5.1.
     JobCancelledOnFreeze { job_id: Uuid },
+    /// The previous step's job, `after_job_id`, was reported done and Jobs
+    /// told (`job.finish`): the chain's next step, `step_index`, is decided
+    /// and its job id minted, `job_id`, but its `job.create` waits for Jobs'
+    /// own end of `after_job_id` — Jobs holds one live job per file and
+    /// judges a create and a finish on separate consumers, in no order. The
+    /// file stays PROCESSING; `JobCreated` with that id follows when Jobs'
+    /// end arrives, or `StepSkipped` / `StepAbandoned` instead. Since 0.8.1.
+    NextStepHeld {
+        step_index: i32,
+        runner_type: String,
+        job_id: Uuid,
+        after_job_id: Uuid,
+    },
 }
 
 impl DriveEvent for ProcessingEvent {
