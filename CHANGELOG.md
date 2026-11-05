@@ -9,6 +9,90 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.8.2 — 2026-11-05
+
+A chain's first step is asked of Jobs once the engine promoted the file's
+source, no longer at the commit. No signature changes; a host on 0.8.1
+upgrades by bumping the pin and applying the new migration (the library's
+`migrate` does). Engine and `contract-jobs` pins are unchanged.
+
+### Fixed
+
+- **A runner no longer meets `SOURCE_NOT_AVAILABLE` on its first call.** The
+  commit (on a host that processes on commit) checked the source with a live
+  storage HEAD and staged the first step's `job.create` in its own
+  transaction, while the engine's blob row was still `pending`: the engine
+  promotes it only in its blob reaper (once per reaper interval, 60 s by
+  default) and serves no download URL for a verified source before that. The
+  runner, called a fraction of a second after the commit, was refused
+  `SOURCE_NOT_AVAILABLE` until the reaper's next sweep and leaned on Jobs'
+  retries (observed 10–42 s on a real deployment). Now a chain started on a
+  source still pending **awaits its promotion**: the gesture records
+  everything it recorded before — the rule (the commit's choice rules are
+  unchanged), the `steps` snapshot, the initiator's Passport, the file
+  `PROCESSING`, `ChainStarted` — mints the first step's job id and records
+  `SourceAwaited` instead of `JobCreated`; the source's post-upload policy,
+  in the promotion's transaction, commands the new `source-promoted`
+  self-command, whose reaction stages the `job.create.v3` with the minted id
+  (`JobCreated`). The runner's first `<p>RunnerContext` call is served.
+  Behaviour is unchanged when the reaper already promoted the source (a late
+  commit, a reprocess, a regeneration): the job is created in the gesture.
+  The same holds for `ProcessFile` right after a commit on a two-gesture host.
+- Between the gesture and the promotion the file is `PROCESSING`, `progress`
+  at step 0 with nothing run, `lastJob` the minted job with an
+  `awaiting_source` entry (`FileJob::awaiting_source()`), and no active job
+  (`FileRow::active_job()` is `None`; the minted id answers `JOB_NOT_ACTIVE`
+  to a runner). A `<p>CancelProcessing` or a `freeze_drive` drops the
+  awaiting step at once (`AwaitedStepDropped`, the file `FAILED`
+  `cancelled`) and sends Jobs nothing; a deleted file leaves the promotion
+  nothing to start; an initiator erased meanwhile drops the step
+  `passport_missing` at the promotion. A redelivered promotion creates the
+  step once.
+
+### Changed
+
+- **`FileRow::active_job()` answers `None` while the first step awaits the
+  source**, as it does while a next step is held (0.8.1).
+- **A host whose `record_facts` refuses a step's `JobCreated` refuses it in
+  the promotion's reaction** when the step awaited its source, not in the
+  gesture: the gesture is acked, the reaction is retried, and the file stays
+  `PROCESSING` until a user cancels it.
+- `SOURCE_NOT_AVAILABLE` stays as a defensive refusal of `<p>RunnerContext`
+  (a source the engine cannot serve); it is no longer the normal path, and
+  the host contract no longer documents "retry until promoted".
+
+### Added
+
+- **Migration `9121000016_processing_awaiting_source`**: `drive.file_processing
+  .awaiting_source` (boolean, default `false`, only while `processing`).
+  Additive; a 0.8.1 binary ignores it and never creates an awaiting step.
+  **Upgrade with no mixed 0.8.1 / 0.8.2 consumers** — a `Recreate` rollout,
+  or one replica during the upgrade — and let awaiting steps drain (none
+  waits longer than one reaper interval) before rolling back. A file
+  stranded all the same is released by the user's `<p>CancelProcessing` on
+  0.8.2.
+- **Self-command `source-promoted`** (durable
+  `{SERVICE}-drive-source-promoted`), the library's twelfth reaction; it
+  arrives as a service actor, like `image-landed`.
+- **Facts** on `drive_file_processing`: `SourceAwaited { step_index,
+  runner_type, job_id }` and `AwaitedStepDropped { step_index, runner_type,
+  job_id, reason_code }`, appended after `NextStepHeld` (`ProcessingEvent` is
+  `#[non_exhaustive]`).
+- **`FileJob::awaiting_source()`** and the job-event kind
+  `awaiting_source`.
+- e2e `source_promotion`: with the reaper held off the source (a row lock on
+  its blob row, anchored on the reaper waiting on it), no `job.create` before
+  the promotion and the job created with the minted id once it lands, the
+  runner served on its first call; a replayed promotion creates the step
+  once; a commit on a source already promoted creates the job in the commit;
+  a `ProcessFile` right after a commit awaits too; a cancel, a freeze, a
+  delete and an erasure while the step awaits; a rule deleted meanwhile does
+  not change the chain the commit decided. `upload_processed` and the
+  `commit_processing` scenarios now wait for the promotion first, so they
+  keep proving the in-gesture path whatever the reaper's timing; the runner
+  scenario that expected `SOURCE_NOT_AVAILABLE` until the promotion now
+  expects no job and `JOB_NOT_ACTIVE`.
+
 ## 0.8.1 — 2026-11-04
 
 A chain's next step is created once Jobs ended the previous one, no longer

@@ -454,6 +454,90 @@ impl World {
         }
     }
 
+    /// Holds the engine reaper off the source of `file_id`: a transaction
+    /// of the suite locks the source's blob row, so the reaper's promotion (an
+    /// `UPDATE` of that row) waits until [`PromotionHold::release`]. Reads of
+    /// the row (a commit's storage HEAD, a gesture's promotion check) are not
+    /// held. Take it before the bytes land, or the reaper may promote first.
+    pub async fn hold_promotion(&self, file_id: Uuid) -> PromotionHold {
+        let source = self.source_of(file_id).await;
+        let mut tx = self
+            .db
+            .app
+            .begin()
+            .await
+            .expect("open the holding transaction");
+        sqlx::query("SELECT 1 FROM service_engine.blob WHERE id = $1 FOR UPDATE")
+            .bind(source)
+            .execute(&mut *tx)
+            .await
+            .expect("lock the source's blob row");
+        PromotionHold { tx }
+    }
+
+    /// Waits until `count` statements of the host's database wait on a row
+    /// lock — the reaper's promotion behind a [`PromotionHold`], say: the
+    /// anchor after which "the promotion has not happened" is a fact, not a
+    /// timing.
+    pub async fn await_lock_waiters(&self, count: i64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = $1 AND wait_event_type = 'Lock' \
+                   AND query LIKE 'UPDATE service_engine.blob%'",
+            )
+            .bind(&self.db.database)
+            .fetch_one(&self.db.admin)
+            .await
+            .expect("read the database's activity");
+            if waiting >= count {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{count} blob update(s) never waited on the hold ({waiting} did)"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The library's `source-promoted` self-command for `file_id`, published
+    /// on the host's command subject as the source's post-upload policy does
+    /// — a redelivery; answers its message id.
+    pub async fn send_source_promoted(&self, file_id: Uuid) -> Uuid {
+        use br_core_integration::{Actor, EventMetadata, IntegrationCommand, ServiceAccountId};
+        let message_id = Uuid::now_v7();
+        let command = IntegrationCommand::new(
+            message_id,
+            "drive_source.promoted",
+            1,
+            chrono::Utc::now(),
+            EventMetadata::new(
+                Actor::Service(ServiceAccountId::from(Uuid::now_v7())),
+                Uuid::now_v7(),
+            ),
+            serde_json::json!({ "file_id": file_id }),
+        );
+        let bytes = serde_json::to_vec(&command).expect("the command encodes");
+        let client = async_nats::connect(self.nats_server.url())
+            .await
+            .expect("dial the ephemeral broker");
+        let js = async_nats::jetstream::new(client);
+        js.publish(
+            format!(
+                "integration.cmd.{}.drive_source.promoted.v1",
+                br_drive_example::SERVICE
+            ),
+            bytes.into(),
+        )
+        .await
+        .expect("publish the redelivered promotion")
+        .await
+        .expect("the stream acks the redelivered promotion");
+        message_id
+    }
+
     pub async fn source_of(&self, file_id: Uuid) -> Uuid {
         sqlx::query_scalar("SELECT blob_ref FROM drive.file WHERE id = $1")
             .bind(file_id)
@@ -980,6 +1064,18 @@ pub async fn refute_delta(
             !forbidden(&delta[root]),
             "a forbidden delta arrived: {delta}"
         );
+    }
+}
+
+/// The suite's lock on a source's blob row ([`World::hold_promotion`]).
+pub struct PromotionHold {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
+impl PromotionHold {
+    /// Lets the reaper's promotion through.
+    pub async fn release(self) {
+        self.tx.rollback().await.expect("release the hold");
     }
 }
 

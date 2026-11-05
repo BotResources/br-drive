@@ -419,7 +419,8 @@ pub(crate) async fn visible_file_keys<H: DriveHost>(
 /// Where the running chain is, while the file is PROCESSING: the step of
 /// the file's active job, and what that job's runner said of its run — or,
 /// while the next step is held until Jobs ends the job reported done, that
-/// next step, nothing run yet.
+/// next step, nothing run yet; while the first step awaits the source's
+/// promotion, that step, nothing run yet.
 fn progress_of<H>(row: &FileRow<H>) -> Option<DriveProgress> {
     let job = row.processing_job()?;
     let steps = row.steps.as_deref().unwrap_or_default();

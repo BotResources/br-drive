@@ -228,7 +228,9 @@ pub struct DriveFrozen {
 ///   not in yet) has nothing running: no `job.cancel` is staged, the held
 ///   step is skipped (`StepSkipped`) and the file is `FAILED` `cancelled`;
 ///   Jobs' later end of the job reported done is recorded as itself and
-///   changes nothing.
+///   changes nothing. A file whose chain's first step awaits the source's
+///   promotion (0.8.2) has nothing in Jobs either: the step is dropped
+///   (`AwaitedStepDropped`), the file `FAILED` `cancelled`, no `job.cancel`.
 /// - Every pending upload of the drive (`committed_at` unset) is abandoned
 ///   as its upload deadline would: `UploadAbandoned`, the row deleted, its
 ///   blob released; a later commit meets `FILE_NOT_FOUND`.
@@ -270,6 +272,20 @@ pub async fn freeze_drive<H: DriveHost>(
             continue;
         };
         let mut processing = crate::processing::load_processing(ops, &file).await?;
+        if processing.awaits_source() {
+            // The chain's first step awaits the source and was never asked
+            // of Jobs: it is dropped, nothing to cancel there.
+            crate::processing::drop_awaited_step(
+                ops,
+                meta,
+                &mut file,
+                &mut processing,
+                crate::processing::CANCELLED,
+            )
+            .await?;
+            frozen.cancelled += 1;
+            continue;
+        }
         if processing.held_job_id().is_some() {
             // The last job was reported done and the next step waits for
             // Jobs to end it: nothing runs to cancel, the held step is

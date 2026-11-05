@@ -97,6 +97,10 @@ pub fn register<H: DriveHost>(
         &durable(RENDITION_LANDED_DURABLE),
         rendition_landed::<H>,
     )?;
+    engine.register_reaction::<processing::SourcePromoted<H>, _, _>(
+        &durable(processing::SOURCE_PROMOTED_DURABLE),
+        processing::source_promoted_reaction::<H>,
+    )?;
     engine.register_reaction::<QueuedFact, _, _>(
         &durable(processing::DURABLE_QUEUED),
         processing::on_queued::<H>,

@@ -6,10 +6,13 @@ mod chain;
 mod commands;
 mod reactions;
 mod roots;
+mod source;
 mod state;
 
 pub use chain::{ChainPlan, cancel_active_job};
-pub(crate) use chain::{load_processing, report_done, report_failed, skip_next_step, start_chain};
+pub(crate) use chain::{
+    drop_awaited_step, load_processing, report_done, report_failed, skip_next_step, start_chain,
+};
 pub use commands::Initiator;
 pub(crate) use commands::JobCancel;
 pub use reactions::{
@@ -20,6 +23,9 @@ pub use reactions::{
     on_queued, on_started, on_step_started,
 };
 pub use roots::{RootNames, declare_roots};
+pub(crate) use source::{
+    SOURCE_PROMOTED_DURABLE, SourcePromoted, source_pending, source_promoted_reaction,
+};
 pub(crate) use state::RunningFacts;
 pub use state::{
     CANCELLED, FileJob, FileProcessing, FileProcessingNoun, FileProcessingStore, PASSPORT_MISSING,

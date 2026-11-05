@@ -15,7 +15,10 @@
 //!   about it — and any fact about an earlier job of the file — is kept as
 //!   `JobFactIgnored` and moves nothing;
 //! - a user's cancel crossing the runner's final report stops the chain
-//!   before its next step.
+//!   before its next step;
+//! - a chain's first step is never asked of Jobs before the engine promoted
+//!   the file's source: started on a source not yet promoted, the step's job
+//!   id is minted and the step awaits the promotion (`SourceAwaited`, 0.8.2).
 
 use std::marker::PhantomData;
 
@@ -64,6 +67,9 @@ pub mod kind {
     pub const REPORTED_DONE: &str = "reported_done";
     /// The runner declared the job failed, with its reason.
     pub const REPORTED_FAILED: &str = "reported_failed";
+    /// The job is the chain's first step, decided but not yet asked of Jobs:
+    /// it waits for the engine to promote the file's source. Since 0.8.2.
+    pub const AWAITING_SOURCE: &str = "awaiting_source";
 }
 
 /// The noun of a file's processing: keyed by the file's id.
@@ -191,6 +197,28 @@ pub enum ProcessingEvent {
         job_id: Uuid,
         after_job_id: Uuid,
     },
+    /// The chain's first step, `step_index`, is decided and its job id
+    /// minted, `job_id` — the file's last job — but the file's source is not
+    /// promoted yet (the engine serves no download before its reaper verified
+    /// the object), so its `job.create` waits for the promotion: `JobCreated`
+    /// with that id follows when it reaches the library, or
+    /// `AwaitedStepDropped` instead. The file is PROCESSING. Since 0.8.2.
+    SourceAwaited {
+        step_index: i32,
+        runner_type: String,
+        job_id: Uuid,
+    },
+    /// The chain stopped before its first step, `job_id`, which awaited the
+    /// source's promotion (`SourceAwaited`) and was never asked of Jobs: a
+    /// user's cancel or a freeze (`cancelled`), or, at the promotion, the
+    /// chain's Passport missing or unreadable (`reason_code`). The file is
+    /// FAILED with that code. Since 0.8.2.
+    AwaitedStepDropped {
+        step_index: i32,
+        runner_type: String,
+        job_id: Uuid,
+        reason_code: String,
+    },
 }
 
 impl DriveEvent for ProcessingEvent {
@@ -211,6 +239,8 @@ impl DriveEvent for ProcessingEvent {
             Self::StepSkipped { .. } => "StepSkipped",
             Self::StepAbandoned { .. } => "StepAbandoned",
             Self::NextStepHeld { .. } => "NextStepHeld",
+            Self::SourceAwaited { .. } => "SourceAwaited",
+            Self::AwaitedStepDropped { .. } => "AwaitedStepDropped",
             Self::JobPlanDeclared { .. } => "JobPlanDeclared",
             Self::JobStepStarted { .. } => "JobStepStarted",
             Self::JobQueued { .. } => "JobQueued",
@@ -247,7 +277,8 @@ pub struct FileJob {
     /// current plan (`plan_declared`, `steps`), the latest step started
     /// (`step_started`, `index`, `label`, `started_at`) and a cancel request
     /// (`cancel_requested`); once the job was reported done while the chain's
-    /// next step is held, `reported_done` (and a cancel request) instead.
+    /// next step is held, `reported_done` (and a cancel request) instead;
+    /// while the job is a first step awaiting its source, `awaiting_source`.
     /// Empty once the processing ended.
     pub events: Vec<serde_json::Value>,
     pub created_at: DateTime<Utc>,
@@ -277,6 +308,15 @@ impl FileJob {
     /// more and is not the file's active job. Since 0.8.1.
     pub fn reported_done(&self) -> bool {
         entries_of(&self.events, kind::REPORTED_DONE)
+            .next()
+            .is_some()
+    }
+
+    /// Whether the job is the chain's first step, decided but not yet asked
+    /// of Jobs: it waits for the engine to promote the file's source, so it
+    /// runs nothing yet and is not the file's active job. Since 0.8.2.
+    pub fn awaiting_source(&self) -> bool {
+        entries_of(&self.events, kind::AWAITING_SOURCE)
             .next()
             .is_some()
     }
@@ -331,6 +371,9 @@ pub(crate) struct RunningFacts {
     /// The job was reported done and the chain's next step is held until
     /// Jobs ends it: the job no longer runs, its plan and step are gone.
     pub reported_done: bool,
+    /// The job is the chain's first step awaiting the source's promotion:
+    /// nothing of it ran.
+    pub awaiting_source: bool,
 }
 
 impl RunningFacts {
@@ -338,6 +381,9 @@ impl RunningFacts {
     pub(crate) fn entries(self) -> Vec<serde_json::Value> {
         let reported_done = self.reported_done;
         let mut entries = Vec::new();
+        if self.awaiting_source {
+            entries.push(serde_json::json!({ "kind": kind::AWAITING_SOURCE }));
+        }
         if reported_done {
             entries.push(serde_json::json!({ "kind": kind::REPORTED_DONE }));
         } else if let Some(plan) = self.plan {
@@ -504,6 +550,10 @@ pub struct FileProcessing<H> {
     /// step's final report until Jobs ends that step's job; `None` otherwise.
     /// Set only while PROCESSING, with `job_id` reported done. Since 0.8.1.
     pub(crate) next_job_id: Option<Uuid>,
+    /// The file's last job is the chain's first step, minted but not yet
+    /// asked of Jobs: it waits for the source's promotion. Set only while
+    /// PROCESSING. Since 0.8.2.
+    pub(crate) awaiting_source: bool,
     pending: Pending<ProcessingEvent>,
     host: PhantomData<fn() -> H>,
 }
@@ -530,6 +580,7 @@ impl<H> Clone for FileProcessing<H> {
             updated_at: self.updated_at,
             passport: self.passport.clone(),
             next_job_id: self.next_job_id,
+            awaiting_source: self.awaiting_source,
             pending: self.pending.clone(),
             host: PhantomData,
         }
@@ -545,6 +596,7 @@ impl<H> std::fmt::Debug for FileProcessing<H> {
             .field("job_id", &self.job_id)
             .field("step_index", &self.step_index)
             .field("next_job_id", &self.next_job_id)
+            .field("awaiting_source", &self.awaiting_source)
             .finish_non_exhaustive()
     }
 }
@@ -573,6 +625,7 @@ impl<H> FileProcessing<H> {
             updated_at: at,
             passport: None,
             next_job_id: None,
+            awaiting_source: false,
             pending: Pending::default(),
             host: PhantomData,
         }
@@ -594,10 +647,19 @@ impl<H> FileProcessing<H> {
         self.pending.push(&mut self.version, event, meta);
     }
 
-    /// Whether the file's last job is still running: PROCESSING, and not
-    /// reported done with the chain's next step held.
+    /// Whether the file's last job is still running: PROCESSING, not
+    /// reported done with the chain's next step held, and not a first step
+    /// still awaiting the source.
     pub(crate) fn is_running(&self) -> bool {
-        self.state == ProcessingState::Processing && self.next_job_id.is_none()
+        self.state == ProcessingState::Processing
+            && self.next_job_id.is_none()
+            && !self.awaiting_source
+    }
+
+    /// Whether the file's last job is the chain's first step awaiting the
+    /// source's promotion.
+    pub(crate) fn awaits_source(&self) -> bool {
+        self.awaiting_source
     }
 
     /// The id of the chain's next step's job, held until Jobs ends the
@@ -620,6 +682,7 @@ impl<H> FileProcessing<H> {
                 }),
                 cancel_requested_at: self.cancel_requested_at,
                 reported_done: self.next_job_id.is_some(),
+                awaiting_source: self.awaiting_source,
             }
         } else {
             RunningFacts::default()
@@ -674,9 +737,12 @@ impl<H> FileProcessing<H> {
         passport: serde_json::Value,
         meta: &FactMeta,
     ) {
-        self.retire_current_job();
+        if self.job_id != job_id {
+            self.retire_current_job();
+        }
         self.passport = Some(passport);
         self.next_job_id = None;
+        self.awaiting_source = false;
         self.state = ProcessingState::Processing;
         self.job_id = job_id;
         self.step_index = step_index;
@@ -689,6 +755,62 @@ impl<H> FileProcessing<H> {
                 job_id,
                 step_index,
                 runner_type,
+            },
+            meta,
+        );
+    }
+
+    /// The chain's first step, `step_index`, becomes the file's last job as
+    /// `job_id`, minted now, but is not asked of Jobs: the file's source is
+    /// not promoted yet. The file is PROCESSING and the chain keeps its
+    /// Passport; [`Self::create_job`] with the same id follows at the
+    /// promotion, or [`Self::drop_awaited_step`].
+    pub(crate) fn await_source(
+        &mut self,
+        job_id: Uuid,
+        step_index: i32,
+        runner_type: String,
+        trigger: Option<Trigger>,
+        triggered_by: Option<Initiator>,
+        meta: &FactMeta,
+    ) {
+        self.retire_current_job();
+        self.next_job_id = None;
+        self.awaiting_source = true;
+        self.state = ProcessingState::Processing;
+        self.job_id = job_id;
+        self.step_index = step_index;
+        self.trigger = trigger;
+        self.triggered_by = triggered_by;
+        self.job_created_at = meta.occurred_at;
+        self.updated_at = meta.occurred_at;
+        self.push(
+            ProcessingEvent::SourceAwaited {
+                step_index,
+                runner_type,
+                job_id,
+            },
+            meta,
+        );
+    }
+
+    /// The chain stops before its first step, which awaited the source: the
+    /// step is never asked of Jobs and the file is FAILED `reason_code`.
+    pub(crate) fn drop_awaited_step(
+        &mut self,
+        runner_type: String,
+        reason_code: &str,
+        meta: &FactMeta,
+    ) {
+        let job_id = self.job_id;
+        let step_index = self.step_index;
+        self.end(Some((reason_code.to_string(), None)), meta);
+        self.push(
+            ProcessingEvent::AwaitedStepDropped {
+                step_index,
+                runner_type,
+                job_id,
+                reason_code: reason_code.to_string(),
             },
             meta,
         );
@@ -715,6 +837,7 @@ impl<H> FileProcessing<H> {
     fn end(&mut self, error: Option<(String, Option<String>)>, meta: &FactMeta) {
         self.passport = None;
         self.next_job_id = None;
+        self.awaiting_source = false;
         match error {
             Some((code, message)) => {
                 self.state = ProcessingState::Failed;
@@ -990,7 +1113,7 @@ impl<H> FileProcessing<H> {
 /// The columns of `drive.file_processing`.
 const COLUMNS: &str = "file_id, version, state, job_id, step_index, trigger, triggered_by_id, \
      triggered_by_name, job_created_at, error_code, error_message, plan, plan_index, plan_label, \
-     plan_at, cancel_requested_at, past_job_ids, updated_at, passport, next_job_id";
+     plan_at, cancel_requested_at, past_job_ids, updated_at, passport, next_job_id, awaiting_source";
 
 fn config_error(error: impl std::fmt::Display) -> EngineError {
     EngineError::Config(error.to_string())
@@ -1027,6 +1150,7 @@ fn row_to_processing<H>(row: &sqlx::postgres::PgRow) -> Result<FileProcessing<H>
         updated_at: row.get("updated_at"),
         passport: row.get("passport"),
         next_job_id: row.get("next_job_id"),
+        awaiting_source: row.get("awaiting_source"),
         pending: Pending::default(),
         host: PhantomData,
     })
@@ -1117,7 +1241,7 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
     };
     sqlx::query(&format!(
         "INSERT INTO drive.file_processing ({COLUMNS}) VALUES \
-         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
+         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) \
          ON CONFLICT (file_id) DO UPDATE SET version = EXCLUDED.version, state = EXCLUDED.state, \
            job_id = EXCLUDED.job_id, step_index = EXCLUDED.step_index, \
            trigger = EXCLUDED.trigger, triggered_by_id = EXCLUDED.triggered_by_id, \
@@ -1127,7 +1251,8 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
            plan_index = EXCLUDED.plan_index, plan_label = EXCLUDED.plan_label, \
            plan_at = EXCLUDED.plan_at, cancel_requested_at = EXCLUDED.cancel_requested_at, \
            past_job_ids = EXCLUDED.past_job_ids, updated_at = EXCLUDED.updated_at, \
-           passport = EXCLUDED.passport, next_job_id = EXCLUDED.next_job_id"
+           passport = EXCLUDED.passport, next_job_id = EXCLUDED.next_job_id, \
+           awaiting_source = EXCLUDED.awaiting_source"
     ))
     .bind(state.file_id)
     .bind(state.version)
@@ -1149,6 +1274,7 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
     .bind(state.updated_at)
     .bind(&state.passport)
     .bind(state.next_job_id)
+    .bind(state.awaiting_source)
     .execute(conn)
     .await?;
     Ok(())
@@ -1660,6 +1786,95 @@ mod tests {
         assert!(
             !facts.contains("service_account_id") && !facts.contains("claims"),
             "no fact carries the passport: {facts}"
+        );
+    }
+
+    fn awaiting() -> (FileProcessing<()>, Uuid) {
+        let meta = meta();
+        let mut processing = FileProcessing::<()>::blank(Uuid::now_v7(), meta.occurred_at);
+        processing.start_chain(Trigger::Upload, None, Vec::new(), passport(), &meta);
+        let job = Uuid::now_v7();
+        processing.await_source(job, 0, "render".into(), Some(Trigger::Upload), None, &meta);
+        (processing, job)
+    }
+
+    #[test]
+    fn a_first_step_awaiting_the_source_processes_but_runs_nothing() {
+        let (processing, job) = awaiting();
+        assert_eq!(kinds(&processing), vec!["ChainStarted", "SourceAwaited"]);
+        assert_eq!(processing.state, ProcessingState::Processing);
+        assert!(processing.awaits_source());
+        assert!(!processing.is_running(), "no job runs before the promotion");
+        assert!(
+            processing.passport.is_some(),
+            "the chain keeps its passport"
+        );
+        assert_eq!(processing.held_job_id(), None, "not a held next step");
+        let status = processing.status();
+        let last = status.last_job.expect("the minted step is the last job");
+        assert_eq!(last.job_id, job);
+        assert_eq!(last.step_index, 0);
+        assert!(last.awaiting_source());
+        assert!(!last.reported_done());
+        assert_eq!(last.progress().plan, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_promotion_creates_the_awaited_step_with_its_minted_id() {
+        let (mut processing, job) = awaiting();
+        let meta = meta();
+        processing.create_job(
+            job,
+            0,
+            "render".into(),
+            Some(Trigger::Upload),
+            None,
+            passport(),
+            &meta,
+        );
+        assert_eq!(
+            kinds(&processing),
+            vec!["ChainStarted", "SourceAwaited", "JobCreated"]
+        );
+        assert!(!processing.awaits_source());
+        assert!(processing.is_running());
+        assert_eq!(processing.job_id, job);
+        assert!(
+            processing.past_job_ids.is_empty(),
+            "the awaited step is the created job, not an earlier one"
+        );
+        assert!(!processing.status().last_job.unwrap().awaiting_source());
+    }
+
+    #[test]
+    fn a_dropped_awaited_step_fails_the_file_and_lets_its_passport_go() {
+        let (mut processing, job) = awaiting();
+        processing.drop_awaited_step("render".into(), CANCELLED, &meta());
+        assert_eq!(processing.state, ProcessingState::Failed);
+        assert_eq!(processing.error_code.as_deref(), Some(CANCELLED));
+        assert!(!processing.awaits_source());
+        assert!(processing.passport.is_none());
+        let Some(Stamped {
+            event:
+                ProcessingEvent::AwaitedStepDropped {
+                    step_index,
+                    job_id,
+                    reason_code,
+                    runner_type,
+                },
+            ..
+        }) = processing.pending().last()
+        else {
+            panic!("the dropped step is a fact");
+        };
+        assert_eq!(
+            (
+                *step_index,
+                *job_id,
+                reason_code.as_str(),
+                runner_type.as_str()
+            ),
+            (0, job, CANCELLED, "render")
         );
     }
 }

@@ -6,7 +6,7 @@ use crate::harness::runner::{
     RUNNER_SCOPE, Report, context, image_ticket, install_render_rule, report, request_image,
     upload_image,
 };
-use crate::harness::upload::{UploadRequest, post_bytes, upload_processed};
+use crate::harness::upload::{UploadRequest, post_bytes, process, upload, upload_processed};
 use crate::harness::{
     JobsStandIn, World, WorldOptions, drain_with_a_rename, drive_subscription, error_code,
     manager_passport, next_drive_delta, next_page_delta, ok, pages_subscription, passport,
@@ -109,7 +109,9 @@ async fn the_runner_context_carries_a_fresh_presigned_get_on_the_source_and_the_
 }
 
 #[tokio::test]
-async fn the_runner_context_says_source_not_available_until_the_reaper_promoted_the_source() {
+async fn no_runner_is_offered_a_file_whose_source_the_reaper_has_not_promoted() {
+    // Given: a reaper that does not sweep during the scenario, and a file
+    // committed then processed at once — its source still pending
     let world = World::start_with(
         "pod-runner-source-pending",
         WorldOptions {
@@ -121,18 +123,40 @@ async fn the_runner_context_says_source_not_available_until_the_reaper_promoted_
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
     let jobs = JobsStandIn::attach(&world).await;
-    let (_, file_id, job_id) = file_with_job(&world, &jobs, &owner).await;
-
-    let pending = context(&world, &runner, file_id, job_id).await;
+    let manager = manager_passport(Uuid::now_v7(), "Ada");
+    install_render_rule(&world, &manager).await;
+    let drive = world.create_workspace(&owner, "library").await;
+    let file_id = upload(
+        &world,
+        &owner,
+        &UploadRequest::text(drive, "docs", "source.txt", SOURCE),
+    )
+    .await;
     assert_eq!(
-        error_code(&pending),
-        "SOURCE_NOT_AVAILABLE",
-        "a verified source is not downloadable before the engine reaper promotes it"
+        world
+            .blob_state(world.source_of(file_id).await)
+            .await
+            .as_deref(),
+        Some("pending")
     );
+    ok(&process(&world, &owner, file_id).await);
+
+    // Then: the chain started — the file PROCESSING — but its first job is
+    // not asked of Jobs, and its minted id opens nothing: a runner is never
+    // handed a source it cannot read (`SOURCE_NOT_AVAILABLE` stays a
+    // defensive refusal, off the normal path)
     assert_eq!(
         world.file(&owner, file_id).await["processingState"],
-        "PROCESSING",
-        "the commit itself went through and the chain started"
+        "PROCESSING"
+    );
+    let minted = world
+        .job_of(file_id)
+        .await
+        .expect("the step's id is minted");
+    jobs.expect_no_command(Duration::from_secs(1)).await;
+    assert_eq!(
+        error_code(&context(&world, &runner, file_id, minted).await),
+        "JOB_NOT_ACTIVE"
     );
 
     world.cleanup().await;

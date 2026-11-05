@@ -34,6 +34,7 @@ mod rulesets;
 mod runner;
 mod runner_end;
 mod smoke;
+mod source_promotion;
 mod titles;
 mod upload;
 mod upload_rule;

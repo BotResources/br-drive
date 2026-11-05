@@ -3,6 +3,10 @@
 //! the commit's transaction, never READY in between; a file no rule matches
 //! is stored, READY, and the commit is not refused; with the switch off the
 //! commit only stores, as the two-gesture flow does.
+//!
+//! Every upload here lands and is promoted by the engine before its commit:
+//! the chain then starts in the commit's own transaction. A commit on a source
+//! not promoted yet awaits the promotion: `scenarios::source_promotion`.
 
 use std::time::Duration;
 
@@ -24,7 +28,7 @@ fn processing_on_commit() -> WorldOptions {
 }
 
 /// Requests an upload and posts its bytes: the file is PENDING, its object
-/// landed.
+/// landed and promoted by the engine.
 async fn landed(world: &World, passport: &str, drive: Uuid, name: &str) -> Uuid {
     let file_id = Uuid::now_v7();
     let upload_ticket = ticket(
@@ -38,6 +42,7 @@ async fn landed(world: &World, passport: &str, drive: Uuid, name: &str) -> Uuid 
     );
     let posted = post_bytes(world, &upload_ticket, BYTES, name).await;
     assert!((200..300).contains(&posted), "the object lands: {posted}");
+    world.await_source_promoted(file_id).await;
     file_id
 }
 

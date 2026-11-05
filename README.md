@@ -27,7 +27,7 @@ is created on `job.create.v3`, with a Passport.
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.8.1", version = "0.8.1" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.8.2", version = "0.8.2" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -102,7 +102,7 @@ rolls them together. The host never writes to the `drive` schema directly.
 ### Embedding checklist
 
 1. **Compose**: `slice drive ["drive"] from br_drive::drive_slice { query = drive::DriveQuery, mutation = drive::DriveMutation, subscription = drive::DriveSubscription }` under the host's `prefix`; every root below appears at that prefix.
-2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and the library's three self-commands (`upload-deadline`, `image-landed`, `rendition-landed`) arrive as a service actor, and a resolver that rejects services parks all eleven reactions.
+2. **Principals**: the engine's `register_reaction_principal` must resolve `Actor::Service` — every Jobs fact and the library's four self-commands (`upload-deadline`, `image-landed`, `rendition-landed`, `source-promoted`) arrive as a service actor, and a resolver that rejects services parks all twelve reactions.
 3. **`DriveHost`** on the principal — whose `Principal::passport()` must answer the caller's own Passport, as the gateway forwarded it (see [The chain's Passport](#the-chains-passport)): `SERVICE`, `RUNNER_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, `RENDITION_MAX_BYTES`, the three `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `record_facts` (required), `visible_drives` (never a service principal), `admit` (the host's caller admission, asked first by every root), `display_name`, `upload_window`, `process_on_commit`, `erase_mode`, the two folder hooks.
 4. **Fact table**: the host's own fact table (the reference table under [Facts](#facts-handed-to-the-host)), created by a host migration; `record_facts` inserts into it on the connection it is given.
 5. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
@@ -188,8 +188,10 @@ every `RequestUpload`.
   the `upload` rule the uploader chose at `RequestUpload` (`rulesetId`, since
   0.5.1), else of the default `upload` rule matching the file's media type, in its own
   transaction, when the host's `Process { file }` gate allows it — a file
-  that will be processed is never `READY` before it is; a file no rule
-  matches is stored, `READY`, with no refusal. `false` keeps the two-gesture
+  that will be processed is never `READY` before it is; its first job is
+  asked of Jobs once the engine promoted the source (see
+  [The first step waits for the source](#the-first-step-waits-for-the-source));
+  a file no rule matches is stored, `READY`, with no refusal. `false` keeps the two-gesture
   flow (commit, then `ProcessFile`). A host may decide per principal (the
   example host reads its settings).
 - `record_facts(conn, facts)` is **required**: a host that does not
@@ -286,7 +288,7 @@ renders it, is committed at
 | Root | Shape |
 |---|---|
 | `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256, title?, rulesetId?): UploadTicket!` | `title` trimmed, 1–255 characters, one line, no control or bidirectional-override character (`INVALID_TITLE`); absent, it is the requested `name` without its extension (`report.pdf` → `report`; a name with no stem is kept whole; a collision renames the file, never its title); gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). `rulesetId` (since 0.5.1) chooses the `upload` rule the commit runs, for a front that lets its user pick a processing per upload: validated as `ProcessFile` validates a named rule — after the gate and the drive — `RULESET_NOT_FOUND`, `RULESET_MISMATCH` (another trigger, or no pattern matching the media type); pinned on the pending file (`UploadRulesetChosen`, the fact after `UploadTicketIssued`). Without it nothing is pinned and the commit runs the default, as before. |
-| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then, on a host that processes on commit (`DriveHost::process_on_commit`, default `true`) and whose `Process { file }` gate allows it, the `upload` rule the uploader chose — else the default `upload` rule matching the file's media type — starts its chain **in the commit's transaction**: the file goes `PENDING` → `PROCESSING`, never `READY` first, and the facts `UploadCommitted`, `ChainStarted`, `JobCreated` share the commit's correlation (a failure rolls all of it back). No matching rule, or the gate refusing: the file is `READY` — stored only — and the commit is not refused. A chosen rule deleted since the request, or changed so it no longer carries the `upload` trigger or matches the file, stores the file `READY` too: the default never runs in the place of the rule the uploader chose. With the switch off, the file is `READY` and `ProcessFile` starts its chain. A second commit is `FILE_NOT_PENDING`. |
+| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then, on a host that processes on commit (`DriveHost::process_on_commit`, default `true`) and whose `Process { file }` gate allows it, the `upload` rule the uploader chose — else the default `upload` rule matching the file's media type — starts its chain **in the commit's transaction**: the file goes `PENDING` → `PROCESSING`, never `READY` first, and the commit records the chain — the rule, its `steps` snapshot, the committer's Passport — with the commit's correlation (a failure rolls all of it back). The first step's job is asked of Jobs once the engine promoted the source (since 0.8.2): in the commit itself (`UploadCommitted`, `ChainStarted`, `JobCreated`) when the reaper already promoted it, else at the promotion (`ChainStarted`, `SourceAwaited` at the commit; `JobCreated` when the promotion lands — [The first step waits for the source](#the-first-step-waits-for-the-source)). No matching rule, or the gate refusing: the file is `READY` — stored only — and the commit is not refused. A chosen rule deleted since the request, or changed so it no longer carries the `upload` trigger or matches the file, stores the file `READY` too: the default never runs in the place of the rule the uploader chose. With the switch off, the file is `READY` and `ProcessFile` starts its chain. A second commit is `FILE_NOT_PENDING`. |
 | `<p>ProcessFile(fileId, rulesetId?): MutationAck!` | starts processing on a host that does not process on commit — right after the commit, later, or never — and reprocesses on any host: gate `Process { file }`, then a `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload, `FILE_PROCESSING` while a chain runs). A file that never had a job runs its `upload` rule, any other its `reprocess` rule (see "Processing rules": `RULESET_NOT_FOUND`, `RULESET_MISMATCH`, `NO_RULESET_MATCHES`). Nothing is wiped: the previous results stay readable while the new run reports over them. Affordance `process`. |
 | `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; records `JobCancelSent` on the file's processing and stages `job.cancel.v2` for the running job (the live cause stays `CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). While the chain's next step is held (its last job reported done, Jobs' end not in yet — since 0.8.1) nothing runs: the held step is skipped at once (`StepSkipped`, `FAILED` `cancelled`, cause `ProcessingFailed`), the `job.cancel.v2` of the job reported done still staged. Affordance `cancelProcessing`. |
 | `<p>RegeneratePage(fileId, number, comment?, rulesetId?): MutationAck!` | run the `regenerate_page` rule on one page of a `READY` file: `page` and `comment` are merged into the first step's options; `PAGE_NOT_FOUND`, `NO_RULESET_MATCHES`. Affordance `regeneratePage` on the page. |
@@ -401,7 +403,7 @@ runner reports and never interprets a media type.
 
 | Root | Shape |
 |---|---|
-| `<p>RunnerContext(fileId, jobId): RunnerContext!` | `{ fileId, mediaType, name, pageCount, summary, pages[] { number, markdown, origin, updatedAt }, images[], renditions[] { name, kind, mediaType, sizeBytes, url }, sourceUrl }` — a **fresh** presigned GET on the source (inline) at every call, plus the current markdown rendition read directly by file id, so an indexer or a page-regeneration runner reads the pages, not the source; and the landed file renditions, each with a **fresh** presigned GET (inline) at every call, so a later step of the chain reads what an earlier one produced (since 0.8.0; read behind their own gate after the snapshot — a rendition replaced while it is presigned is re-read and its current object signed, never left out). `FILE_NOT_FOUND` for an unknown file, `JOB_NOT_ACTIVE` for any job but the file's, `SOURCE_NOT_AVAILABLE` while the engine reaper has not promoted the source yet (retry). The file, its pages and its image names are read in one read-only snapshot behind the runner source gate (`Query::behind`). |
+| `<p>RunnerContext(fileId, jobId): RunnerContext!` | `{ fileId, mediaType, name, pageCount, summary, pages[] { number, markdown, origin, updatedAt }, images[], renditions[] { name, kind, mediaType, sizeBytes, url }, sourceUrl }` — a **fresh** presigned GET on the source (inline) at every call, plus the current markdown rendition read directly by file id, so an indexer or a page-regeneration runner reads the pages, not the source; and the landed file renditions, each with a **fresh** presigned GET (inline) at every call, so a later step of the chain reads what an earlier one produced (since 0.8.0; read behind their own gate after the snapshot — a rendition replaced while it is presigned is re-read and its current object signed, never left out). `FILE_NOT_FOUND` for an unknown file, `JOB_NOT_ACTIVE` for any job but the file's active one. A job is asked of Jobs only once the engine promoted the file's source (since 0.8.2), so the first call is served; `SOURCE_NOT_AVAILABLE` remains a defensive refusal for a source the engine cannot serve (a source row with no promoted object), never the normal path. The file, its pages and its image names are read in one read-only snapshot behind the runner source gate (`Query::behind`). |
 | `<p>RunnerRequestImageUpload(fileId, jobId, name, mediaType, size: ByteCount, sha256): UploadTicket!` | a verified presigned POST for a `drive_image` blob (the runner hashes first; `FILE_TOO_LARGE` past `DriveHost::IMAGE_MAX_BYTES`) and the `file_image` row, unique per file by name. An existing name is **replaced only when the new object lands**: until then the old image stays readable and a failed replacement upload changes nothing; when it lands, the row swaps and the old object is released in the same transaction. A re-request for a name whose upload is still in flight is refused with `IMAGE_UPLOAD_PENDING` (the first ticket stands, one blob per request — the same posture as the source's `KEY_REUSED`); past the host's `upload_window` a re-request replaces the abandoned blob. |
 | `<p>RunnerRequestRenditionUpload(fileId, jobId, name, kind, mediaType, size: ByteCount, sha256): UploadTicket!` | since 0.8.0: a verified presigned POST for a `drive_rendition` blob (`FILE_TOO_LARGE` past `DriveHost::RENDITION_MAX_BYTES`, 5 GiB by default — a single presigned POST is capped at 5 GB on AWS S3) and the `file_rendition` row, unique per file by name. Same posture as an image: an existing name is **replaced only when the new object lands** (its old object and kind stay current until then, a failed upload changes nothing, the old object is released in the landing's transaction), and a re-request while an upload is in flight is `RENDITION_UPLOAD_PENDING`. `INVALID_RENDITION_NAME`, `INVALID_RENDITION_KIND`. See [File renditions](#file-renditions). |
 | `<p>RunnerReport(fileId, jobId, pages: [ReportedPageInput!], origin: PageOrigin, summary, pageCount, estimatedTokens, done): MutationAck!` | pages in one or several batches of at most `MAX_REPORT_PAGES` (512, `BATCH_TOO_LARGE`), **upserted by number** (a replayed batch changes nothing; a number twice in one batch is `INVALID_PAGE`) — except that the run of an `upload` or `reprocess` chain never overwrites a page whose origin is `EDITED` (a person's correction is kept; a `regenerate_page` run does overwrite it); each page written reaches `<p>FilePages` on its own key (`Reported { job_id, origin }`) and the file row is touched only by the indexer's triple. `origin` `RUNNER` (default) or `REGENERATED` — on a regenerated page the images of that page that its new markdown no longer references (matched on the whole name, `![…](p001-img01.png)`, never as a substring) are dropped and released (`ImagesDropped { names }` on the file); `summary` and `pageCount` are the indexer's pair and move together, `estimatedTokens` is optional and only rides along with them (`INDEXER_FIELDS_TOGETHER` otherwise, `INVALID_INDEXER_VALUE` when negative; an indexing without an estimate clears a previous one; `ReportStored { job_id, done }` on the file when any of the three changes); an empty report is `NOTHING_TO_CHANGE` unless `done`; `done: true` ends the job in the report's transaction — the chain moves on and `job.finish.v2` is staged (see "Processing rules"); a replayed final report meets a job that no longer runs (`JOB_NOT_ACTIVE`). |
@@ -543,6 +545,54 @@ rule, else `NO_RULESET_MATCHES` (a regeneration cannot be inferred from an
 upload snapshot). A rule never applies retroactively, and a rule edited or
 deleted while a chain runs never reaches that chain: the File keeps a `steps`
 snapshot taken when the rule fired.
+
+### The first step waits for the source
+
+The engine serves no download URL for a verified source until its blob
+reaper has verified the landed object and promoted its row (`pending` →
+`uploaded`, once per reaper interval — `EngineConfig::with_blob_reaper_interval`, 60 s by default). A job
+created before that would hand its runner a file it cannot read. So since
+0.8.2 a chain's first step is asked of Jobs **only once the source is
+promoted**:
+
+- a gesture that starts a chain — the commit on a host that processes on
+  commit, `<p>ProcessFile`, `<p>RegeneratePage` — decides everything at once,
+  as before: the rule (the commit's choice rules are unchanged: decided at
+  the commit, a rule deleted or edited afterwards never reaches the chain,
+  which runs the `steps` snapshot), the chain's Passport, the file
+  `PROCESSING`, `ChainStarted`. On a source already promoted (or one the
+  engine holds no pending row for) the first step's `job.create` is staged in
+  that transaction, as before. On a source **still pending** the step's job
+  id is minted and the step **awaits the promotion**
+  (`drive.file_processing.awaiting_source`; `SourceAwaited { step_index,
+  runner_type, job_id }`), with `ProcessingStarted { job_id, step: 0 }` on
+  the file's views;
+- while it awaits, the file is `PROCESSING`: `progress` names step 0,
+  nothing run yet (`plan` empty); `lastJob` is the minted job, whose
+  `events` carry `{ "kind": "awaiting_source" }` (`FileJob::awaiting_source()`);
+  `FileRow::active_job()` is `None` — nothing runs, the minted id answers
+  `JOB_NOT_ACTIVE` to a runner; `<p>ProcessFile` is `FILE_PROCESSING`;
+  `<p>FileAccess` is `null` (the engine's rule);
+- the source's post-upload policy (the promotion's transaction) commands the
+  library's `source-promoted` self-command (durable
+  `{SERVICE}-drive-source-promoted`); its reaction locks the file — a gesture
+  still deciding on it is waited for — and, when the step still awaits,
+  stages the `job.create.v3` with the minted id, the chain's Passport and its
+  initiator (`JobCreated`; `ProgressChanged` on the file's views). The
+  runner's first `<p>RunnerContext` call then serves the source. A
+  redelivered promotion, or one for a file with nothing awaiting, changes
+  nothing;
+- a user's `<p>CancelProcessing` or the host's `freeze_drive` while the step
+  awaits drops it **at once** (`AwaitedStepDropped { step_index,
+  runner_type, job_id, reason_code: "cancelled" }`, the file `FAILED`
+  `cancelled`), and sends Jobs nothing — it never heard of the step; a
+  `DeleteFile` deletes the file and its processing, and the promotion later
+  finds nothing to start. An initiator erased meanwhile leaves no Passport:
+  the promotion drops the step `passport_missing` (`AwaitedStepDropped`), as
+  a next step would be abandoned;
+- a host whose `record_facts` refuses the step's `JobCreated` now refuses it
+  in the promotion's reaction, not in the gesture: the reaction is retried,
+  and the file stays `PROCESSING` until a user cancels it.
 
 The chain, one step at a time, in the library's own transactions:
 
@@ -930,7 +980,7 @@ writers of one aggregate would hand the same `seq`.
 | `drive_page` (`PageEvent`) | `Reported { job_id, origin }`, `Edited`, `Trimmed` |
 | `drive_label` (`LabelEvent`) | `Created { name, color, description }`, `Updated { name, color, description }`, `Deleted` |
 | `drive_ruleset` (`RulesetEvent`) | `Created { name, trigger, media_types, steps, is_default }`, `Saved { name, media_types, steps, is_default }`, `Deleted` |
-| `drive_file_processing` (`ProcessingEvent`) | `ChainStarted { trigger, ruleset_id, steps }`, `JobCreated { job_id, step_index, runner_type }`, `JobReportedDone { job_id }`, `JobReportedFailed { job_id, reason_code, message }`, `JobFailed { job_id, failure_cause, reason_code, note }`, `JobCancelled { job_id }`, `JobCancelledOnFreeze { job_id }` (0.5.1), `JobCreationRejected { job_id, reason_code, params }`, `JobCancelSent { job_id }`, `StepSkipped { step_index, runner_type, after_job_id }`, `StepAbandoned { step_index, runner_type, after_job_id, reason_code }` (0.7.0), `NextStepHeld { step_index, runner_type, job_id, after_job_id }` (0.8.1), `JobPlanDeclared { job_id, run_id, labels }`, `JobStepStarted { job_id, run_id, index, label, started_at }`, `JobQueued { job_id, runner_type }`, `JobStarted { job_id, run_id }`, `JobCompleted { job_id }`, `JobFactIgnored { job_id, received, why }` |
+| `drive_file_processing` (`ProcessingEvent`) | `ChainStarted { trigger, ruleset_id, steps }`, `JobCreated { job_id, step_index, runner_type }`, `JobReportedDone { job_id }`, `JobReportedFailed { job_id, reason_code, message }`, `JobFailed { job_id, failure_cause, reason_code, note }`, `JobCancelled { job_id }`, `JobCancelledOnFreeze { job_id }` (0.5.1), `JobCreationRejected { job_id, reason_code, params }`, `JobCancelSent { job_id }`, `StepSkipped { step_index, runner_type, after_job_id }`, `StepAbandoned { step_index, runner_type, after_job_id, reason_code }` (0.7.0), `NextStepHeld { step_index, runner_type, job_id, after_job_id }` (0.8.1), `SourceAwaited { step_index, runner_type, job_id }` (0.8.2), `AwaitedStepDropped { step_index, runner_type, job_id, reason_code }` (0.8.2), `JobPlanDeclared { job_id, run_id, labels }`, `JobStepStarted { job_id, run_id, index, label, started_at }`, `JobQueued { job_id, runner_type }`, `JobStarted { job_id, run_id }`, `JobCompleted { job_id }`, `JobFactIgnored { job_id, received, why }` |
 
 Every payload is at schema version 1 (`FILE_EVENT_VERSION`,
 `PAGE_EVENT_VERSION`, `LABEL_EVENT_VERSION`, `RULESET_EVENT_VERSION`,
