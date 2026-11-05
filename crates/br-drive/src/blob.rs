@@ -55,6 +55,9 @@ pub fn image_available<'a, H: DriveHost>(
     })
 }
 
+/// The source of a file was promoted: its views learn the source is
+/// readable, and a chain step awaiting it is released
+/// ([`crate::processing::SourcePromoted`]).
 pub fn source_available<'a, H: DriveHost>(
     uploaded: Uploaded<'a>,
     ps: &'a mut PostSave<'_, '_>,
@@ -71,6 +74,10 @@ pub fn source_available<'a, H: DriveHost>(
                 ps.impact::<H::DriveOwner>(&drive, service_engine::impact::Dims::ALL)?;
             }
             ps.impact_caused::<File, _>(&id, FileCause::SourceAvailable)?;
+            // A chain's first step may await this promotion: its reaction
+            // decides under the file's lock (a commit still deciding is
+            // waited for), so the command goes out whatever the file's state.
+            ps.command(crate::processing::SourcePromoted::<H>::new(id))?;
         }
         Ok(())
     })

@@ -374,6 +374,11 @@ impl MutationInput for CancelProcessing {
 /// job reported done — harmless on a settled job, and it frees the file in
 /// Jobs if the `job.finish` never landed; a later Jobs end of that job only
 /// confirms.
+///
+/// A file whose chain's first step still awaits the source's promotion
+/// (since 0.8.2) has nothing in Jobs: the step is dropped at once
+/// (`AwaitedStepDropped`), the file is FAILED `cancelled`, no `job.cancel`
+/// is sent, and the promotion later starts nothing.
 pub fn cancel_processing<'m, H: DriveHost>(
     cx: &'m mut Mutation<'m, H>,
     input: CancelProcessing,
@@ -389,6 +394,19 @@ pub fn cancel_processing<'m, H: DriveHost>(
         };
         let mut processing = processing::load_processing(cx, &file).await?;
         let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
+        if processing.awaits_source() {
+            // The chain's first step was never asked of Jobs: nothing to
+            // cancel there, the step is dropped here.
+            processing::drop_awaited_step(
+                cx,
+                &meta,
+                &mut file,
+                &mut processing,
+                processing::CANCELLED,
+            )
+            .await?;
+            return Ok(());
+        }
         processing.request_cancel(&meta);
         cx.command(processing::JobCancel {
             payload: CancelJob { job_id },

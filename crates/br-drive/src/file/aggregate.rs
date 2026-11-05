@@ -424,13 +424,17 @@ impl<H> FileRow<H> {
 
     /// The job running now: the last job while the file is PROCESSING —
     /// unless it was reported done and the chain's next step is held until
-    /// Jobs ends it ([`FileJob::reported_done`]): no job runs then.
+    /// Jobs ends it ([`FileJob::reported_done`]), or it is the chain's first
+    /// step still awaiting the source's promotion
+    /// ([`FileJob::awaiting_source`], since 0.8.2): no job runs then.
     pub fn active_job(&self) -> Option<&FileJob> {
-        self.processing_job().filter(|job| !job.reported_done())
+        self.processing_job()
+            .filter(|job| !job.reported_done() && !job.awaiting_source())
     }
 
-    /// The last job while the file is PROCESSING, running or reported done
-    /// with the chain's next step held: the job a cancel or a freeze is about.
+    /// The last job while the file is PROCESSING, running, reported done
+    /// with the chain's next step held, or a first step awaiting the source:
+    /// the job a cancel or a freeze is about.
     pub(crate) fn processing_job(&self) -> Option<&FileJob> {
         self.last_job()
             .filter(|_| self.status.state == ProcessingState::Processing)

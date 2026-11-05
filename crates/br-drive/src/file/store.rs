@@ -59,6 +59,7 @@ pub(crate) fn file_select(prefix: &str) -> String {
         ("plan_at", "last_job_plan_at"),
         ("cancel_requested_at", "last_job_cancel_requested_at"),
         ("next_job_id", "last_job_next_job_id"),
+        ("awaiting_source", "last_job_awaiting_source"),
     ]
     .into_iter()
     .map(|(column, name)| format!("s.{column} AS {prefix}{name}"));
@@ -149,6 +150,9 @@ pub(crate) fn row_to_file_prefixed<H>(
                     reported_done: row
                         .get::<Option<Uuid>, _>(column("last_job_next_job_id").as_str())
                         .is_some(),
+                    awaiting_source: row
+                        .get::<Option<bool>, _>(column("last_job_awaiting_source").as_str())
+                        .unwrap_or(false),
                 }
             } else {
                 RunningFacts::default()

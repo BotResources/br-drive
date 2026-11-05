@@ -225,7 +225,10 @@ impl MutationInput for CommitUpload {
 /// the file goes PROCESSING, never READY first — when the host's `Process`
 /// gate allows it; without such a rule, or with the gate refusing, the file is
 /// READY, stored only, and the commit is not refused. Otherwise the file is
-/// READY and processing is a gesture of its own (`ProcessFile`).
+/// READY and processing is a gesture of its own (`ProcessFile`). The chain's
+/// first job is asked of Jobs here only when the engine already promoted the
+/// source; otherwise it awaits the promotion (`SourceAwaited`, since 0.8.2),
+/// so no runner is ever handed a source it cannot read yet.
 pub fn commit_upload<'m, H: DriveHost>(
     cx: &'m mut Mutation<'m, H>,
     input: CommitUpload,

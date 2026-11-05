@@ -198,9 +198,13 @@ pub async fn process_with(
 }
 
 /// An upload committed, then processed: what a front does right after the
-/// commit when its user wants the file processed.
+/// commit when its user wants the file processed — once the engine promoted
+/// the source, so the gesture starts its first job in its own transaction
+/// whatever the reaper's timing (a chain started before the promotion awaits
+/// it: `scenarios::source_promotion`).
 pub async fn upload_processed(world: &World, passport: &str, request: &UploadRequest<'_>) -> Uuid {
     let file_id = upload(world, passport, request).await;
+    world.await_source_promoted(file_id).await;
     let processed = process(world, passport, file_id).await;
     assert!(
         processed.get("errors").is_none(),

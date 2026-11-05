@@ -198,11 +198,15 @@ async fn launch_step<H: DriveHost>(
     Ok(Some(job_id))
 }
 
-/// Starts a chain on a READY or FAILED file: the plan becomes the file's
-/// snapshot and its first step a job. Nothing of the previous results is
-/// touched — they stay readable while the new run reports over them. The
-/// chain acts under `passport`, the initiator's own: it is kept with the
-/// file's processing until the chain ends, and every step's job carries it.
+/// Starts a chain on a file just committed, READY or FAILED: the plan becomes
+/// the file's snapshot and its first step a job. Nothing of the previous
+/// results is touched — they stay readable while the new run reports over
+/// them. The chain acts under `passport`, the initiator's own: it is kept with
+/// the file's processing until the chain ends, and every step's job carries
+/// it. On a source still pending the engine's promotion — its runner could
+/// not read it — the first step's job id is minted and the step awaits the
+/// promotion (`SourceAwaited`, the file PROCESSING); its `job.create` is
+/// staged by [`release_awaited_step`] when the promotion reaches the library.
 pub(crate) async fn start_chain<H: DriveHost>(
     cx: &mut Ops<'_>,
     meta: &FactMeta,
@@ -222,6 +226,23 @@ pub(crate) async fn start_chain<H: DriveHost>(
         )))
     })?;
     processing.start_chain(trigger, plan.ruleset_id, plan.steps, document, meta);
+    if file.steps.as_ref().is_none_or(Vec::is_empty) {
+        return Err(DriveFault::Refused(codes::INVALID_RULESET));
+    }
+    if super::source_pending(cx.connection(), file.blob_ref).await? {
+        let job_id = Uuid::now_v7();
+        processing.await_source(
+            job_id,
+            0,
+            runner_type_of(file, 0),
+            Some(trigger),
+            Some(initiator),
+            meta,
+        );
+        save_processing(cx, file, &mut processing).await?;
+        crate::file::file_changed::<H>(cx, file, FileCause::ProcessingStarted { job_id, step: 0 })?;
+        return Ok(());
+    }
     let Some(job_id) = launch_step(
         cx,
         meta,
@@ -338,6 +359,62 @@ pub(crate) async fn release_next_step<H: DriveHost>(
         FileCause::ProcessingStarted {
             job_id,
             step: step_number(next),
+        },
+    )?;
+    Ok(())
+}
+
+/// The engine promoted the file's source and the chain's first step awaits
+/// it: the step's `job.create` is staged with the id minted when the chain
+/// started, and the step becomes the file's running job (`JobCreated`). A
+/// Passport no longer held or readable drops the step
+/// (`AwaitedStepDropped`). A user's cancel or a freeze drops an awaited step
+/// at once ([`drop_awaited_step`]), so none is found cancelled here.
+pub(crate) async fn release_awaited_step<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    meta: &FactMeta,
+    file: &mut FileRow<H>,
+    processing: &mut FileProcessing<H>,
+) -> Result<(), DriveFault> {
+    let index = usize::try_from(processing.step_index).unwrap_or(0);
+    let passport = match chain_passport(processing.take_passport()) {
+        Ok(passport) => passport,
+        Err(reason) => return drop_awaited_step(cx, meta, file, processing, reason).await,
+    };
+    let job_id = processing.job_id;
+    let trigger = processing.trigger;
+    let initiator = processing.triggered_by.clone();
+    launch_step(
+        cx, meta, file, processing, index, job_id, trigger, initiator, &passport,
+    )
+    .await?
+    .ok_or_else(|| {
+        DriveFault::Engine(EngineError::Config(
+            "a chain's awaited first step vanished under the file's lock".into(),
+        ))
+    })?;
+    save_processing(cx, file, processing).await?;
+    crate::file::file_progressed::<H>(cx, file)?;
+    Ok(())
+}
+
+/// The chain stops before its first step, which awaited the source and was
+/// never asked of Jobs: the file is FAILED `reason`.
+pub(crate) async fn drop_awaited_step<H: DriveHost>(
+    cx: &mut Ops<'_>,
+    meta: &FactMeta,
+    file: &mut FileRow<H>,
+    processing: &mut FileProcessing<H>,
+    reason: &'static str,
+) -> Result<(), DriveFault> {
+    let index = usize::try_from(processing.step_index).unwrap_or(0);
+    processing.drop_awaited_step(runner_type_of(file, index), reason, meta);
+    save_processing(cx, file, processing).await?;
+    crate::file::file_changed::<H>(
+        cx,
+        file,
+        FileCause::ProcessingFailed {
+            reason: reason.to_string(),
         },
     )?;
     Ok(())
