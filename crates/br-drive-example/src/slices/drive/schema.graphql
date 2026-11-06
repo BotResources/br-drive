@@ -55,11 +55,11 @@ type DriveLabel {
 }
 
 type DriveMutation {
-	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!, title: String, rulesetId: UUID): UploadTicket!
+	workspaceRequestUpload(fileId: UUID!, driveId: UUID!, path: String!, name: String!, mediaType: String!, size: ByteCount!, sha256: String!, title: String, rulesetId: UUID, priority: Int): UploadTicket!
 	workspaceCommitUpload(fileId: UUID!): MutationAck!
-	workspaceProcessFile(fileId: UUID!, rulesetId: UUID): MutationAck!
+	workspaceProcessFile(fileId: UUID!, rulesetId: UUID, priority: Int): MutationAck!
 	workspaceCancelProcessing(fileId: UUID!): MutationAck!
-	workspaceRegeneratePage(fileId: UUID!, number: Int!, comment: String, rulesetId: UUID): MutationAck!
+	workspaceRegeneratePage(fileId: UUID!, number: Int!, comment: String, rulesetId: UUID, priority: Int): MutationAck!
 	workspaceCreateRuleset(id: UUID!, name: String!, trigger: Trigger!, mediaTypes: [String!]!, steps: [RulesetStepInput!]!, isDefault: Boolean! = false): RulesetSaved!
 	workspaceUpdateRuleset(id: UUID!, name: String, mediaTypes: [String!], steps: [RulesetStepInput!], isDefault: Boolean): RulesetSaved!
 	workspaceCreateLabel(id: UUID!, name: String!, color: String!, description: String): MutationAck!

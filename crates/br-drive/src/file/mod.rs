@@ -71,6 +71,7 @@ pub(crate) mod tests_support {
             ruleset_id: None,
             steps: None,
             upload_ruleset_id: None,
+            upload_priority: None,
             created_by: Uuid::now_v7(),
             created_at: now,
             updated_at: now,

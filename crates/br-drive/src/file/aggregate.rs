@@ -262,6 +262,12 @@ pub enum FileEvent {
     UploadRulesetChosen {
         ruleset_id: Uuid,
     },
+    /// The uploader named the priority its commit's chain asks Jobs for, with
+    /// the upload ticket (after `UploadTicketIssued`, and
+    /// `UploadRulesetChosen` when a rule was chosen too). Since 0.9.0.
+    UploadPriorityChosen {
+        priority: i16,
+    },
 }
 
 impl crate::facts::DriveEvent for FileEvent {
@@ -290,6 +296,7 @@ impl crate::facts::DriveEvent for FileEvent {
             Self::FolderDeleted { .. } => "FolderDeleted",
             Self::DriveDeleted => "DriveDeleted",
             Self::UploadRulesetChosen { .. } => "UploadRulesetChosen",
+            Self::UploadPriorityChosen { .. } => "UploadPriorityChosen",
         }
     }
 }
@@ -315,6 +322,9 @@ pub struct FileRow<H> {
     /// The `upload` rule the uploader chose at `RequestUpload`, for the
     /// commit's chain; `None`: the default `upload` rule matching the file.
     pub(crate) upload_ruleset_id: Option<Uuid>,
+    /// The priority the uploader pinned at `RequestUpload` for the commit's
+    /// chain (1 to 5); `None`: the chain asks Jobs for none. Since 0.9.0.
+    pub(crate) upload_priority: Option<i16>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
     /// The file's last change: the latest of its own row's and of its
@@ -381,6 +391,7 @@ impl<H> Clone for FileRow<H> {
             ruleset_id: self.ruleset_id,
             steps: self.steps.clone(),
             upload_ruleset_id: self.upload_ruleset_id,
+            upload_priority: self.upload_priority,
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,

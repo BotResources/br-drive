@@ -84,6 +84,27 @@ async fn save_processing<H: DriveHost>(
     Ok(())
 }
 
+/// The lowest priority a chain may ask Jobs for. Since 0.9.0.
+pub const MIN_CHAIN_PRIORITY: i32 = 1;
+/// The highest priority a chain may ask Jobs for. Since 0.9.0.
+pub const MAX_CHAIN_PRIORITY: i32 = 5;
+
+/// The priority a gesture that starts a chain named, checked: 1 (lowest) to 5
+/// (highest), else `INVALID_PRIORITY`; none named asks for nothing (Jobs'
+/// default applies). Never judged against the initiator's ceiling: Jobs caps
+/// it at the maximum of the user the job runs for.
+pub(crate) fn chain_priority(requested: Option<i32>) -> Result<Option<i16>, DriveFault> {
+    requested
+        .map(|priority| {
+            if (MIN_CHAIN_PRIORITY..=MAX_CHAIN_PRIORITY).contains(&priority) {
+                i16::try_from(priority).map_err(|_| DriveFault::Refused(codes::INVALID_PRIORITY))
+            } else {
+                Err(DriveFault::Refused(codes::INVALID_PRIORITY))
+            }
+        })
+        .transpose()
+}
+
 /// The Passport the chain acts under, read back from the file's processing
 /// for its next step: the `processingError` the chain ends with when it is
 /// not held ([`PASSPORT_MISSING`]) or no longer reads as a Passport
@@ -122,8 +143,9 @@ fn step_number(index: usize) -> i32 {
 }
 
 /// Starts step `index` of the file's snapshot as job `job_id`: the file's
-/// running job and its `job.create` (v3, carrying the chain's `passport`),
-/// staged through the outbox. `None` past the last step.
+/// running job and its `job.create` (v3, carrying the chain's `passport` and
+/// asking for the chain's priority, held on `processing`), staged through the
+/// outbox. `None` past the last step.
 #[allow(clippy::too_many_arguments)]
 async fn launch_step<H: DriveHost>(
     cx: &mut Ops<'_>,
@@ -162,6 +184,7 @@ async fn launch_step<H: DriveHost>(
         )))
     })?;
     let triggered_by = triggered_by(passport, initiator.as_ref());
+    let priority = processing.priority.map(i64::from);
     processing.create_job(
         job_id,
         step_index,
@@ -192,7 +215,7 @@ async fn launch_step<H: DriveHost>(
             source_bc: Some(H::SERVICE.to_string()),
             source_entity_id: Some(file.id),
             max_attempts: None,
-            priority: None,
+            priority,
         },
     })?;
     Ok(Some(job_id))
@@ -203,10 +226,13 @@ async fn launch_step<H: DriveHost>(
 /// results is touched — they stay readable while the new run reports over
 /// them. The chain acts under `passport`, the initiator's own: it is kept with
 /// the file's processing until the chain ends, and every step's job carries
-/// it. On a source still pending the engine's promotion — its runner could
-/// not read it — the first step's job id is minted and the step awaits the
-/// promotion (`SourceAwaited`, the file PROCESSING); its `job.create` is
-/// staged by [`release_awaited_step`] when the promotion reaches the library.
+/// it. So is `priority`, the one the gesture named (checked by
+/// [`chain_priority`]): every step's job asks Jobs for it. On a source still
+/// pending the engine's promotion — its runner could not read it — the first
+/// step's job id is minted and the step awaits the promotion
+/// (`SourceAwaited`, the file PROCESSING); its `job.create` is staged by
+/// [`release_awaited_step`] when the promotion reaches the library.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_chain<H: DriveHost>(
     cx: &mut Ops<'_>,
     meta: &FactMeta,
@@ -215,6 +241,7 @@ pub(crate) async fn start_chain<H: DriveHost>(
     trigger: Trigger,
     initiator: Initiator,
     passport: &Passport,
+    priority: Option<i16>,
 ) -> Result<(), DriveFault> {
     file.ruleset_id = plan.ruleset_id;
     file.steps = Some(plan.steps.clone());
@@ -225,7 +252,14 @@ pub(crate) async fn start_chain<H: DriveHost>(
             "a passport does not encode: {error}"
         )))
     })?;
-    processing.start_chain(trigger, plan.ruleset_id, plan.steps, document, meta);
+    processing.start_chain(
+        trigger,
+        plan.ruleset_id,
+        plan.steps,
+        document,
+        priority,
+        meta,
+    );
     if file.steps.as_ref().is_none_or(Vec::is_empty) {
         return Err(DriveFault::Refused(codes::INVALID_RULESET));
     }
