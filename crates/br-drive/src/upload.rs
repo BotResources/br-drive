@@ -39,6 +39,12 @@ pub struct RequestUpload {
     pub media_type: String,
     pub size: u64,
     pub sha256_hex: String,
+    /// The priority the commit's chain asks Jobs for at every step, 1
+    /// (lowest) to 5 (highest), pinned on the pending file
+    /// (`INVALID_PRIORITY` out of range); absent, it asks for none and Jobs'
+    /// default applies. Since 0.9.0.
+    #[serde(default)]
+    pub priority: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, async_graphql::SimpleObject)]
@@ -113,6 +119,7 @@ async fn request_upload_in<H: DriveHost>(
         if input.file_id.get_version_num() != 7 {
             return Err(DriveFault::Refused(codes::INVALID_FILE_ID));
         }
+        let priority = processing::chain_priority(input.priority)?;
         let path = DrivePath::parse(&input.path).map_err(Reason::from)?;
         let name = FileName::parse(&input.name).map_err(Reason::from)?;
         let title = match input.title.as_deref() {
@@ -170,6 +177,7 @@ async fn request_upload_in<H: DriveHost>(
             ruleset_id: None,
             steps: None,
             upload_ruleset_id: upload_ruleset,
+            upload_priority: priority,
             created_by: cx.principal().id().as_uuid(),
             created_at: now,
             updated_at: now,
@@ -193,6 +201,9 @@ async fn request_upload_in<H: DriveHost>(
         );
         if let Some(ruleset_id) = upload_ruleset {
             file.record(FileEvent::UploadRulesetChosen { ruleset_id }, &meta);
+        }
+        if let Some(priority) = priority {
+            file.record(FileEvent::UploadPriorityChosen { priority }, &meta);
         }
         facts::create(cx, &mut file).await?;
         crate::file::file_changed::<H>(cx, &file, FileCause::UploadRequested)?;
@@ -253,6 +264,7 @@ pub fn commit_upload<'m, H: DriveHost>(
             if let Some(rule) = rule {
                 let initiator = processing::Initiator::of(cx.principal());
                 let passport = cx.principal().passport().clone();
+                let priority = file.upload_priority;
                 processing::start_chain(
                     cx,
                     &meta,
@@ -261,6 +273,7 @@ pub fn commit_upload<'m, H: DriveHost>(
                     Trigger::Upload,
                     initiator,
                     &passport,
+                    priority,
                 )
                 .await?;
             }

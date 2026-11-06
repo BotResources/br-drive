@@ -240,6 +240,11 @@ pub fn delete_file<'m, H: DriveHost>(
 pub struct ProcessFile {
     pub file_id: Uuid,
     pub ruleset_id: Option<Uuid>,
+    /// The priority every step's job of the chain asks Jobs for, 1 (lowest)
+    /// to 5 (highest) (`INVALID_PRIORITY` out of range); absent, none is asked
+    /// and Jobs' default applies. Since 0.9.0.
+    #[serde(default)]
+    pub priority: Option<i32>,
 }
 
 impl MutationInput for ProcessFile {
@@ -261,6 +266,7 @@ pub fn process_file<'m, H: DriveHost>(
     input: ProcessFile,
 ) -> BoxFuture<'m, Result<(), DriveFault>> {
     Box::pin(async move {
+        let priority = processing::chain_priority(input.priority)?;
         let mut file = cx
             .load::<FileRow<H>>(&input.file_id)
             .await?
@@ -282,7 +288,10 @@ pub fn process_file<'m, H: DriveHost>(
         let initiator = processing::Initiator::of(cx.principal());
         let passport = cx.principal().passport().clone();
         let meta = FactMeta::of(cx.principal(), cx.now().as_datetime());
-        processing::start_chain(cx, &meta, &mut file, plan, trigger, initiator, &passport).await?;
+        processing::start_chain(
+            cx, &meta, &mut file, plan, trigger, initiator, &passport, priority,
+        )
+        .await?;
         Ok(())
     })
 }
@@ -293,6 +302,11 @@ pub struct RegeneratePage {
     pub number: i32,
     pub comment: Option<String>,
     pub ruleset_id: Option<Uuid>,
+    /// The priority every step's job of the chain asks Jobs for, 1 (lowest)
+    /// to 5 (highest) (`INVALID_PRIORITY` out of range); absent, none is asked
+    /// and Jobs' default applies. Since 0.9.0.
+    #[serde(default)]
+    pub priority: Option<i32>,
 }
 
 impl MutationInput for RegeneratePage {
@@ -306,6 +320,7 @@ pub fn regenerate_page<'m, H: DriveHost>(
     input: RegeneratePage,
 ) -> BoxFuture<'m, Result<(), DriveFault>> {
     Box::pin(async move {
+        let priority = processing::chain_priority(input.priority)?;
         let mut file = cx
             .load::<FileRow<H>>(&input.file_id)
             .await?
@@ -344,6 +359,7 @@ pub fn regenerate_page<'m, H: DriveHost>(
             Trigger::RegeneratePage,
             initiator,
             &passport,
+            priority,
         )
         .await?;
         Ok(())

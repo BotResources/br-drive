@@ -23,6 +23,7 @@ mod migration_0_4;
 mod migration_0_7;
 mod pages;
 mod passport;
+mod priority;
 mod process_gesture;
 mod processing;
 mod processing_counts;

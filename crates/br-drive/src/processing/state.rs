@@ -93,6 +93,10 @@ pub enum ProcessingEvent {
         trigger: Trigger,
         ruleset_id: Option<Uuid>,
         steps: Vec<RulesetStep>,
+        /// The priority every step's job asks Jobs for, 1 to 5; `None` (left
+        /// out of the payload) when the gesture named none. Since 0.9.0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<i16>,
     },
     /// The job of a chain step was asked of Jobs (`job.create`).
     JobCreated {
@@ -554,6 +558,10 @@ pub struct FileProcessing<H> {
     /// asked of Jobs: it waits for the source's promotion. Set only while
     /// PROCESSING. Since 0.8.2.
     pub(crate) awaiting_source: bool,
+    /// The priority the running chain asks Jobs for at every step, as the
+    /// gesture that started it named it (1 to 5); `None` when it named none,
+    /// and from any end on. Since 0.9.0.
+    pub(crate) priority: Option<i16>,
     pending: Pending<ProcessingEvent>,
     host: PhantomData<fn() -> H>,
 }
@@ -581,6 +589,7 @@ impl<H> Clone for FileProcessing<H> {
             passport: self.passport.clone(),
             next_job_id: self.next_job_id,
             awaiting_source: self.awaiting_source,
+            priority: self.priority,
             pending: self.pending.clone(),
             host: PhantomData,
         }
@@ -597,6 +606,7 @@ impl<H> std::fmt::Debug for FileProcessing<H> {
             .field("step_index", &self.step_index)
             .field("next_job_id", &self.next_job_id)
             .field("awaiting_source", &self.awaiting_source)
+            .field("priority", &self.priority)
             .finish_non_exhaustive()
     }
 }
@@ -626,6 +636,7 @@ impl<H> FileProcessing<H> {
             passport: None,
             next_job_id: None,
             awaiting_source: false,
+            priority: None,
             pending: Pending::default(),
             host: PhantomData,
         }
@@ -702,22 +713,26 @@ impl<H> FileProcessing<H> {
     }
 
     /// A gesture started a chain on the settled file, acting under its
-    /// initiator's `passport` until the chain ends.
+    /// initiator's `passport` and asking Jobs for `priority` until the chain
+    /// ends.
     pub(crate) fn start_chain(
         &mut self,
         trigger: Trigger,
         ruleset_id: Option<Uuid>,
         steps: Vec<RulesetStep>,
         passport: serde_json::Value,
+        priority: Option<i16>,
         meta: &FactMeta,
     ) {
         self.passport = Some(passport);
+        self.priority = priority;
         self.updated_at = meta.occurred_at;
         self.push(
             ProcessingEvent::ChainStarted {
                 trigger,
                 ruleset_id,
                 steps,
+                priority,
             },
             meta,
         );
@@ -832,10 +847,11 @@ impl<H> FileProcessing<H> {
     }
 
     /// The running job ended: READY on success, else FAILED with `error`. The
-    /// chain's Passport goes with it, and a held next step: the chain is
-    /// over.
+    /// chain's Passport and priority go with it, and a held next step: the
+    /// chain is over.
     fn end(&mut self, error: Option<(String, Option<String>)>, meta: &FactMeta) {
         self.passport = None;
+        self.priority = None;
         self.next_job_id = None;
         self.awaiting_source = false;
         match error {
@@ -1113,7 +1129,8 @@ impl<H> FileProcessing<H> {
 /// The columns of `drive.file_processing`.
 const COLUMNS: &str = "file_id, version, state, job_id, step_index, trigger, triggered_by_id, \
      triggered_by_name, job_created_at, error_code, error_message, plan, plan_index, plan_label, \
-     plan_at, cancel_requested_at, past_job_ids, updated_at, passport, next_job_id, awaiting_source";
+     plan_at, cancel_requested_at, past_job_ids, updated_at, passport, next_job_id, awaiting_source, \
+     priority";
 
 fn config_error(error: impl std::fmt::Display) -> EngineError {
     EngineError::Config(error.to_string())
@@ -1151,6 +1168,7 @@ fn row_to_processing<H>(row: &sqlx::postgres::PgRow) -> Result<FileProcessing<H>
         passport: row.get("passport"),
         next_job_id: row.get("next_job_id"),
         awaiting_source: row.get("awaiting_source"),
+        priority: row.get("priority"),
         pending: Pending::default(),
         host: PhantomData,
     })
@@ -1241,7 +1259,7 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
     };
     sqlx::query(&format!(
         "INSERT INTO drive.file_processing ({COLUMNS}) VALUES \
-         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) \
+         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) \
          ON CONFLICT (file_id) DO UPDATE SET version = EXCLUDED.version, state = EXCLUDED.state, \
            job_id = EXCLUDED.job_id, step_index = EXCLUDED.step_index, \
            trigger = EXCLUDED.trigger, triggered_by_id = EXCLUDED.triggered_by_id, \
@@ -1252,7 +1270,7 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
            plan_at = EXCLUDED.plan_at, cancel_requested_at = EXCLUDED.cancel_requested_at, \
            past_job_ids = EXCLUDED.past_job_ids, updated_at = EXCLUDED.updated_at, \
            passport = EXCLUDED.passport, next_job_id = EXCLUDED.next_job_id, \
-           awaiting_source = EXCLUDED.awaiting_source"
+           awaiting_source = EXCLUDED.awaiting_source, priority = EXCLUDED.priority"
     ))
     .bind(state.file_id)
     .bind(state.version)
@@ -1275,6 +1293,7 @@ async fn upsert<H>(conn: &mut PgConnection, state: &FileProcessing<H>) -> Result
     .bind(&state.passport)
     .bind(state.next_job_id)
     .bind(state.awaiting_source)
+    .bind(state.priority)
     .execute(conn)
     .await?;
     Ok(())
@@ -1332,7 +1351,14 @@ mod tests {
     fn running() -> FileProcessing<()> {
         let meta = meta();
         let mut processing = FileProcessing::<()>::blank(Uuid::now_v7(), meta.occurred_at);
-        processing.start_chain(Trigger::Upload, None, Vec::new(), passport(), &meta);
+        processing.start_chain(
+            Trigger::Upload,
+            None,
+            Vec::new(),
+            passport(),
+            Some(4),
+            &meta,
+        );
         processing.create_job(
             Uuid::now_v7(),
             0,
@@ -1711,12 +1737,15 @@ mod tests {
     fn the_passport_is_held_only_while_the_chain_runs() {
         let mut processing = running();
         assert!(processing.passport.is_some(), "a running chain holds it");
+        assert_eq!(processing.priority, Some(4), "and its priority");
         processing.report_done(&meta());
         assert!(processing.passport.is_none(), "READY drops it");
+        assert!(processing.priority.is_none(), "READY drops the priority");
 
         let mut failed = running();
         failed.report_failed("broken", None, &meta());
         assert!(failed.passport.is_none(), "a reported failure drops it");
+        assert!(failed.priority.is_none(), "and the priority");
 
         for fact in [
             Received::Cancelled,
@@ -1734,17 +1763,52 @@ mod tests {
             let job = ended.job_id;
             assert_eq!(ended.receive(job, fact, &meta()), Applied::Ended);
             assert!(ended.passport.is_none(), "an end from Jobs drops it");
+            assert!(ended.priority.is_none(), "and the priority");
         }
 
         let mut frozen = running();
         frozen.cancel_on_freeze(&meta());
         assert!(frozen.passport.is_none(), "a freeze drops it");
+        assert!(frozen.priority.is_none(), "and the priority");
 
         let mut skipped = running();
         skipped.request_cancel(&meta());
         skipped.report_done(&meta());
         skipped.skip_step(1, "index".into(), &meta());
         assert!(skipped.passport.is_none(), "a cancelled chain drops it");
+        assert!(skipped.priority.is_none(), "and the priority");
+    }
+
+    #[test]
+    fn the_chain_started_fact_names_a_priority_only_when_one_was_asked() {
+        let meta = meta();
+        let mut asked = FileProcessing::<()>::blank(Uuid::now_v7(), meta.occurred_at);
+        asked.start_chain(
+            Trigger::Upload,
+            None,
+            Vec::new(),
+            passport(),
+            Some(5),
+            &meta,
+        );
+        let payload = serde_json::to_value(&asked.pending()[0].event).unwrap();
+        assert_eq!(payload["priority"], serde_json::json!(5));
+
+        let mut none = FileProcessing::<()>::blank(Uuid::now_v7(), meta.occurred_at);
+        none.start_chain(Trigger::Upload, None, Vec::new(), passport(), None, &meta);
+        let payload = serde_json::to_value(&none.pending()[0].event).unwrap();
+        assert!(
+            payload.get("priority").is_none(),
+            "a chain asking for nothing keeps the 0.8 payload: {payload}"
+        );
+        let read: ProcessingEvent = serde_json::from_value(serde_json::json!({
+            "kind": "ChainStarted", "trigger": "UPLOAD", "ruleset_id": null, "steps": []
+        }))
+        .unwrap();
+        assert!(matches!(
+            read,
+            ProcessingEvent::ChainStarted { priority: None, .. }
+        ));
     }
 
     #[test]
@@ -1792,7 +1856,14 @@ mod tests {
     fn awaiting() -> (FileProcessing<()>, Uuid) {
         let meta = meta();
         let mut processing = FileProcessing::<()>::blank(Uuid::now_v7(), meta.occurred_at);
-        processing.start_chain(Trigger::Upload, None, Vec::new(), passport(), &meta);
+        processing.start_chain(
+            Trigger::Upload,
+            None,
+            Vec::new(),
+            passport(),
+            Some(2),
+            &meta,
+        );
         let job = Uuid::now_v7();
         processing.await_source(job, 0, "render".into(), Some(Trigger::Upload), None, &meta);
         (processing, job)

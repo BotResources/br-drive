@@ -303,6 +303,20 @@ impl World {
         .flatten()
     }
 
+    /// The priority the file's processing holds for its running chain, as
+    /// stored (`drive.file_processing.priority`); `None` without a row, when
+    /// the chain asked for none, or once it ended.
+    pub async fn held_priority(&self, file_id: Uuid) -> Option<i16> {
+        sqlx::query_scalar::<_, Option<i16>>(
+            "SELECT priority FROM drive.file_processing WHERE file_id = $1",
+        )
+        .bind(file_id)
+        .fetch_optional(&self.db.app)
+        .await
+        .expect("read the file's processing priority")
+        .flatten()
+    }
+
     /// Whether any row the host's fact table holds mentions `needle` — a
     /// value that must never be recorded (a Passport's claims, say).
     pub async fn facts_mention(&self, needle: &str) -> bool {

@@ -9,6 +9,68 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.9.0 — 2026-11-06
+
+A chain may ask Jobs for a priority. The gesture that starts it — the upload
+request (pinned for its commit), `ProcessFile` or `RegeneratePage` — names one
+from 1 (lowest) to 5 (highest), and every step's `job.create.v3` asks for it.
+Engine (`br-service-engine/v0.4.2`) and `contract-jobs` (`v0.7.0`, whose
+`CreateJobV3.priority` the library now sets) pins are unchanged.
+
+### Upgrading from 0.8
+
+- Bump the br-drive pin and apply the new migration (the library's `migrate`
+  does). It is additive, but **upgrade with no mixed 0.8.2 / 0.9.0
+  consumers** — a `Recreate` rollout, or one replica during the upgrade: a
+  0.8.2 binary never clears the new `priority` column, so its end of a chain
+  a 0.9.0 binary started with a priority breaks the column's check and fails
+  (a reaction is retried, a runner's report answers an internal error) until
+  a 0.9.0 binary handles it. For the same reason, before rolling
+  back let the chains started with a priority drain (or set their `priority`
+  to `NULL`).
+- A host's GraphQL surface gains an optional `priority: Int` argument on
+  `<p>RequestUpload`, `<p>ProcessFile` and `<p>RegeneratePage`; a front that
+  names none sees the 0.8 behaviour. Regenerate a committed SDL.
+- A host that builds `RequestUpload`, `RequestUploadWithRuleset` (through its
+  `upload`), `ProcessFile` or `RegeneratePage` by hand (a test, an
+  adapter) adds `priority: None`; one that matches
+  `ProcessingEvent::ChainStarted` field by field adds `priority` or `..`.
+  Inputs decoded from JSON need nothing: a missing `priority` reads as none.
+
+### Added
+
+- **`priority` on the three gestures that start a chain**: `RequestUpload`,
+  `ProcessFile` and `RegeneratePage` (`priority: Option<i32>`, GraphQL
+  `priority: Int`). Out of 1–5 is the new reason code **`INVALID_PRIORITY`**,
+  refused before anything is recorded (with the other input checks, before
+  the host's gate). None named asks for nothing: `CreateJobV3.priority` stays
+  unset and Jobs' default applies. The library never judges it against the
+  initiator's ceiling: Jobs caps it at the maximum of the user the job runs
+  for. `br_drive::MIN_CHAIN_PRIORITY` / `MAX_CHAIN_PRIORITY` name the bounds.
+- **The chain keeps it like its Passport**: written on the file's processing
+  in the transaction that starts the chain and asked by **every step's
+  `job.create.v3`** — the first step, in the gesture or when the source's
+  promotion releases a step that awaited it (0.8.2), and each next step, when
+  Jobs' end of the previous one releases the held step (0.8.1). It is set back
+  to `NULL` at every end of the processing, with the Passport. An upload's
+  pin applies to its commit's chain only; a later `ProcessFile` or
+  `RegeneratePage` names its own.
+- **Migration `9121000017_chain_priority`**: `drive.file.upload_priority`
+  (smallint, 1–5, the uploader's pin, like `upload_ruleset_id`) and
+  `drive.file_processing.priority` (smallint, 1–5, only while `processing`).
+  The checks are added `NOT VALID` (both columns are new and `NULL`
+  everywhere), so the migration does not scan the tables under their lock.
+- **Facts**: `FileEvent::UploadPriorityChosen { priority }` (after
+  `UploadTicketIssued` and `UploadRulesetChosen`), and
+  `ProcessingEvent::ChainStarted` gains `priority`, left out of the payload
+  when none was named — a 0.8 payload reads as `None`, and the payload schema
+  version stays 1.
+- e2e `priority`: a priority pinned at upload asked by the awaited first step
+  and the held next step of a two-step chain, held while it runs and gone at
+  `READY`; `ProcessFile` and `RegeneratePage` asking for theirs, a reprocess
+  naming none asking for nothing; 0 and 6 refused `INVALID_PRIORITY` on all
+  three gestures with no file, chain or job recorded.
+
 ## 0.8.2 — 2026-11-05
 
 A chain's first step is asked of Jobs once the engine promoted the file's

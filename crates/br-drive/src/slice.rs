@@ -224,6 +224,7 @@ macro_rules! drive_slice {
                     sha256: ::std::string::String,
                     title: ::core::option::Option<::std::string::String>,
                     ruleset_id: ::core::option::Option<::uuid::Uuid>,
+                    priority: ::core::option::Option<i32>,
                 ) -> ::async_graphql::Result<$crate::UploadTicket> {
                     $crate::admitted_mutation::<$p>(ctx)?;
                     let upload = $crate::RequestUpload {
@@ -235,8 +236,9 @@ macro_rules! drive_slice {
                         media_type,
                         size: size.0,
                         sha256_hex: sha256,
+                        priority,
                     };
-                    // No rule named: exactly the 0.5.0 gesture.
+                    // No rule named: the 0.5.0 gesture (with its 0.9.0 priority).
                     ::core::result::Result::Ok(match ruleset_id {
                         ::core::option::Option::None => {
                             ::service_engine::execute::<$p, $crate::RequestUpload>(ctx, upload)
@@ -272,11 +274,16 @@ macro_rules! drive_slice {
                     ctx: &::async_graphql::Context<'_>,
                     file_id: ::uuid::Uuid,
                     ruleset_id: ::core::option::Option<::uuid::Uuid>,
+                    priority: ::core::option::Option<i32>,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
                     $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::ProcessFile>(
                         ctx,
-                        $crate::ProcessFile { file_id, ruleset_id },
+                        $crate::ProcessFile {
+                            file_id,
+                            ruleset_id,
+                            priority,
+                        },
                     )
                     .await
                 }
@@ -301,6 +308,7 @@ macro_rules! drive_slice {
                     number: i32,
                     comment: ::core::option::Option<::std::string::String>,
                     ruleset_id: ::core::option::Option<::uuid::Uuid>,
+                    priority: ::core::option::Option<i32>,
                 ) -> ::async_graphql::Result<::service_engine::MutationAck> {
                     $crate::admitted_mutation::<$p>(ctx)?;
                     ::service_engine::ack::<$p, $crate::RegeneratePage>(
@@ -310,6 +318,7 @@ macro_rules! drive_slice {
                             number,
                             comment,
                             ruleset_id,
+                            priority,
                         },
                     )
                     .await

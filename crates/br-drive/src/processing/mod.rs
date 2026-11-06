@@ -9,9 +9,10 @@ mod roots;
 mod source;
 mod state;
 
-pub use chain::{ChainPlan, cancel_active_job};
+pub use chain::{ChainPlan, MAX_CHAIN_PRIORITY, MIN_CHAIN_PRIORITY, cancel_active_job};
 pub(crate) use chain::{
-    drop_awaited_step, load_processing, report_done, report_failed, skip_next_step, start_chain,
+    chain_priority, drop_awaited_step, load_processing, report_done, report_failed, skip_next_step,
+    start_chain,
 };
 pub use commands::Initiator;
 pub(crate) use commands::JobCancel;

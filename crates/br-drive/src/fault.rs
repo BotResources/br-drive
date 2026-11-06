@@ -52,6 +52,8 @@ pub mod codes {
     pub const LABEL_NOT_FOUND: Reason = Reason::new("LABEL_NOT_FOUND");
     pub const LABEL_NAME_TAKEN: Reason = Reason::new("LABEL_NAME_TAKEN");
     pub const INVALID_LABEL: Reason = Reason::new("INVALID_LABEL");
+    /// A chain's priority outside 1 (lowest) to 5 (highest). Since 0.9.0.
+    pub const INVALID_PRIORITY: Reason = Reason::new("INVALID_PRIORITY");
 }
 
 #[derive(Debug, thiserror::Error)]
