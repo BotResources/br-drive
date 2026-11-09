@@ -1,14 +1,17 @@
 //! A chain's first step is asked of Jobs only once the engine promoted the
-//! file's source (since 0.8.2). The engine serves no download URL for a
-//! verified source before its reaper verified the landed object, so a step
-//! created at the commit met a runner context with no source to read. Now a
-//! chain started on a source not yet promoted records its plan, mints its
-//! first job's id and awaits the promotion (`SourceAwaited`), the file
-//! PROCESSING; the source's post-upload policy releases it (`JobCreated`),
-//! and the runner context serves the source on its first call.
+//! file's source (since 0.8.2): the engine serves no download URL for a
+//! verified source before it verified the landed object. Since 0.9.1 the
+//! commit promotes its source itself, in its own transaction
+//! (`promote_blob`), so the chain the commit starts asks Jobs for its first
+//! step with the commit — no wait for the engine reaper's next sweep.
 //!
-//! The suite holds the reaper off a source with a row lock on its blob row
-//! ([`World::hold_promotion`]) and anchors every "not yet" on the reaper
+//! The reaper stays the fallback: a source a commit of 0.9.0 or earlier left
+//! pending is promoted at the next sweep, and a chain started on it records
+//! its plan, mints its first job's id and awaits the promotion
+//! (`SourceAwaited`), the file PROCESSING; the source's post-upload policy
+//! releases it (`JobCreated`). The suite builds that Given in SQL and holds
+//! the reaper off the source with a row lock on its blob row
+//! ([`World::unpromote_and_hold`]), and anchors every "not yet" on the reaper
 //! actually waiting on that lock ([`World::await_lock_waiters`]).
 
 use std::time::Duration;
@@ -23,14 +26,18 @@ use crate::harness::{
 };
 
 const BYTES: &[u8] = b"a document whose source the engine still verifies";
+const OTHER: &[u8] = b"a document whose bytes are not the pinned ones!!!";
 const CANCEL: &str = "mutation($f:UUID!){workspaceCancelProcessing(fileId:$f){success}}";
 const DELETE: &str = "mutation($f:UUID!){workspaceDeleteFile(fileId:$f){success}}";
 const DELETE_RULE: &str = "mutation($id:UUID!){workspaceDeleteRuleset(id:$id){success}}";
 const FREEZE: &str = "mutation($id:UUID!){workspaceFreeze(id:$id){success}}";
 
-fn processing_on_commit() -> WorldOptions {
+/// A host processing on commit whose engine reaper does not sweep during the
+/// scenario: whatever is promoted, the commit promoted.
+fn processing_on_commit_without_sweeps() -> WorldOptions {
     WorldOptions {
         process_on_commit: true,
+        reaper_interval: Duration::from_secs(3600),
         ..WorldOptions::default()
     }
 }
@@ -46,9 +53,10 @@ struct Awaiting {
     hold: PromotionHold,
 }
 
-/// A text upload whose source the reaper is held off, its bytes landed: the
-/// file is PENDING and the reaper waits on the hold.
-async fn landed_and_held(world: World) -> Awaiting {
+/// A text upload on a two-gesture host, committed — READY, stored only —
+/// whose source is pending as a commit of 0.9.0 or earlier left it, the
+/// reaper held off it and waiting on the hold.
+async fn committed_unpromoted_and_held(world: World) -> Awaiting {
     let jobs = JobsStandIn::attach(&world).await;
     let owner_id = Uuid::now_v7();
     let owner = manager_passport(owner_id, "Ada");
@@ -64,8 +72,13 @@ async fn landed_and_held(world: World) -> Awaiting {
         )
         .await,
     );
-    let hold = world.hold_promotion(file_id).await;
     assert!((200..300).contains(&post_bytes(&world, &upload_ticket, BYTES, "awaited.txt").await));
+    ok(&commit(&world, &owner, file_id).await);
+    assert_eq!(
+        world.file(&owner, file_id).await["processingState"],
+        "READY"
+    );
+    let hold = world.unpromote_and_hold(file_id).await;
     world.await_lock_waiters(1).await;
     Awaiting {
         world,
@@ -98,10 +111,202 @@ fn awaited_job(facts: &[Fact]) -> Uuid {
 }
 
 #[tokio::test]
-async fn the_first_job_is_asked_of_jobs_only_once_the_source_is_promoted() {
-    // Given: a default upload rule, and a landed upload the reaper has not
-    // promoted — it waits on the hold
-    let world = World::start_with("pod-promotion-commit", processing_on_commit()).await;
+async fn a_commit_promotes_its_source_and_asks_jobs_for_the_first_job_at_once() {
+    // Given: a default upload rule, a reaper that does not sweep during the
+    // scenario, and a landed upload whose source is still pending
+    let world = World::start_with(
+        "pod-promotion-commit",
+        processing_on_commit_without_sweeps(),
+    )
+    .await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let owner_id = Uuid::now_v7();
+    let owner = manager_passport(owner_id, "Ada");
+    let runner = service_passport(&[RUNNER_SCOPE]);
+    install_render_rule(&world, &owner).await;
+    let drive = world.create_workspace(&owner, "library").await;
+    let file_id = Uuid::now_v7();
+    let upload_ticket = ticket(
+        &request(
+            &world,
+            &owner,
+            file_id,
+            &UploadRequest::text(drive, "", "promoted.txt", BYTES),
+        )
+        .await,
+    );
+    assert!((200..300).contains(&post_bytes(&world, &upload_ticket, BYTES, "promoted.txt").await));
+    let source = world.source_of(file_id).await;
+    assert_eq!(world.blob_state(source).await.as_deref(), Some("pending"));
+
+    // When: the owner commits it
+    ok(&commit(&world, &owner, file_id).await);
+
+    // Then: the commit promoted the source and asked Jobs for the first step
+    // in its own transaction — no sweep ran, nothing awaits
+    assert_eq!(
+        world.blob_state(source).await.as_deref(),
+        Some("uploaded"),
+        "the commit promoted the source"
+    );
+    let create = jobs.await_create(file_id).await;
+    assert_eq!(create.runner_type, RENDER);
+    let carried: br_core_auth::Passport =
+        serde_json::from_value(create.passport.clone().expect("the job carries a passport"))
+            .expect("the carried passport decodes");
+    assert_eq!(
+        carried,
+        <br_core_auth::Passport as br_core_auth::PassportHeader>::from_header(&owner).unwrap(),
+        "the committer's passport"
+    );
+    let committed = world
+        .facts("drive_file", serde_json::json!(file_id))
+        .await
+        .pop()
+        .expect("the commit");
+    assert_eq!(committed.event_type, "UploadCommitted");
+    let facts = world.processing_facts(file_id).await;
+    assert_eq!(kinds(&facts), vec!["ChainStarted", "JobCreated"]);
+    assert_eq!(facts[1].payload["job_id"], create.job_id.to_string());
+    assert_eq!(facts[1].payload["step_index"], 0);
+    for fact in &facts {
+        assert_eq!(fact.correlation_id, committed.correlation_id, "one gesture");
+        assert_eq!(fact.actor_id, owner_id);
+    }
+    assert_eq!(world.job_of(file_id).await, Some(create.job_id));
+    let file = world.file(&owner, file_id).await;
+    assert_eq!(file["processingState"], "PROCESSING", "{file}");
+    // And: the runner's very first call reads the source
+    let first = context(&world, &runner, file_id, create.job_id).await;
+    assert!(
+        first.get("errors").is_none(),
+        "the first call is served: {first}"
+    );
+    let source_url = first["data"]["workspaceRunnerContext"]["sourceUrl"]
+        .as_str()
+        .expect("a source url");
+    let fetched = world.http.get(source_url).send().await.unwrap();
+    assert!(fetched.status().is_success(), "{}", fetched.status());
+    assert_eq!(fetched.bytes().await.unwrap().as_ref(), BYTES);
+
+    // When: the promotion the commit's policy commanded is delivered again
+    let replayed = world.send_source_promoted(file_id).await;
+    world.await_consumed(replayed).await;
+
+    // Then: the step is created once
+    jobs.expect_no_command(Duration::from_millis(500)).await;
+    assert_eq!(
+        kinds(&world.processing_facts(file_id).await),
+        vec!["ChainStarted", "JobCreated"]
+    );
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_commit_on_an_object_that_is_not_the_pinned_bytes_is_refused_and_promotes_nothing() {
+    // Given: a default upload rule, a reaper that does not sweep during the
+    // scenario, and an upload whose object holds other bytes of the same size
+    // — written past the upload policy, which no conforming store allows
+    let world = World::start_with(
+        "pod-promotion-mismatch",
+        processing_on_commit_without_sweeps(),
+    )
+    .await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let owner = manager_passport(Uuid::now_v7(), "Ada");
+    install_render_rule(&world, &owner).await;
+    let drive = world.create_workspace(&owner, "library").await;
+    let file_id = Uuid::now_v7();
+    let upload_ticket = ticket(
+        &request(
+            &world,
+            &owner,
+            file_id,
+            &UploadRequest::text(drive, "", "forged.txt", BYTES),
+        )
+        .await,
+    );
+    assert_eq!(OTHER.len(), BYTES.len());
+    let object_key = upload_ticket.fields["key"]
+        .as_str()
+        .expect("the object key");
+    world.put_object(object_key, OTHER).await;
+    assert!(world.object_exists(object_key).await);
+
+    // When: the owner commits it
+    let refused = commit(&world, &owner, file_id).await;
+
+    // Then: the commit is refused, the file still PENDING, its source still
+    // pending — not promoted — and no chain started
+    assert_eq!(error_code(&refused), "UPLOAD_NOT_LANDED");
+    assert_eq!(
+        world.file(&owner, file_id).await["processingState"],
+        "PENDING"
+    );
+    assert_eq!(
+        world
+            .blob_state(world.source_of(file_id).await)
+            .await
+            .as_deref(),
+        Some("pending")
+    );
+    assert!(world.processing_facts(file_id).await.is_empty());
+    jobs.expect_no_command(Duration::from_millis(500)).await;
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_commit_on_a_source_already_promoted_starts_the_chain_in_its_own_transaction() {
+    // Given: a landed upload the reaper already promoted (a late commit)
+    let world = World::start_with(
+        "pod-promotion-late-commit",
+        WorldOptions {
+            process_on_commit: true,
+            ..WorldOptions::default()
+        },
+    )
+    .await;
+    let jobs = JobsStandIn::attach(&world).await;
+    let owner = manager_passport(Uuid::now_v7(), "Ada");
+    install_render_rule(&world, &owner).await;
+    let drive = world.create_workspace(&owner, "library").await;
+    let file_id = Uuid::now_v7();
+    let upload_ticket = ticket(
+        &request(
+            &world,
+            &owner,
+            file_id,
+            &UploadRequest::text(drive, "", "late.txt", BYTES),
+        )
+        .await,
+    );
+    assert!((200..300).contains(&post_bytes(&world, &upload_ticket, BYTES, "late.txt").await));
+    world.await_source_promoted(file_id).await;
+
+    // When: the owner commits it
+    ok(&commit(&world, &owner, file_id).await);
+
+    // Then: the first job is asked of Jobs by the commit itself — nothing
+    // awaits a promotion that already happened
+    let create = jobs.await_create(file_id).await;
+    let facts = world.processing_facts(file_id).await;
+    assert_eq!(kinds(&facts), vec!["ChainStarted", "JobCreated"]);
+    assert_eq!(facts[1].payload["job_id"], create.job_id.to_string());
+    assert_eq!(
+        facts[0].correlation_id, facts[1].correlation_id,
+        "one gesture"
+    );
+
+    world.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_chain_on_a_source_a_former_commit_left_pending_starts_at_the_reapers_promotion() {
+    // Given: a default upload rule, and a file committed by a former version
+    // whose source the reaper has not promoted — it waits on the hold
+    let world = World::start("pod-promotion-fallback").await;
     let Awaiting {
         world,
         jobs,
@@ -110,25 +315,19 @@ async fn the_first_job_is_asked_of_jobs_only_once_the_source_is_promoted() {
         file_id,
         hold,
         ..
-    } = landed_and_held(world).await;
+    } = committed_unpromoted_and_held(world).await;
     let runner = service_passport(&[RUNNER_SCOPE]);
 
-    // When: the owner commits it
-    ok(&commit(&world, &owner, file_id).await);
+    // When: the owner processes it
+    ok(&process(&world, &owner, file_id).await);
 
     // Then: the file is PROCESSING at its first step, nothing run yet, and
-    // the commit recorded the chain and its awaited step in one transaction
+    // the gesture recorded the chain and its awaited step in one transaction
     let file = world.file(&owner, file_id).await;
     assert_eq!(file["processingState"], "PROCESSING", "{file}");
     assert_eq!(file["progress"]["stepIndex"], 0);
     assert_eq!(file["progress"]["runnerType"], RENDER);
     assert_eq!(file["progress"]["plan"], serde_json::json!([]));
-    let committed = world
-        .facts("drive_file", serde_json::json!(file_id))
-        .await
-        .pop()
-        .expect("the commit");
-    assert_eq!(committed.event_type, "UploadCommitted");
     let facts = world.processing_facts(file_id).await;
     assert_eq!(kinds(&facts), vec!["ChainStarted", "SourceAwaited"]);
     let minted = awaited_job(&facts);
@@ -142,12 +341,12 @@ async fn the_first_job_is_asked_of_jobs_only_once_the_source_is_promoted() {
         })
     );
     for fact in &facts {
-        assert_eq!(fact.correlation_id, committed.correlation_id, "one gesture");
+        assert_eq!(fact.correlation_id, facts[0].correlation_id, "one gesture");
         assert_eq!(fact.actor_id, owner_id);
     }
     assert!(
         world.held_passport(file_id).await.is_some(),
-        "the chain keeps the committer's passport for its first step"
+        "the chain keeps the initiator's passport for its first step"
     );
     // And: while the reaper still waits on the source, no job is asked of
     // Jobs, the minted job opens nothing, and a reprocess is refused
@@ -181,7 +380,7 @@ async fn the_first_job_is_asked_of_jobs_only_once_the_source_is_promoted() {
     assert_eq!(
         carried,
         <br_core_auth::Passport as br_core_auth::PassportHeader>::from_header(&owner).unwrap(),
-        "the committer's passport, captured at the commit"
+        "the initiator's passport, captured at the gesture"
     );
     assert_eq!(
         world
@@ -226,87 +425,10 @@ async fn the_first_job_is_asked_of_jobs_only_once_the_source_is_promoted() {
 }
 
 #[tokio::test]
-async fn a_commit_on_a_source_already_promoted_starts_the_chain_in_its_own_transaction() {
-    // Given: a landed upload the reaper already promoted (a late commit)
-    let world = World::start_with("pod-promotion-late-commit", processing_on_commit()).await;
-    let jobs = JobsStandIn::attach(&world).await;
-    let owner = manager_passport(Uuid::now_v7(), "Ada");
-    install_render_rule(&world, &owner).await;
-    let drive = world.create_workspace(&owner, "library").await;
-    let file_id = Uuid::now_v7();
-    let upload_ticket = ticket(
-        &request(
-            &world,
-            &owner,
-            file_id,
-            &UploadRequest::text(drive, "", "late.txt", BYTES),
-        )
-        .await,
-    );
-    assert!((200..300).contains(&post_bytes(&world, &upload_ticket, BYTES, "late.txt").await));
-    world.await_source_promoted(file_id).await;
-
-    // When: the owner commits it
-    ok(&commit(&world, &owner, file_id).await);
-
-    // Then: the first job is asked of Jobs by the commit itself — nothing
-    // awaits a promotion that already happened
-    let create = jobs.await_create(file_id).await;
-    let facts = world.processing_facts(file_id).await;
-    assert_eq!(kinds(&facts), vec!["ChainStarted", "JobCreated"]);
-    assert_eq!(facts[1].payload["job_id"], create.job_id.to_string());
-    assert_eq!(
-        facts[0].correlation_id, facts[1].correlation_id,
-        "one gesture"
-    );
-
-    world.cleanup().await;
-}
-
-#[tokio::test]
-async fn a_process_file_right_after_the_commit_awaits_the_source_too() {
-    // Given: a host with the two-gesture flow, and a landed upload the reaper
-    // has not promoted, committed: READY, stored only
-    let world = World::start("pod-promotion-process-file").await;
-    let Awaiting {
-        world,
-        jobs,
-        owner,
-        file_id,
-        hold,
-        ..
-    } = landed_and_held(world).await;
-    ok(&commit(&world, &owner, file_id).await);
-    assert_eq!(
-        world.file(&owner, file_id).await["processingState"],
-        "READY"
-    );
-
-    // When: the owner processes it at once
-    ok(&process(&world, &owner, file_id).await);
-
-    // Then: the file is PROCESSING and its first step awaits the source
-    assert_eq!(
-        world.file(&owner, file_id).await["processingState"],
-        "PROCESSING"
-    );
-    let minted = awaited_job(&world.processing_facts(file_id).await);
-    world.await_lock_waiters(1).await;
-    jobs.expect_no_command(Duration::from_secs(1)).await;
-
-    // When: the reaper promotes the source
-    hold.release().await;
-
-    // Then: the step is asked of Jobs with its minted id
-    assert_eq!(jobs.await_create(file_id).await.job_id, minted);
-
-    world.cleanup().await;
-}
-
-#[tokio::test]
 async fn a_cancel_while_the_source_is_awaited_drops_the_step_and_the_promotion_starts_nothing() {
-    // Given: a committed upload whose first step awaits the source
-    let world = World::start_with("pod-promotion-cancel", processing_on_commit()).await;
+    // Given: a file a former version committed, processed, whose first step
+    // awaits the source
+    let world = World::start("pod-promotion-cancel").await;
     let Awaiting {
         world,
         jobs,
@@ -314,8 +436,8 @@ async fn a_cancel_while_the_source_is_awaited_drops_the_step_and_the_promotion_s
         file_id,
         hold,
         ..
-    } = landed_and_held(world).await;
-    ok(&commit(&world, &owner, file_id).await);
+    } = committed_unpromoted_and_held(world).await;
+    ok(&process(&world, &owner, file_id).await);
     let minted = awaited_job(&world.processing_facts(file_id).await);
 
     // When: the owner cancels the processing
@@ -380,8 +502,9 @@ async fn a_cancel_while_the_source_is_awaited_drops_the_step_and_the_promotion_s
 
 #[tokio::test]
 async fn a_freeze_while_the_source_is_awaited_drops_the_step_and_sends_no_cancel() {
-    // Given: a committed upload whose first step awaits the source
-    let world = World::start_with("pod-promotion-freeze", processing_on_commit()).await;
+    // Given: a file a former version committed, processed, whose first step
+    // awaits the source
+    let world = World::start("pod-promotion-freeze").await;
     let Awaiting {
         world,
         jobs,
@@ -390,8 +513,8 @@ async fn a_freeze_while_the_source_is_awaited_drops_the_step_and_sends_no_cancel
         file_id,
         hold,
         ..
-    } = landed_and_held(world).await;
-    ok(&commit(&world, &owner, file_id).await);
+    } = committed_unpromoted_and_held(world).await;
+    ok(&process(&world, &owner, file_id).await);
 
     // When: the host freezes the drive
     ok(&world
@@ -424,8 +547,9 @@ async fn a_freeze_while_the_source_is_awaited_drops_the_step_and_sends_no_cancel
 
 #[tokio::test]
 async fn a_delete_while_the_source_is_awaited_leaves_nothing_to_start() {
-    // Given: a committed upload whose first step awaits the source
-    let world = World::start_with("pod-promotion-delete", processing_on_commit()).await;
+    // Given: a file a former version committed, processed, whose first step
+    // awaits the source
+    let world = World::start("pod-promotion-delete").await;
     let Awaiting {
         world,
         jobs,
@@ -433,8 +557,8 @@ async fn a_delete_while_the_source_is_awaited_leaves_nothing_to_start() {
         file_id,
         hold,
         ..
-    } = landed_and_held(world).await;
-    ok(&commit(&world, &owner, file_id).await);
+    } = committed_unpromoted_and_held(world).await;
+    ok(&process(&world, &owner, file_id).await);
     let source = world.source_of(file_id).await;
 
     // When: the owner deletes the file — its release of the source queues
@@ -469,8 +593,9 @@ async fn a_delete_while_the_source_is_awaited_leaves_nothing_to_start() {
 
 #[tokio::test]
 async fn an_initiator_erased_while_the_source_is_awaited_drops_the_step_passport_missing() {
-    // Given: a committed upload whose first step awaits the source
-    let world = World::start_with("pod-promotion-erase", processing_on_commit()).await;
+    // Given: a file a former version committed, processed, whose first step
+    // awaits the source
+    let world = World::start("pod-promotion-erase").await;
     let Awaiting {
         world,
         jobs,
@@ -479,11 +604,11 @@ async fn an_initiator_erased_while_the_source_is_awaited_drops_the_step_passport
         file_id,
         hold,
         ..
-    } = landed_and_held(world).await;
-    ok(&commit(&world, &owner, file_id).await);
+    } = committed_unpromoted_and_held(world).await;
+    ok(&process(&world, &owner, file_id).await);
     let minted = awaited_job(&world.processing_facts(file_id).await);
 
-    // When: the committer is erased, then the reaper promotes the source
+    // When: the initiator is erased, then the reaper promotes the source
     world.erase(owner_id).await;
     assert!(world.held_passport(file_id).await.is_none());
     hold.release().await;
@@ -524,9 +649,10 @@ async fn an_initiator_erased_while_the_source_is_awaited_drops_the_step_passport
 }
 
 #[tokio::test]
-async fn the_rule_is_decided_at_the_commit_and_runs_even_if_deleted_before_the_promotion() {
-    // Given: a committed upload whose first step awaits the source
-    let world = World::start_with("pod-promotion-rule-gone", processing_on_commit()).await;
+async fn the_rule_is_decided_at_the_gesture_and_runs_even_if_deleted_before_the_promotion() {
+    // Given: a file a former version committed, processed, whose first step
+    // awaits the source
+    let world = World::start("pod-promotion-rule-gone").await;
     let Awaiting {
         world,
         jobs,
@@ -535,8 +661,8 @@ async fn the_rule_is_decided_at_the_commit_and_runs_even_if_deleted_before_the_p
         file_id,
         hold,
         ..
-    } = landed_and_held(world).await;
-    ok(&commit(&world, &owner, file_id).await);
+    } = committed_unpromoted_and_held(world).await;
+    ok(&process(&world, &owner, file_id).await);
     let minted = awaited_job(&world.processing_facts(file_id).await);
 
     // When: the rule is deleted, then the reaper promotes the source

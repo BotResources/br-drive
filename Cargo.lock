@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "br-drive"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-graphql",
  "br-core-auth",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "br-drive-example"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-graphql",
  "async-nats",
@@ -1024,7 +1024,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2485,7 +2485,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2776,7 +2776,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2995,8 +2995,8 @@ dependencies = [
 
 [[package]]
 name = "service-engine"
-version = "0.4.2"
-source = "git+https://github.com/BotResources/br-service-engine?tag=br-service-engine%2Fv0.4.2#aa0bd6b89e95d1ac7c5129836b0925cd20d4f3d8"
+version = "0.5.0"
+source = "git+https://github.com/BotResources/br-service-engine?tag=br-service-engine%2Fv0.5.0#8ea5c103ddc970ee1f088fb8a88f04c417502f42"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -3498,7 +3498,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -4,6 +4,10 @@
 //! before that would meet a runner context with no source to read. The
 //! source's post-upload policy commands [`SourcePromoted`] in the promotion's
 //! transaction, and its reaction asks Jobs for the awaited step (since 0.8.2).
+//! Since 0.9.1 the upload commit promotes the source itself
+//! (`CommitUpload`), so a chain finds it promoted; the wait
+//! remains the fallback for a source a former version's commit left to the
+//! reaper.
 
 use std::marker::PhantomData;
 

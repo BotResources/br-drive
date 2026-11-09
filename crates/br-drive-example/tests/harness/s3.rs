@@ -174,6 +174,23 @@ impl TestS3 {
             .is_success()
     }
 
+    pub async fn put_object(&self, bucket: &str, object_key: &str, bytes: &[u8]) {
+        let s3 = self.s3_bucket(bucket);
+        let credentials = Credentials::new(ACCESS_KEY, SECRET_KEY);
+        let url = s3
+            .put_object(Some(&credentials), object_key)
+            .sign(Duration::from_secs(60));
+        let status = self
+            .http
+            .put(url)
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .expect("reach the object store to PUT the object")
+            .status();
+        assert!(status.is_success(), "the PUT answered {status}");
+    }
+
     /// Ready once the S3 gateway answers healthy AND the master counts the
     /// volume server: the volume server's first heartbeat races the master's
     /// leader election and is only retried five seconds later, so a gateway
