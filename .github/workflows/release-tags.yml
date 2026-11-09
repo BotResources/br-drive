@@ -71,6 +71,20 @@ jobs:
             git push origin "${tag}"
           fi
 
+          # The Libraries registry records a release only under
+          # `{library}/v{version}` (RELEASE_TAG_INVALID otherwise), while the
+          # importers pin `v{version}`: push both, on the same commit.
+          registry_tag="br-drive/${tag}"
+          if git rev-parse --verify "refs/tags/${registry_tag}" >/dev/null 2>&1; then
+            echo "✓ tag ${registry_tag} already exists"
+          else
+            echo "→ creating tag ${registry_tag}"
+            git tag -a "${registry_tag}" "${tag}^{commit}" \
+              -m "br-drive ${version}" \
+              -m "Libraries registry release tag; same commit as ${tag}."
+            git push origin "${registry_tag}"
+          fi
+
           if gh release view "${tag}" >/dev/null 2>&1; then
             echo "✓ release ${tag} already exists"
           else
