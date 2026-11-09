@@ -106,7 +106,7 @@ rolls them together. The host never writes to the `drive` schema directly.
 3. **`DriveHost`** on the principal — whose `Principal::passport()` must answer the caller's own Passport, as the gateway forwarded it (see [The chain's Passport](#the-chains-passport)): `SERVICE`, `RUNNER_SCOPE`, `type DriveOwner`, `VISIBILITY_DEPS`, the blob bounds (`SOURCE_MAX_BYTES`, `IMAGE_MAX_BYTES`, `RENDITION_MAX_BYTES`, the three `*_ORPHAN_AFTER`), `BULK_RESET_THRESHOLD`, `drive_gate`, `record_facts` (required), `visible_drives` (never a service principal), `admit` (the host's caller admission, asked first by every root), `display_name`, `upload_window`, `process_on_commit`, `erase_mode`, the two folder hooks.
 4. **Fact table**: the host's own fact table (the reference table under [Facts](#facts-handed-to-the-host)), created by a host migration; `record_facts` inserts into it on the connection it is given.
 5. **Migrations**: `br_drive::migrations()` in `BootPlan.libraries` — schema `drive`, band `9_121_000_001..=9_121_999_999`, disjoint from the engine's reserved range and from the host's own.
-6. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); three blob kinds, `drive_source`, `drive_image` and `drive_rendition` (each with its bound and its orphan delay from `DriveHost`); an S3-compatible store with POST-policy checksum conditions — MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
+6. **Object storage**: `EngineConfig::with_blob_storage` (the library refuses to register without it); three blob kinds, `drive_source`, `drive_image` and `drive_rendition` (each with its bound and its orphan delay from `DriveHost`); an S3-compatible store that enforces POST-policy checksum conditions and answers `x-amz-checksum-sha256` on a checksum-mode `HEAD` — SeaweedFS 4.48 (what the example's suite runs against) or MinIO ≥ `RELEASE.2024-12-13` — and a public endpoint the browser and the runners can reach for the presigned POST and GET.
 7. **Jobs**: a Jobs service serving `contract-jobs` 0.7 (`svc-jobs` ≥ 0.6: it takes `job.create.v3`); the outbox reaches `integration.cmd.jobs.>` and the eight `integration.evt.jobs.job.*.v1` subjects are on the `INTEGRATION_EVT` stream; the durables are named `{SERVICE}-drive-…`.
 8. **Erase**: the engine's erase pipeline (`engine.eraser().erase(person)`) runs the library's `Erasable` in `DriveHost::erase_mode`; drives themselves are deleted by the host with `delete_drive`.
 9. **Drives**: created and deleted from the host's own mutations (`create_drive` from the host object, or `create_unowned_drive` for a `NoDriveOwner` host, and `delete_drive` from a mutation registered with `register_bulk` and answered with `ack_bulk`), or deleted from a host reaction (`delete_drive_in_reaction`); frozen in the host's own gesture (`freeze_drive`); `set_metadata`, `drive_of` for curation; `file_counts` and `processing_counts` for a host view showing its drives' counts.
@@ -1236,7 +1236,7 @@ rule the folder scenarios meet), a `workspace:sweep` scope allowed folder
 gestures but no file, an `admit` refusing a deactivated account at every root
 (`ACTIVE_USER_REQUIRED`; the example reads the passport's `is_active`, a real
 host its roster), `src/bin/service.rs` handing everything to the engine boot kit, and `tests/`
-— the harness spawns real PostgreSQL roles, `nats-server` and `minio`, boots
+— the harness spawns real PostgreSQL roles, `nats-server` and SeaweedFS (`weed server -s3`), boots
 the host in process and drives it over GraphQL and a real
 `graphql-transport-ws` socket (and the gateway's `text/event-stream` leg for
 the admission scenarios). Jobs is played by a stand-in that publishes the
@@ -1255,10 +1255,12 @@ contract violation fails the suite instead of passing it; the fake runner exerci
 ## Running the example's suite
 
 The suite needs a PostgreSQL superuser URL in `E2E_PG_ADMIN_URL` (fallback
-`DATABASE_URL`), `nats-server` on `PATH`, and `minio` on `PATH` for the blob
-scenarios (MinIO ≥ RELEASE.2024-12-13, for checksum conditions in POST
-policies). `crates/br-drive-example/docker-compose.yml` brings up the three for
-a local run of the binary itself.
+`DATABASE_URL`), `nats-server` on `PATH`, and SeaweedFS's `weed` on `PATH` for
+the blob scenarios (release 4.48, the binary of
+<https://github.com/seaweedfs/seaweedfs/releases/tag/4.48>; it enforces the
+checksum and size conditions of the POST policies the scenarios rely on).
+`crates/br-drive-example/docker-compose.yml` brings up the three for a local
+run of the binary itself.
 
 ```bash
 E2E_PG_ADMIN_URL=postgresql://postgres:postgres@localhost:5432/postgres \

@@ -697,7 +697,7 @@ async fn erasing_a_person_purges_the_rendition_objects_of_their_files() {
         .unwrap()
     });
     let key = ticket.fields["key"].as_str().unwrap().to_string();
-    assert!(world.minio.object_exists(&archive.bucket, &key).await);
+    assert!(world.s3.object_exists(&archive.bucket, &key).await);
 
     // When: the person is erased
     let outcome = archive.erase(person_id).await;
@@ -709,7 +709,7 @@ async fn erasing_a_person_purges_the_rendition_objects_of_their_files() {
         "the source and the rendition objects: {outcome:?}"
     );
     poll_until!(Duration::from_secs(30), {
-        (!world.minio.object_exists(&archive.bucket, &key).await).then_some(())
+        (!world.s3.object_exists(&archive.bucket, &key).await).then_some(())
     });
     let rows: i64 =
         sqlx::query_scalar("SELECT count(*) FROM drive.file_rendition WHERE file_id = $1")

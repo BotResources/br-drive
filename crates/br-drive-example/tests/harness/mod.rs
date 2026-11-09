@@ -1,9 +1,9 @@
 pub mod archive;
 pub mod jobs;
-pub mod minio;
 pub mod nats;
 pub mod pg;
 pub mod runner;
+pub mod s3;
 pub mod sse;
 pub mod upload;
 pub mod ws;
@@ -20,9 +20,9 @@ use uuid::Uuid;
 
 pub use archive::ArchiveHost;
 pub use jobs::JobsStandIn;
-pub use minio::TestMinio;
 pub use nats::TestNats;
 pub use pg::TestDb;
+pub use s3::TestS3;
 pub use sse::SseSubscription;
 pub use ws::Subscription;
 
@@ -30,7 +30,7 @@ pub struct World {
     pub db: TestDb,
     pub service: Service,
     pub http: reqwest::Client,
-    pub minio: TestMinio,
+    pub s3: TestS3,
     pub blob_bucket: String,
     pub nats_server: TestNats,
 }
@@ -76,10 +76,10 @@ impl World {
         let nats_server = TestNats::spawn().await;
         nats_server.provision(br_drive_example::SERVICE).await;
 
-        let minio = TestMinio::spawn().await;
+        let s3 = TestS3::spawn().await;
         let blob_bucket = format!("drive-{}", Uuid::now_v7().simple());
-        minio.create_bucket(&blob_bucket).await;
-        let blob_config = minio.config(&blob_bucket);
+        s3.create_bucket(&blob_bucket).await;
+        let blob_config = s3.config(&blob_bucket);
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut config = base_config(pod, addr)
@@ -109,7 +109,7 @@ impl World {
             db,
             service,
             http: reqwest::Client::new(),
-            minio,
+            s3,
             blob_bucket,
             nats_server,
         }
@@ -572,9 +572,7 @@ impl World {
     }
 
     pub async fn object_exists(&self, object_key: &str) -> bool {
-        self.minio
-            .object_exists(&self.blob_bucket, object_key)
-            .await
+        self.s3.object_exists(&self.blob_bucket, object_key).await
     }
 
     pub async fn object_key_of(&self, reference: Uuid) -> Option<String> {

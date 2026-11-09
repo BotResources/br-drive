@@ -231,20 +231,25 @@ jobs:
           tar -xzf /tmp/nats-server.tar.gz -C /tmp
           sudo install "/tmp/nats-server-${NATS_SERVER_VERSION}-linux-amd64/nats-server" /usr/local/bin/nats-server
           nats-server --version
-      - name: cache the MinIO fixture build (keyed on MINIO_COMMIT, valid until the pin moves)
+      - name: cache the SeaweedFS release archive (keyed on its pinned digest)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: minio-${{ runner.os }}-01ce918d8279a20e4706b96a64396146894adee4
-      - name: build pinned MinIO fixture from source (upstream publishes no binary archive)
+          path: ~/.cache/seaweedfs
+          key: seaweedfs-linux_amd64-4a7d108384d044d95212d1342cdda9533fa55842c1c9b41f606ca3c8a9561124
+      - name: install SeaweedFS (the S3 store the services run on, same release)
         env:
-          MINIO_COMMIT: 01ce918d8279a20e4706b96a64396146894adee4
+          SEAWEEDFS_VERSION: "4.48"
+          SEAWEEDFS_SHA256: 4a7d108384d044d95212d1342cdda9533fa55842c1c9b41f606ca3c8a9561124
         run: |
           set -euo pipefail
-          GOBIN=/tmp/minio-bin go install "github.com/minio/minio@${MINIO_COMMIT}"
-          sudo install /tmp/minio-bin/minio /usr/local/bin/minio
-          minio --version
+          archive="$HOME/.cache/seaweedfs/linux_amd64-${SEAWEEDFS_VERSION}.tar.gz"
+          mkdir -p "$(dirname "$archive")"
+          if [ ! -f "$archive" ]; then
+            curl -fsSL "https://github.com/seaweedfs/seaweedfs/releases/download/${SEAWEEDFS_VERSION}/linux_amd64.tar.gz" -o "$archive"
+          fi
+          echo "${SEAWEEDFS_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" -C /tmp weed
+          sudo install /tmp/weed /usr/local/bin/weed
+          weed version
       - name: example host e2e
         run: cargo test -p br-drive-example --all-targets --locked -- --test-threads=3

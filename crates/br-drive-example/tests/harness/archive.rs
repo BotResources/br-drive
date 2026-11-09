@@ -177,7 +177,7 @@ impl ArchiveHost {
         world.nats_server.provision(ARCHIVE_SERVICE).await;
         let db = TestDb::fresh().await;
         let bucket = format!("archive-{}", Uuid::now_v7().simple());
-        world.minio.create_bucket(&bucket).await;
+        world.s3.create_bucket(&bucket).await;
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let config = EngineConfig::new(
             ChannelName::new(ARCHIVE_SERVICE).expect("valid channel"),
@@ -189,7 +189,7 @@ impl ArchiveHost {
         .with_lease(Duration::from_secs(5))
         .with_lock_timeout(Duration::from_millis(400))
         .with_http_addr(addr)
-        .with_blob_storage(world.minio.config(&bucket))
+        .with_blob_storage(world.s3.config(&bucket))
         .with_blob_reaper_interval(Duration::from_millis(150));
 
         let readiness = ReadinessHandle::not_ready("booting");
