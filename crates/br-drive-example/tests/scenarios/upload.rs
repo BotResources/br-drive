@@ -154,7 +154,8 @@ async fn bytes_whose_checksum_does_not_match_are_refused_by_storage_and_the_comm
 }
 
 #[tokio::test]
-async fn a_commit_in_the_pending_window_reads_the_storage_head_before_the_reaper_sweeps() {
+async fn a_commit_in_the_pending_window_reads_the_storage_head_and_promotes_before_the_reaper_sweeps()
+ {
     let world = World::start_with(
         "pod-upload-pending-window",
         WorldOptions {
@@ -184,8 +185,16 @@ async fn a_commit_in_the_pending_window_reads_the_storage_head_before_the_reaper
         .await
         .expect("head does not error")
         .expect("the object landed");
-    assert_eq!(head.state, BlobState::Pending, "no sweep has run yet");
+    assert_eq!(
+        head.state,
+        BlobState::Uploaded,
+        "no sweep has run yet: the commit promoted the source"
+    );
     assert_eq!(head.verified(), Some(true));
+    assert!(
+        world.file_access(&owner, file_id).await["data"]["workspaceFileAccess"].is_string(),
+        "the source is downloadable with the commit"
+    );
 
     let refused = commit(&world, &owner, file_id).await;
     assert_eq!(

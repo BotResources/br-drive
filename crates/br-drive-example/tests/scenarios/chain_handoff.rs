@@ -202,8 +202,12 @@ async fn the_next_step_is_created_only_once_jobs_completed_the_previous_one_and_
     jobs.complete(first).await;
 
     // Then: the next step's job is created, with the id held at the report
+    // (the gesture that started the chain may still be delivered to a
+    // subscription opened right after it: its step 0 is not this delta)
     let started = next_drive_delta(&mut files, |node| {
-        node["__typename"] == "DriveUpsert" && node["cause"]["kind"] == "ProcessingStarted"
+        node["__typename"] == "DriveUpsert"
+            && node["cause"]["kind"] == "ProcessingStarted"
+            && node["cause"]["step"] == 1
     })
     .await;
     assert_eq!(started["cause"]["step"], 1);

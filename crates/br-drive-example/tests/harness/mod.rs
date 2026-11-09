@@ -468,25 +468,51 @@ impl World {
         }
     }
 
-    /// Holds the engine reaper off the source of `file_id`: a transaction
-    /// of the suite locks the source's blob row, so the reaper's promotion (an
-    /// `UPDATE` of that row) waits until [`PromotionHold::release`]. Reads of
-    /// the row (a commit's storage HEAD, a gesture's promotion check) are not
-    /// held. Take it before the bytes land, or the reaper may promote first.
-    pub async fn hold_promotion(&self, file_id: Uuid) -> PromotionHold {
+    /// Puts the source of `file_id` back as a commit of br-drive 0.9.0 or
+    /// earlier left it — committed, its blob row still `pending` until the
+    /// engine reaper's sweep — and holds the reaper off it. Since 0.9.1 the
+    /// commit promotes its source, so no gesture of this version leaves a
+    /// committed source pending: this Given is built in SQL. A transaction of
+    /// the suite locks the pending row, so the reaper's promotion (an `UPDATE`
+    /// of that row) waits until [`PromotionHold::release`]; reads of the row
+    /// (a gesture's promotion check) are not held. A sweep that promotes the
+    /// row between the reset and the lock is undone and the reset retried, so
+    /// the hold always starts on a pending row.
+    pub async fn unpromote_and_hold(&self, file_id: Uuid) -> PromotionHold {
         let source = self.source_of(file_id).await;
-        let mut tx = self
-            .db
-            .app
-            .begin()
-            .await
-            .expect("open the holding transaction");
-        sqlx::query("SELECT 1 FROM service_engine.blob WHERE id = $1 FOR UPDATE")
+        assert_eq!(
+            self.blob_state(source).await.as_deref(),
+            Some("uploaded"),
+            "the commit promoted the source"
+        );
+        loop {
+            sqlx::query(
+                "UPDATE service_engine.blob \
+                 SET state = 'pending', uploaded_at = NULL, etag = NULL, sha256 = NULL \
+                 WHERE id = $1 AND state = 'uploaded'",
+            )
             .bind(source)
-            .execute(&mut *tx)
+            .execute(&self.db.app)
+            .await
+            .expect("put the source's blob row back to pending");
+            let mut tx = self
+                .db
+                .app
+                .begin()
+                .await
+                .expect("open the holding transaction");
+            let state: String = sqlx::query_scalar(
+                "SELECT state FROM service_engine.blob WHERE id = $1 FOR UPDATE",
+            )
+            .bind(source)
+            .fetch_one(&mut *tx)
             .await
             .expect("lock the source's blob row");
-        PromotionHold { tx }
+            if state == "pending" {
+                return PromotionHold { tx };
+            }
+            tx.rollback().await.expect("drop the late hold");
+        }
     }
 
     /// Waits until `count` statements of the host's database wait on a row
@@ -573,6 +599,15 @@ impl World {
 
     pub async fn object_exists(&self, object_key: &str) -> bool {
         self.s3.object_exists(&self.blob_bucket, object_key).await
+    }
+
+    /// Writes `bytes` under `object_key` with a plain signed PUT, past the
+    /// presigned POST policy — an object that is not the pinned bytes, which
+    /// a conforming store never lets an upload land.
+    pub async fn put_object(&self, object_key: &str, bytes: &[u8]) {
+        self.s3
+            .put_object(&self.blob_bucket, object_key, bytes)
+            .await;
     }
 
     pub async fn object_key_of(&self, reference: Uuid) -> Option<String> {
@@ -1079,7 +1114,7 @@ pub async fn refute_delta(
     }
 }
 
-/// The suite's lock on a source's blob row ([`World::hold_promotion`]).
+/// The suite's lock on a source's blob row ([`World::unpromote_and_hold`]).
 pub struct PromotionHold {
     tx: sqlx::Transaction<'static, sqlx::Postgres>,
 }

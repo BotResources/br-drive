@@ -27,7 +27,7 @@ is created on `job.create.v3`, with a Passport.
 
 ```toml
 [dependencies]
-br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.9.0", version = "0.9.0" }
+br-drive = { git = "https://github.com/BotResources/br-drive", package = "br-drive", tag = "v0.9.1", version = "0.9.1" }
 ```
 
 The `version` beside the `tag` is required: a tag-only git dependency carries a
@@ -45,6 +45,8 @@ The `version` beside the `tag` is required: a tag-only git dependency carries a
 | 0.6.3 | `v0.4.1` |
 | 0.6.4 – 0.6.5 | `br-service-engine/v0.4.2` |
 | 0.7 | `br-service-engine/v0.4.2` |
+| 0.8 – 0.9.0 | `br-service-engine/v0.4.2` |
+| 0.9.1 | `br-service-engine/v0.5.0` |
 
 ## What a host writes
 
@@ -188,9 +190,9 @@ every `RequestUpload`.
   the `upload` rule the uploader chose at `RequestUpload` (`rulesetId`, since
   0.5.1), else of the default `upload` rule matching the file's media type, in its own
   transaction, when the host's `Process { file }` gate allows it — a file
-  that will be processed is never `READY` before it is; its first job is
-  asked of Jobs once the engine promoted the source (see
-  [The first step waits for the source](#the-first-step-waits-for-the-source));
+  that will be processed is never `READY` before it is; the commit promotes
+  the source (since 0.9.1), so its first job is asked of Jobs with the commit
+  (see [The first step waits for the source](#the-first-step-waits-for-the-source));
   a file no rule matches is stored, `READY`, with no refusal. `false` keeps the two-gesture
   flow (commit, then `ProcessFile`). A host may decide per principal (the
   example host reads its settings).
@@ -288,7 +290,7 @@ renders it, is committed at
 | Root | Shape |
 |---|---|
 | `<p>RequestUpload(fileId, driveId, path, name, mediaType, size: ByteCount, sha256, title?, rulesetId?, priority?): UploadTicket!` | `title` trimmed, 1–255 characters, one line, no control or bidirectional-override character (`INVALID_TITLE`); absent, it is the requested `name` without its extension (`report.pdf` → `report`; a name with no stem is kept whole; a collision renames the file, never its title); gate `CreateFile` (asked before the drive is looked up, so an unknown drive id is not an existence oracle) → uniqueness (` (1)`, ` (2)` before the extension) under the drive's lock → verified presigned POST pinning the exact size and SHA-256 → the file row `PENDING`. `UploadTicket { fileId, url, fields }`: the front form-POSTs the bytes to `url` with `fields`. One transaction. `mediaType` must be a `type/subtype` token pair (`INVALID_MEDIA_TYPE`; the library never interprets it). `rulesetId` (since 0.5.1) chooses the `upload` rule the commit runs, for a front that lets its user pick a processing per upload: validated as `ProcessFile` validates a named rule — after the gate and the drive — `RULESET_NOT_FOUND`, `RULESET_MISMATCH` (another trigger, or no pattern matching the media type); pinned on the pending file (`UploadRulesetChosen`, the fact after `UploadTicketIssued`). Without it nothing is pinned and the commit runs the default, as before. `priority` (since 0.9.0), 1 (lowest) to 5 (highest), is the priority the commit's chain asks Jobs for ([The chain's priority](#the-chains-priority)): `INVALID_PRIORITY` out of range, checked with the other inputs, before the gate; pinned on the pending file (`drive.file.upload_priority`, `UploadPriorityChosen { priority }`, the fact after `UploadTicketIssued` and `UploadRulesetChosen`). |
-| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then, on a host that processes on commit (`DriveHost::process_on_commit`, default `true`) and whose `Process { file }` gate allows it, the `upload` rule the uploader chose — else the default `upload` rule matching the file's media type — starts its chain **in the commit's transaction**: the file goes `PENDING` → `PROCESSING`, never `READY` first, and the commit records the chain — the rule, its `steps` snapshot, the committer's Passport — with the commit's correlation (a failure rolls all of it back). The first step's job is asked of Jobs once the engine promoted the source (since 0.8.2): in the commit itself (`UploadCommitted`, `ChainStarted`, `JobCreated`) when the reaper already promoted it, else at the promotion (`ChainStarted`, `SourceAwaited` at the commit; `JobCreated` when the promotion lands — [The first step waits for the source](#the-first-step-waits-for-the-source)). No matching rule, or the gate refusing: the file is `READY` — stored only — and the commit is not refused. A chosen rule deleted since the request, or changed so it no longer carries the `upload` trigger or matches the file, stores the file `READY` too: the default never runs in the place of the rule the uploader chose. With the switch off, the file is `READY` and `ProcessFile` starts its chain. A second commit is `FILE_NOT_PENDING`. |
+| `<p>CommitUpload(fileId): MutationAck!` | gate `CommitUpload { file }` (the pending row, its uploader included), then `FILE_NOT_PENDING`; a live storage HEAD in the pending window: `UPLOAD_NOT_LANDED` unless the object is present and is the pinned bytes (a conforming store refuses anything else at upload); then, on a host that processes on commit (`DriveHost::process_on_commit`, default `true`) and whose `Process { file }` gate allows it, the `upload` rule the uploader chose — else the default `upload` rule matching the file's media type — starts its chain **in the commit's transaction**: the file goes `PENDING` → `PROCESSING`, never `READY` first, and the commit records the chain — the rule, its `steps` snapshot, the committer's Passport — with the commit's correlation (a failure rolls all of it back). The first step's job is asked of Jobs once the engine promoted the source (since 0.8.2), and the commit promotes it itself (since 0.9.1: the engine's `promote_blob`, after the HEAD, in the commit's transaction — an object the engine then finds absent or not the pinned bytes is `UPLOAD_NOT_LANDED` too), so the job is asked in the commit itself (`UploadCommitted`, `ChainStarted`, `JobCreated`); a chain on a source a former version's commit left pending awaits the reaper's promotion ([The first step waits for the source](#the-first-step-waits-for-the-source)). No matching rule, or the gate refusing: the file is `READY` — stored only — and the commit is not refused. A chosen rule deleted since the request, or changed so it no longer carries the `upload` trigger or matches the file, stores the file `READY` too: the default never runs in the place of the rule the uploader chose. With the switch off, the file is `READY` and `ProcessFile` starts its chain. A second commit is `FILE_NOT_PENDING`. |
 | `<p>ProcessFile(fileId, rulesetId?, priority?): MutationAck!` | starts processing on a host that does not process on commit — right after the commit, later, or never — and reprocesses on any host: gate `Process { file }`, then a `READY` or `FAILED` file (`FILE_NOT_READY` on a pending upload, `FILE_PROCESSING` while a chain runs). A file that never had a job runs its `upload` rule, any other its `reprocess` rule (see "Processing rules": `RULESET_NOT_FOUND`, `RULESET_MISMATCH`, `NO_RULESET_MATCHES`). Nothing is wiped: the previous results stay readable while the new run reports over them. `priority` (since 0.9.0): the priority every step's job asks Jobs for, 1 to 5 (`INVALID_PRIORITY` out of range, before anything else); absent, none is asked. Affordance `process`. |
 | `<p>CancelProcessing(fileId): MutationAck!` | gate `CancelProcessing { file }`, then `FILE_NOT_PROCESSING` unless the file is `PROCESSING`; records `JobCancelSent` on the file's processing and stages `job.cancel.v2` for the running job (the live cause stays `CancelRequested { job_id }`); the file stays `PROCESSING` until Jobs' `cancelled` lands it `FAILED` `cancelled`, open to a reprocess. Asking again sends the cancel again (Jobs may drop a cancel it consumes before the job's creation). While the chain's next step is held (its last job reported done, Jobs' end not in yet — since 0.8.1) nothing runs: the held step is skipped at once (`StepSkipped`, `FAILED` `cancelled`, cause `ProcessingFailed`), the `job.cancel.v2` of the job reported done still staged. Affordance `cancelProcessing`. |
 | `<p>RegeneratePage(fileId, number, comment?, rulesetId?, priority?): MutationAck!` | run the `regenerate_page` rule on one page of a `READY` file: `page` and `comment` are merged into the first step's options; `PAGE_NOT_FOUND`, `NO_RULESET_MATCHES`; `priority` as on `ProcessFile` (since 0.9.0). Affordance `regeneratePage` on the page. |
@@ -304,7 +306,7 @@ renders it, is committed at
 | `<p>Labels: [DriveLabel!]!` | the host's label catalogue: `DriveLabel { id, name, color, description, createdAt, updatedAt }` in id order (UUIDv7: creation order); gated by the host's `ReadLabels` — a refused principal (a runner, typically) gets an empty list and an empty live window, exactly as `ReadRulesets` does for the rules; both live windows repopulate when the principal's facts change, so gaining or losing the gate shows at once (the creator's id stays on the row, off the wire). |
 | `<p>CreateLabel(id, name, color, description?)`, `<p>UpdateLabel(id, name?, color?, description?)`, `<p>DeleteLabel(id): MutationAck!` | gate `ManageLabels`; `name` trimmed, 1–100 characters, unique per host case-insensitive (`LABEL_NAME_TAKEN`); `color` `#rrggbb` lowercase hex (an uppercase input is lowercased; anything else `INVALID_LABEL`); `description` defaults to `""`, at most 1 KiB; the name check and the write are serialized, so two concurrent saves of one name answer exactly one `LABEL_NAME_TAKEN`; `NOTHING_TO_CHANGE` on an unchanged update. `DeleteLabel` runs on the bulk pipeline: it detaches the label from every file it was on — `LabelsChanged { detached }` per file up to `BULK_RESET_THRESHOLD`, a `DriveFiles` reset beyond — so a label on any number of files can go. |
 | `<p>SetFileLabels(fileId, labelIds): MutationAck!` | gate `SetFileLabels { file }`; the target set, idempotent — the same set is `NOTHING_TO_CHANGE`, an unknown id `LABEL_NOT_FOUND`; `labelIds` on `DriveFile` follows (`LabelsChanged`), and a file keeps its labels across the host's drives. |
-| `<p>FileAccess(fileId, name: String): String` | a short-lived presigned GET on the source (attachment); `null` when the caller cannot see the file, a coded refusal when the `download` affordance is denied (the host's code first, then `FILE_NOT_READY` before the commit), and `null` between the commit and the engine reaper's promotion (a verified blob is never downloadable in the pending window; the `SourceAvailable` cause says when to retry). With `name`, a presigned GET on that extracted image (inline; `null` for an unknown name and until the object landed). |
+| `<p>FileAccess(fileId, name: String): String` | a short-lived presigned GET on the source (attachment); `null` when the caller cannot see the file, a coded refusal when the `download` affordance is denied (the host's code first, then `FILE_NOT_READY` before the commit), and `null` before the engine promoted the source (a verified blob is never downloadable in the pending window; the commit promotes it since 0.9.1, so this is `null` only for a source a former version's commit left to the reaper; the `SourceAvailable` cause says when to retry). With `name`, a presigned GET on that extracted image (inline; `null` for an unknown name and until the object landed). |
 | `<p>RenditionAccess(fileId, name): String` | a short-lived presigned GET (attachment) on the file rendition of that name (since 0.8.0); the same gate as `FileAccess`: `null` when the caller cannot see the file, for an unknown name, and until the object landed; a coded refusal when the `download` affordance is denied. |
 | `<p>DriveChanged(driveId): DriveDelta!` | the file list: the engine snapshot on connect (`DriveReset` of `DriveFile`s), then `DriveUpsert` / `DriveRemove` on the contiguous revision. |
 | `<p>LabelsChanged: DriveDelta!` | the label catalogue live: a `DriveReset` of `DriveLabel`s, then an upsert (`Created`, `Updated`) or a remove per label. |
@@ -548,12 +550,26 @@ snapshot taken when the rule fired.
 
 ### The first step waits for the source
 
-The engine serves no download URL for a verified source until its blob
-reaper has verified the landed object and promoted its row (`pending` →
-`uploaded`, once per reaper interval — `EngineConfig::with_blob_reaper_interval`, 60 s by default). A job
-created before that would hand its runner a file it cannot read. So since
+The engine serves no download URL for a verified source until it has
+verified the landed object and promoted its row (`pending` → `uploaded`). A
+job created before that would hand its runner a file it cannot read. So since
 0.8.2 a chain's first step is asked of Jobs **only once the source is
-promoted**:
+promoted**.
+
+Since 0.9.1 the commit promotes the source itself: after its storage HEAD,
+`<p>CommitUpload` calls the engine's `promote_blob` (engine 0.5) in its own
+transaction, where the source's post-upload policy runs (`SourceAvailable`,
+the `source-promoted` self-command). A chain the commit starts — and any
+later gesture — finds the source promoted and asks Jobs for its first step
+in that transaction: the first Job starts with the commit, not at the
+engine reaper's next sweep (once per reaper interval —
+`EngineConfig::with_blob_reaper_interval`, 60 s by default). A source the
+reaper promoted first (`AlreadyUploaded`) changes nothing. An object the
+engine then finds absent or not the pinned bytes refuses the commit
+`UPLOAD_NOT_LANDED`, as the HEAD does, and rolls the attempt back.
+
+The reaper remains the fallback, for a source a commit of 0.9.0 or earlier
+left pending (an upgrade, a mixed rollout):
 
 - a gesture that starts a chain — the commit on a host that processes on
   commit, `<p>ProcessFile`, `<p>RegeneratePage` — decides everything at once,

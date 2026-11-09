@@ -8,7 +8,7 @@ use service_engine::blobs::{Sha256Digest, UploadExpectation};
 use service_engine::gate::Reason;
 use service_engine::inbound::{ReactionCoordinates, ReactionMessage};
 use service_engine::pipeline::{Mutation, MutationInput, OneShot, Reaction};
-use service_engine::{BlobReader, BlobRef, JsonScalar, UploadUrl};
+use service_engine::{BlobPromotion, BlobReader, BlobRef, JsonScalar, UploadUrl};
 use uuid::Uuid;
 
 use crate::blob::DriveSource;
@@ -252,6 +252,7 @@ pub fn commit_upload<'m, H: DriveHost>(
             .ok_or(DriveFault::Refused(codes::FILE_NOT_FOUND))?;
         file.commit_gate(cx.principal()).require()?;
         require_landed(&reader, &file).await?;
+        promote_source(cx, &file).await?;
         let now = cx.now().as_datetime();
         file.committed_at = Some(now);
         file.status = FileStatus::stored();
@@ -318,6 +319,25 @@ pub(crate) async fn require_landed<H>(
         Ok(())
     } else {
         Err(DriveFault::Refused(codes::UPLOAD_NOT_LANDED))
+    }
+}
+
+/// Promotes the landed source in the commit's transaction (since 0.9.1): the
+/// source's post-upload policy runs here instead of at the next reaper sweep,
+/// so a chain the commit starts asks Jobs for its first step at once. Must run
+/// before anything sets session variables on the connection. A source the
+/// engine finds absent or not the pinned bytes refuses the commit as the live
+/// HEAD does (`UPLOAD_NOT_LANDED`): the refusal rolls the promotion attempt
+/// back and the reaper judges the row at its sweep.
+async fn promote_source<H: DriveHost>(
+    cx: &mut Mutation<'_, H>,
+    file: &FileRow<H>,
+) -> Result<(), DriveFault> {
+    match cx.promote_blob(BlobRef(file.blob_ref)).await? {
+        BlobPromotion::Promoted | BlobPromotion::AlreadyUploaded => Ok(()),
+        BlobPromotion::NotLanded | BlobPromotion::Failed { .. } => {
+            Err(DriveFault::Refused(codes::UPLOAD_NOT_LANDED))
+        }
     }
 }
 

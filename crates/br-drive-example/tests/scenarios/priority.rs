@@ -96,7 +96,7 @@ async fn report_done(world: &World, runner: &str, file_id: Uuid, job_id: Uuid) {
 #[tokio::test]
 async fn a_priority_pinned_at_upload_is_asked_by_every_step_of_the_commits_chain() {
     // Given: a host processing on commit with a two-step default upload rule,
-    // and an upload naming priority 4 whose source the reaper is held off
+    // and a landed upload naming priority 4
     let world = World::start_with(
         "pod-priority-upload",
         WorldOptions {
@@ -125,28 +125,20 @@ async fn a_priority_pinned_at_upload_is_asked_by_every_step_of_the_commits_chain
         pinned[1].payload,
         serde_json::json!({ "kind": "UploadPriorityChosen", "priority": 4 })
     );
-    let hold = world.hold_promotion(file_id).await;
     assert!((200..300).contains(&post_bytes(&world, &upload_ticket, BYTES, "urgent.txt").await));
-    world.await_lock_waiters(1).await;
 
-    // When: the owner commits it, and the engine promotes the source
+    // When: the owner commits it — the commit promotes the source
     ok(&commit(&world, &owner, file_id).await);
 
-    // Then: the chain holds the priority while its first step awaits the
-    // source, and that step's job asks for it once the source is promoted
+    // Then: the chain holds the priority, and its first step's job, asked
+    // by the commit, asks for it
     assert_eq!(world.held_priority(file_id).await, Some(4));
     let started = world.processing_facts(file_id).await;
     assert_eq!(started[0].event_type, "ChainStarted");
     assert_eq!(started[0].payload["priority"], 4);
-    jobs.expect_no_command(Duration::from_millis(300)).await;
-    hold.release().await;
     let first = jobs.await_create(file_id).await;
     assert_eq!(first.runner_type, RENDER);
-    assert_eq!(
-        first.priority,
-        Some(4),
-        "the awaited first step asks for it"
-    );
+    assert_eq!(first.priority, Some(4), "the first step asks for it");
 
     // When: the first step ends, its next step held until Jobs ends it
     report_done(&world, &runner, file_id, first.job_id).await;

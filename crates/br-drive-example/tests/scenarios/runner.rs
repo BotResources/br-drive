@@ -8,9 +8,8 @@ use crate::harness::runner::{
 };
 use crate::harness::upload::{UploadRequest, post_bytes, process, upload, upload_processed};
 use crate::harness::{
-    JobsStandIn, World, WorldOptions, drain_with_a_rename, drive_subscription, error_code,
-    manager_passport, next_drive_delta, next_page_delta, ok, pages_subscription, passport,
-    service_passport,
+    JobsStandIn, World, drain_with_a_rename, drive_subscription, error_code, manager_passport,
+    next_drive_delta, next_page_delta, ok, pages_subscription, passport, service_passport,
 };
 use crate::poll_until;
 
@@ -110,16 +109,9 @@ async fn the_runner_context_carries_a_fresh_presigned_get_on_the_source_and_the_
 
 #[tokio::test]
 async fn no_runner_is_offered_a_file_whose_source_the_reaper_has_not_promoted() {
-    // Given: a reaper that does not sweep during the scenario, and a file
-    // committed then processed at once — its source still pending
-    let world = World::start_with(
-        "pod-runner-source-pending",
-        WorldOptions {
-            reaper_interval: Duration::from_secs(600),
-            ..WorldOptions::default()
-        },
-    )
-    .await;
+    // Given: a file a former version committed — its source still pending,
+    // the reaper held off it — then processed
+    let world = World::start("pod-runner-source-pending").await;
     let owner = passport(Uuid::now_v7());
     let runner = service_passport(&[RUNNER_SCOPE]);
     let jobs = JobsStandIn::attach(&world).await;
@@ -132,13 +124,8 @@ async fn no_runner_is_offered_a_file_whose_source_the_reaper_has_not_promoted() 
         &UploadRequest::text(drive, "docs", "source.txt", SOURCE),
     )
     .await;
-    assert_eq!(
-        world
-            .blob_state(world.source_of(file_id).await)
-            .await
-            .as_deref(),
-        Some("pending")
-    );
+    let hold = world.unpromote_and_hold(file_id).await;
+    world.await_lock_waiters(1).await;
     ok(&process(&world, &owner, file_id).await);
 
     // Then: the chain started — the file PROCESSING — but its first job is
@@ -159,6 +146,7 @@ async fn no_runner_is_offered_a_file_whose_source_the_reaper_has_not_promoted() 
         "JOB_NOT_ACTIVE"
     );
 
+    hold.release().await;
     world.cleanup().await;
 }
 

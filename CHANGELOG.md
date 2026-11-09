@@ -9,6 +9,46 @@ single git tag `v{version}` releases the set. Format follows
 
 Nothing yet.
 
+## 0.9.1 — 2026-11-09
+
+Libraries registry: br-drive patch 0.9.1 — "The upload commit promotes the
+source at once (service-engine 0.5 promote_blob), so the chain's first Job
+starts with the commit instead of at the next blob reaper sweep." The engine
+pin moves to `br-service-engine/v0.5.0` (version 0.5.0), which adds
+`Mutation::promote_blob` and changes nothing else a host uses. No br-drive
+signature, schema or migration changes. A host bumps the br-drive pin **and
+its own engine pin to `br-service-engine/v0.5.0`** in the same change (one
+engine per host). `contract-jobs` pin unchanged.
+
+### Changed
+
+- **The upload commit promotes its source itself.** After the live storage
+  HEAD accepted the object, `<p>CommitUpload` calls the engine's
+  `promote_blob` on the source in its own transaction: the source's
+  post-upload policy (`SourceAvailable` on the file's views, the
+  `source-promoted` self-command) runs there instead of at the next blob
+  reaper sweep (once per reaper interval, 60 s by default). A chain the
+  commit starts therefore finds the source promoted and stages its first
+  step's `job.create.v3` with the commit (`UploadCommitted`, `ChainStarted`,
+  `JobCreated`, one correlation) — the first Job no longer waits up to one
+  reaper interval — and the source is downloadable with the commit
+  (`<p>FileAccess`). A source the reaper promoted first answers
+  `AlreadyUploaded` and the commit proceeds as before. The promotion runs
+  before the commit writes anything and sets no session variable.
+- An object the engine finds absent or not the pinned bytes at the
+  promotion (a store that answered the commit's HEAD otherwise) refuses the
+  commit `UPLOAD_NOT_LANDED`, as the HEAD does: the refusal rolls the
+  promotion attempt back and the reaper judges the row at its sweep.
+- **The reaper stays the fallback.** A source left pending by a commit of
+  0.9.0 or earlier is promoted at the reaper's next sweep, and a chain
+  started on it still awaits that promotion (`SourceAwaited`, since 0.8.2)
+  and starts its first step from the `source-promoted` reaction, unchanged.
+- The e2e suite asserts the first step's Job is requested by the commit with
+  a reaper that does not sweep during the scenario, that a commit on an
+  object which is not the pinned bytes is refused and promotes nothing, and
+  keeps the awaiting scenarios on a source a former commit left pending
+  (built in SQL, `World::unpromote_and_hold`).
+
 ## 0.9.0 — 2026-11-06
 
 A chain may ask Jobs for a priority. The gesture that starts it — the upload
